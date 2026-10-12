@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, type Activity, type Item, type RepoInfo, type Session, type Settings, type StateId } from "../lib/api";
-import { SECTIONS, STATES, compareItems, groupItems } from "../lib/states";
+import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
 import { clock, friendlyDate } from "../lib/time";
 import { PrList } from "./PrList";
 
@@ -49,6 +49,7 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
   const [state, setStateFilter] = useState("");
   const [owner, setOwner] = useState<"" | "mine" | "others">("");
   const [ci, setCi] = useState("");
+  const [kind, setKind] = useState("");
   const [text, setText] = useState("");
 
   const repos = useMemo(() => [...new Set(items.map((i) => i.repo))].sort(), [items]);
@@ -60,6 +61,7 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
         (!author || i.author === author) &&
         (!state || i.state === state) &&
         (!ci || i.ci === ci) &&
+        (!kind || i.kind === kind) &&
         (!owner || (owner === "mine") === i.isMine) &&
         (!text || `${i.title} ${i.repo} #${i.number}`.toLowerCase().includes(text.toLowerCase())),
     )
@@ -103,6 +105,12 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
             </option>
           ))}
         </select>
+        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          <option value="">PRs, issues & branches</option>
+          <option value="pr">Pull requests</option>
+          <option value="issue">Issues</option>
+          <option value="run">Branches</option>
+        </select>
         <select value={ci} onChange={(e) => setCi(e.target.value)}>
           <option value="">Any CI</option>
           <option value="failure">Failing</option>
@@ -116,7 +124,7 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
         </select>
       </div>
       <PrList
-        sections={[{ id: "all", title: `${filtered.length} pull requests`, items: filtered, empty: "No matches." }]}
+        sections={[{ id: "all", title: `${filtered.length} items`, items: filtered, empty: "No matches." }]}
         now={now}
         active={active}
       />
@@ -189,9 +197,7 @@ export function History({ version }: { version: number }) {
                 </div>
                 {a.title && (
                   <div className="row-sub">
-                    <span className="repo">
-                      {a.repo?.split("/")[1]}#{a.number}
-                    </span>
+                    <span className="repo">{a.repo ? shortRef({ kind: a.number ? "pr" : "run", repo: a.repo, number: a.number ?? 0 }) : ""}</span>
                     <span className="sep">·</span>
                     <span className="reason">{a.title}</span>
                   </div>
@@ -285,6 +291,9 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
               onChange={(e) => save({ ...settings, notifications: e.target.checked })}
             />
             Desktop notifications when something new needs me
+            <button className="link small" onClick={() => api.testNotification()}>
+              send a test
+            </button>
           </label>
           <label className="check">
             <input

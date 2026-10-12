@@ -30,11 +30,13 @@ const INTENTS: Intent[] = [
     label: "new since you last looked",
     match: (i) => i.isNew,
   },
-  { test: /\bmuted?\b/, label: "muted", match: has("muted") },
+  { test: /\bassigned\b/, label: "assigned to you", match: (i) => i.state === "assigned" || (i.kind === "issue" && i.isMine) },
+  { test: /\b(main|master|branch(es)?|builds?|broken|red)\b/, label: "failing branches", match: (i) => i.kind === "run" },
+  { test: /\bissues?\b/, label: "issues", match: (i) => i.kind === "issue" },
   { test: /\bre-?review/, label: "to re-review", match: has("needs_rereview") },
   { test: /\breview(?!ed)|\bto look at/, label: "to review", match: has("needs_review", "needs_rereview") },
   { test: /repl|respond|response|answer|got back/, label: "with replies", match: has("replied") },
-  { test: /\bfail|broken|\bred\b|\bci\b|checks?\b/, label: "failing checks", match: (i) => i.ci === "failure" },
+  { test: /\bfail|\bci\b|checks?\b/, label: "failing checks", match: (i) => i.ci === "failure" },
   { test: /merge|ready to ship|approved/, label: "ready to merge", match: has("ready_to_merge") },
   { test: /later|postpone|snooz|come back|parked/, label: "parked for later", match: (i) => i.state === "later" || i.reminderDue },
   {
@@ -62,7 +64,7 @@ const STOPWORDS = new Set(
 );
 
 /** Words that only express intent; never used as title text. */
-const INTENT_WORD = /^(re-?review|review|repl|respon|answer|fail|broken|checks?$|merge|approv|ready|later|postpon|snooz|park|forg|stale|neglect|wait|block|pend|draft|change|fix|attention|focus|today|important|plate|new$|unread|changed|muted?$|mine$|yours?$|opened|wrote)/;
+const INTENT_WORD = /^(re-?review|review|repl|respon|answer|fail|broken|checks?$|merge|approv|ready|later|postpon|snooz|park|forg|stale|neglect|wait|block|pend|draft|change|fix|attention|focus|today|important|plate|new$|unread|changed|muted?$|mine$|yours?$|opened|wrote|issues?$|assigned$|branch|builds?$|main$|master$)/;
 
 const HISTORY = /yesterday|did i|i did|worked on|history|this week|last week|have i (done|reviewed)/;
 
@@ -152,7 +154,8 @@ export type PaletteAction =
   | { kind: "reset" }
   | { kind: "open" }
   | { kind: "rerun" }
-  | { kind: "checkout" };
+  | { kind: "checkout" }
+  | { kind: "unfollow" };
 
 export interface ParsedAction {
   action: PaletteAction;
@@ -242,7 +245,8 @@ export function parseAction(raw: string): ParsedAction | null {
     strip(/^(done|complete|finish(ed)?|archive|dismiss)\b|\b(mark|as|is)\b|\bdone$/g);
     return { action: { kind: "state", state: "done" }, label: "✅ Mark done", target: q };
   }
-  if (/^mute\b/.test(q)) return { action: { kind: "state", state: "muted" }, label: "🔇 Mute", target: q.replace(/^mute\b/, "").trim() };
+  if ((m = q.match(/^(mute|unfollow|stop following|ignore)\b/)))
+    return { action: { kind: "unfollow" }, label: "🔕 Stop following", target: q.slice(m[0].length).trim() };
   if (/^(unmute|reset|unsnooze)\b/.test(q))
     return { action: { kind: "reset" }, label: "↺ Back to automatic", target: q.replace(/^\S+/, "").trim() };
   if (/^open\b/.test(q)) return { action: { kind: "open" }, label: "↗ Open", target: q.replace(/^open\b/, "").trim() };

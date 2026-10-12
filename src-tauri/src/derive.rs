@@ -1,7 +1,7 @@
 //! Deterministic mapping from GitHub data to a personal workflow state.
 //! No AI here: everything is derived from who did what, and when.
 
-use crate::github::{Actor, PullRequest};
+use crate::github::{Actor, Issue, PullRequest};
 use chrono::{DateTime, Utc};
 
 pub type Ts = DateTime<Utc>;
@@ -32,10 +32,14 @@ pub const STALE: &str = "stale";
 pub const STALE_DAYS: i64 = 30;
 /// Manual only: hidden from Today and never resurfaced by new activity.
 pub const MUTED: &str = "muted";
+/// An issue assigned to you that you haven't touched since.
+pub const ASSIGNED: &str = "assigned";
+/// A default branch whose latest commit is failing CI.
+pub const BROKEN: &str = "broken";
 
 /// States that mean "this needs you now" — these trigger notifications and resurface snoozed items.
 pub fn is_actionable(state: &str) -> bool {
-    matches!(state, NEEDS_REVIEW | NEEDS_REREVIEW | NEEDS_CHANGES | REPLIED | READY_TO_MERGE)
+    matches!(state, NEEDS_REVIEW | NEEDS_REREVIEW | NEEDS_CHANGES | REPLIED | READY_TO_MERGE | ASSIGNED | BROKEN)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,11 +80,95 @@ pub struct Derived {
     pub ci: Ci,
 }
 
-struct Event<'a> {
+/// One human message on a PR or issue.
+struct Msg<'a> {
     who: &'a str,
     at: Ts,
+    body: &'a str,
+    /// Index of the review thread it belongs to, if any.
+    thread: Option<usize>,
     /// Comments and commented/changes-requested reviews. A bare approval isn't a "reply".
     conversational: bool,
+}
+
+/// Does `body` @mention `login`?
+pub fn mentions(body: &str, login: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let needle = format!("@{}", login.to_ascii_lowercase());
+    lower.match_indices(&needle).any(|(i, _)| {
+        let before_ok = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric();
+        let after = lower.as_bytes().get(i + needle.len()).copied();
+        before_ok && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    })
+}
+
+/// Why something counts as a reply to the user.
+#[derive(Clone, Copy, PartialEq)]
+enum Why {
+    Thread,
+    Mention,
+    Author,
+}
+
+struct Reply<'a> {
+    who: &'a str,
+    at: Ts,
+    why: Why,
+}
+
+struct Conversation<'a> {
+    msgs: Vec<Msg<'a>>,
+    me: &'a str,
+}
+
+impl<'a> Conversation<'a> {
+    fn mine(&self, m: &Msg) -> bool {
+        m.who.eq_ignore_ascii_case(self.me)
+    }
+
+    fn my_last(&self) -> Option<Ts> {
+        self.msgs.iter().filter(|m| self.mine(m)).map(|m| m.at).max()
+    }
+
+    /// Every conversational message by someone else after `t` (used on the user's own PRs/issues).
+    fn others_after(&self, t: Ts) -> Vec<&Msg<'a>> {
+        self.msgs.iter().filter(|m| m.conversational && !self.mine(m) && m.at > t).collect()
+    }
+
+    /// Messages that are actually addressed to the user: replies in threads they took part in,
+    /// @mentions, or the author answering after the user's last message.
+    fn replies_to_me(&self, author: &str) -> Vec<Reply<'a>> {
+        let my_last = self.my_last();
+        let mut out = Vec::new();
+        for m in self.msgs.iter().filter(|m| m.conversational && !self.mine(m)) {
+            let why = if mentions(m.body, self.me) && my_last.map_or(true, |t| m.at > t) {
+                Some(Why::Mention)
+            } else if let Some(t) = m.thread.and_then(|th| {
+                self.msgs.iter().filter(|x| x.thread == Some(th) && self.mine(x)).map(|x| x.at).max()
+            }) {
+                (m.at > t).then_some(Why::Thread)
+            } else if m.who.eq_ignore_ascii_case(author) && my_last.is_some_and(|t| m.at > t) {
+                Some(Why::Author)
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                out.push(Reply { who: m.who, at: m.at, why });
+            }
+        }
+        out
+    }
+}
+
+fn describe_replies(replies: &[Reply]) -> (String, Ts) {
+    let last = replies.iter().max_by_key(|r| r.at).expect("non-empty");
+    let reason = match (replies.len(), last.why) {
+        (1, Why::Mention) => format!("{} mentioned you", last.who),
+        (1, Why::Thread) => format!("{} replied in your thread", last.who),
+        (1, Why::Author) => format!("{} replied", last.who),
+        (n, _) => format!("{n} replies to you · latest from {}", last.who),
+    };
+    (reason, last.at)
 }
 
 /// Who "me" is, plus people whose activity should never count (machine users, noisy bots).
@@ -117,15 +205,27 @@ pub fn derive(pr: &PullRequest, ctx: &Ctx) -> Derived {
 }
 
 pub fn derive_at(pr: &PullRequest, ctx: &Ctx, now: Ts) -> Derived {
-    let mut d = derive_state(pr, ctx);
-    if let Some(author) = pr.author.as_ref().filter(|a| ctx.is_ignored(&a.login)) {
-        if d.state != NEEDS_REVIEW && d.state != NEEDS_REREVIEW {
+    finish(derive_state(pr, ctx), pr.author.as_ref(), &pr.updated_at, ctx, now)
+}
+
+pub fn derive_issue(issue: &Issue, ctx: &Ctx) -> Derived {
+    derive_issue_at(issue, ctx, Utc::now())
+}
+
+pub fn derive_issue_at(issue: &Issue, ctx: &Ctx, now: Ts) -> Derived {
+    finish(derive_issue_state(issue, ctx), issue.author.as_ref(), &issue.updated_at, ctx, now)
+}
+
+/// Rules shared by PRs and issues: ignored authors go to FYI, quiet items go stale.
+fn finish(mut d: Derived, author: Option<&Actor>, updated_at: &str, ctx: &Ctx, now: Ts) -> Derived {
+    if let Some(author) = author.filter(|a| ctx.is_ignored(&a.login)) {
+        if !matches!(d.state, NEEDS_REVIEW | NEEDS_REREVIEW | ASSIGNED) {
             d.reason = format!("From {} (ignored) · {}", author.login, d.reason);
             d.state = FYI;
             return d;
         }
     }
-    let last_activity = parse_ts(&pr.updated_at).unwrap_or(now);
+    let last_activity = parse_ts(updated_at).unwrap_or(now);
     let quiet_days = (now - last_activity).num_days();
     if d.state != DONE && d.state != FYI && quiet_days >= STALE_DAYS {
         let quiet = if quiet_days >= 60 { format!("{} months", quiet_days / 30) } else { format!("{quiet_days} days") };
@@ -156,21 +256,33 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
         .max();
     let last_push_at = commit_at.max(force_push_at);
 
-    // --- Human activity (comments + submitted reviews, incl. thread replies) ---
-    let mut activity: Vec<Event> = Vec::new();
+    // --- Human conversation: comments, submitted reviews and review-thread comments ---
+    // Without thread data (e.g. older fixtures), fall back to bare COMMENTED reviews counting as messages.
+    let threads_known = !pr.review_threads.nodes.is_empty();
+    let mut msgs: Vec<Msg> = Vec::new();
     for c in pr.comments.iter() {
         if let (Some(a), Some(at)) = (ctx.human(&c.author), parse_ts(&c.created_at)) {
-            activity.push(Event { who: &a.login, at, conversational: true });
+            msgs.push(Msg { who: &a.login, at, body: &c.body, thread: None, conversational: true });
         }
     }
     for r in pr.reviews.iter().filter(|r| r.state != "PENDING") {
         if let (Some(a), Some(at)) = (ctx.human(&r.author), r.submitted_at.as_deref().and_then(parse_ts)) {
-            let conversational = matches!(r.state.as_str(), "COMMENTED" | "CHANGES_REQUESTED");
-            activity.push(Event { who: &a.login, at, conversational });
+            // A review's thread comments are counted per thread below; its body only if it has one.
+            let conversational = r.state == "CHANGES_REQUESTED"
+                || (r.state == "COMMENTED" && (!r.body.trim().is_empty() || !threads_known));
+            msgs.push(Msg { who: &a.login, at, body: &r.body, thread: None, conversational });
         }
     }
-    let my_last_activity = activity.iter().filter(|e| eq(e.who)).map(|e| e.at).max();
-    let others_after = |t: Ts| -> Vec<&Event> { activity.iter().filter(|e| e.conversational && !eq(e.who) && e.at > t).collect() };
+    for (i, t) in pr.review_threads.iter().enumerate() {
+        for c in t.comments.iter() {
+            if let (Some(a), Some(at)) = (ctx.human(&c.author), parse_ts(&c.created_at)) {
+                msgs.push(Msg { who: &a.login, at, body: &c.body, thread: Some(i), conversational: true });
+            }
+        }
+    }
+    let convo = Conversation { msgs, me };
+    let my_last_activity = convo.my_last();
+    let others_after = |t: Ts| convo.others_after(t);
 
     // My most recent *decisive* review (approve / request changes).
     let my_decisive = pr
@@ -247,7 +359,7 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
         if let Some(last) = replies.iter().max_by_key(|e| e.at) {
             let mut who: Vec<String> = Vec::new();
             for e in &replies {
-                if !who.iter().any(|w| w == e.who) {
+                if !who.iter().any(|w| w.eq_ignore_ascii_case(e.who)) {
                     who.push(e.who.to_string());
                 }
             }
@@ -287,45 +399,105 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
         return d(NEEDS_REVIEW, reason, since);
     }
 
+    let replies = convo.replies_to_me(author);
     match my_decisive {
         Some(("CHANGES_REQUESTED", reviewed_at)) => {
             if let Some(p) = last_push_at.filter(|p| *p > reviewed_at) {
                 return d(NEEDS_REREVIEW, "New commits since you requested changes".into(), p);
             }
-            let replies = others_after(my_last_activity.unwrap_or(reviewed_at));
-            if let Some(last) = replies.iter().max_by_key(|e| e.at) {
-                return d(REPLIED, format!("{} replied to your review", last.who), last.at);
+            if !replies.is_empty() {
+                let (reason, at) = describe_replies(&replies);
+                return d(REPLIED, reason, at);
             }
             return d(WAITING, format!("Waiting for {author} to address your changes"), reviewed_at);
         }
         Some(("APPROVED", approved_at)) => {
-            let replies = others_after(my_last_activity.unwrap_or(approved_at));
-            if let Some(last) = replies.iter().max_by_key(|e| e.at) {
-                return d(REPLIED, format!("{} commented after your approval", last.who), last.at);
+            if !replies.is_empty() {
+                let (reason, at) = describe_replies(&replies);
+                return d(REPLIED, reason, at);
             }
             return d(DONE, "You approved".into(), approved_at);
         }
         _ => {}
     }
 
+    if !replies.is_empty() {
+        let (reason, at) = describe_replies(&replies);
+        return d(REPLIED, reason, at);
+    }
     if let Some(mine) = my_last_activity {
-        let replies = others_after(mine);
-        if let Some(last) = replies.iter().max_by_key(|e| e.at) {
-            let n = replies.len();
-            let reason = if n == 1 {
-                format!("{} replied after your comment", last.who)
-            } else {
-                format!("{n} new comments since yours")
-            };
-            return d(REPLIED, reason, last.at);
-        }
         return d(WAITING, "Waiting for a response".into(), mine);
     }
-
     if assigned_to_me {
         return d(NEEDS_REVIEW, format!("Assigned to you{checks_note}"), created);
     }
-    d(FYI, "You're mentioned or subscribed".into(), parse_ts(&pr.updated_at).unwrap_or(created))
+    d(FYI, "You're subscribed".into(), parse_ts(&pr.updated_at).unwrap_or(created))
+}
+
+fn derive_issue_state(issue: &Issue, ctx: &Ctx) -> Derived {
+    let me = ctx.me.as_str();
+    let eq = |login: &str| login.eq_ignore_ascii_case(me);
+    let author = issue.author.as_ref().map(|a| a.login.as_str()).unwrap_or("ghost");
+    let created = parse_ts(&issue.created_at).unwrap_or_else(Utc::now);
+    let authored = eq(author);
+    let assigned = issue.assignees.iter().any(|a| eq(&a.login));
+    let d = |state: &'static str, reason: String, since: Ts| Derived {
+        state,
+        reason,
+        since,
+        is_mine: authored || assigned,
+        ci: Ci::None,
+    };
+
+    let mut msgs: Vec<Msg> = Vec::new();
+    for c in issue.comments.iter() {
+        if let (Some(a), Some(at)) = (ctx.human(&c.author), parse_ts(&c.created_at)) {
+            msgs.push(Msg { who: &a.login, at, body: &c.body, thread: None, conversational: true });
+        }
+    }
+    let convo = Conversation { msgs, me };
+    let my_last = convo.my_last();
+
+    if authored {
+        let replies = convo.others_after(my_last.unwrap_or(created));
+        if let Some(last) = replies.iter().max_by_key(|m| m.at) {
+            let reason = if replies.len() == 1 {
+                format!("{} commented on your issue", last.who)
+            } else {
+                format!("{} new comments on your issue", replies.len())
+            };
+            return d(REPLIED, reason, last.at);
+        }
+    } else {
+        let replies = convo.replies_to_me(author);
+        if !replies.is_empty() {
+            let (reason, at) = describe_replies(&replies);
+            return d(REPLIED, reason, at);
+        }
+    }
+
+    if assigned {
+        let assigned_at = issue
+            .timeline_items
+            .iter()
+            .filter(|t| t.typename == "AssignedEvent")
+            .filter(|t| t.assignee.as_ref().and_then(|a| a.login.as_deref()).is_some_and(|l| eq(l)))
+            .filter_map(|t| t.created_at.as_deref().and_then(parse_ts))
+            .max()
+            .unwrap_or(created);
+        if my_last.map_or(true, |t| t < assigned_at) {
+            return d(ASSIGNED, "Assigned to you".into(), assigned_at);
+        }
+        return d(WAITING, "Assigned to you · waiting for a response".into(), my_last.unwrap_or(assigned_at));
+    }
+    if let Some(t) = my_last {
+        let reason = if authored { "Your issue · no new replies" } else { "Waiting for a response" };
+        return d(WAITING, reason.into(), t);
+    }
+    if authored {
+        return d(WAITING, "Your issue · no replies yet".into(), created);
+    }
+    d(FYI, "You're subscribed".into(), parse_ts(&issue.updated_at).unwrap_or(created))
 }
 
 #[cfg(test)]
@@ -398,6 +570,74 @@ mod tests {
         let d = derive(&p, "me");
         assert_eq!(d.state, REPLIED);
         assert!(d.reason.contains("sarah"));
+    }
+
+    fn comment(id: &str, login: &str, at: &str, body: &str) -> serde_json::Value {
+        json!({"id": id, "createdAt": at, "body": body, "author": {"__typename": "User", "login": login}})
+    }
+
+    #[test]
+    fn third_party_chatter_is_not_a_reply() {
+        // I commented; then someone else (not the author, no mention) talks to someone else.
+        let p = pr(json!({"comments": {"nodes": [
+            comment("c1", "me", "2026-01-02T00:00:00Z", "Looks fine"),
+            comment("c2", "bob", "2026-01-03T00:00:00Z", "@carol can you check the migration?")
+        ]}}));
+        assert_eq!(derive(&p, "me").state, WAITING);
+    }
+
+    #[test]
+    fn mention_is_a_reply() {
+        let p = pr(json!({"comments": {"nodes": [comment("c1", "bob", "2026-01-03T00:00:00Z", "cc @me, thoughts?")]}}));
+        let d = derive(&p, "me");
+        assert_eq!(d.state, REPLIED);
+        assert!(d.reason.contains("mentioned"));
+        assert!(!mentions("email me@example.com", "me"));
+        assert!(!mentions("@meghan", "me"));
+    }
+
+    #[test]
+    fn reply_in_my_thread() {
+        let p = pr(json!({
+            "reviews": {"nodes": [review("me", "COMMENTED", "2026-01-02T00:00:00Z")]},
+            "reviewThreads": {"nodes": [{"comments": {"nodes": [
+                comment("t1", "me", "2026-01-02T00:00:00Z", "Why 500ms?"),
+                comment("t2", "bob", "2026-01-03T00:00:00Z", "Fair, changed")
+            ]}}, {"comments": {"nodes": [
+                comment("t3", "carol", "2026-01-04T00:00:00Z", "unrelated thread")
+            ]}}]}
+        }));
+        let d = derive(&p, "me");
+        assert_eq!(d.state, REPLIED);
+        assert!(d.reason.contains("bob") && d.reason.contains("thread"), "{}", d.reason);
+    }
+
+    fn issue(extra: serde_json::Value) -> Issue {
+        let mut base = json!({
+            "id": "I_1", "number": 5, "title": "Bug", "url": "u", "state": "OPEN",
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "closedAt": null,
+            "author": {"__typename": "User", "login": "sarah", "avatarUrl": null},
+            "repository": {"nameWithOwner": "acme/web"},
+            "assignees": {"nodes": []}, "comments": {"nodes": []}, "timelineItems": {"nodes": []}
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn issue_states() {
+        let at = parse_ts("2026-01-05T00:00:00Z").unwrap();
+        let c = Ctx::new("me", &[]);
+        let assigned = issue(json!({"assignees": {"nodes": [{"login": "me"}]},
+            "timelineItems": {"nodes": [{"__typename": "AssignedEvent", "createdAt": "2026-01-02T00:00:00Z", "assignee": {"__typename": "User", "login": "me"}}]}}));
+        assert_eq!(derive_issue_at(&assigned, &c, at).state, ASSIGNED);
+        let mine = issue(json!({"author": {"__typename": "User", "login": "me", "avatarUrl": null},
+            "comments": {"nodes": [comment("c1", "bob", "2026-01-03T00:00:00Z", "I can repro")]}}));
+        assert_eq!(derive_issue_at(&mine, &c, at).state, REPLIED);
+        let subscribed = issue(json!({"comments": {"nodes": [comment("c1", "bob", "2026-01-03T00:00:00Z", "hm")]}}));
+        assert_eq!(derive_issue_at(&subscribed, &c, at).state, FYI);
     }
 
     #[test]

@@ -13,17 +13,24 @@ export type StateId =
   | "draft"
   | "fyi"
   | "stale"
-  | "muted";
+  | "muted"
+  | "assigned"
+  | "broken";
+
+export type Kind = "pr" | "issue" | "run";
 
 export interface Personal {
   state: string;
   note?: string | null;
   until?: string | null;
   setAt: string;
+  /** "owner/repo#123": comes back when that PR/issue merges or closes. */
+  waitsOn?: string | null;
 }
 
 export interface Item {
   id: string;
+  kind: Kind;
   repo: string;
   number: number;
   title: string;
@@ -75,6 +82,19 @@ export interface Settings {
   digestHour: number;
 }
 
+export interface FollowItem {
+  id: string;
+  kind: Kind;
+  repo: string;
+  number: number;
+  title: string;
+  author: string;
+  isMine: boolean;
+  state: StateId;
+  updatedAt: string;
+  followed: boolean;
+}
+
 export interface Session {
   login: string;
   avatarUrl: string;
@@ -91,6 +111,9 @@ export const api = {
     invoke<void>("set_state", { prIds, state, until: until ?? null, note: note ?? null }),
   markSeen: (prIds: string[]) => invoke<void>("mark_seen", { prIds }),
   rerunChecks: (prId: string) => invoke<string>("rerun_checks", { prId }),
+  testNotification: () => invoke<void>("test_notification"),
+  getFollowing: () => invoke<FollowItem[]>("get_following"),
+  setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),
   getRepos: () => invoke<RepoInfo[]>("get_repos"),
   setRepoHidden: (repo: string, hidden: boolean) => invoke<void>("set_repo_hidden", { repo, hidden }),

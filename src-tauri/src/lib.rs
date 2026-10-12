@@ -2,6 +2,7 @@ mod db;
 mod demo;
 mod derive;
 mod github;
+mod intent;
 mod sync;
 
 use rusqlite::Connection;
@@ -12,7 +13,9 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_opener::OpenerExt;
 
 const KEYRING_SERVICE: &str = "dev-inbox";
 const KEYRING_USER: &str = "github-token";
@@ -89,7 +92,7 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
         Ok(out) => {
             if state.setting("notifications").as_deref() != Some("0") {
                 for n in out.notices {
-                    let _ = app.notification().builder().title(&n.title).body(&n.body).show();
+                    notify(app, n);
                 }
             }
             update_tray(app, out.needs_you);
@@ -102,6 +105,58 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
             let _ = app.emit("inbox-updated", ());
             Err(msg)
         }
+    }
+}
+
+/// Show a desktop notification. On macOS, clicking it opens the item (and marks it seen).
+fn notify(app: &AppHandle, n: sync::Notice) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Each clickable notification parks a thread until it's clicked or cleared; cap how many.
+        static WAITING: AtomicUsize = AtomicUsize::new(0);
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // Unbundled dev builds have no identity of their own; borrow Terminal's like the plugin does.
+            let id = if tauri::is_dev() { "com.apple.Terminal".to_string() } else { app.config().identifier.clone() };
+            let _ = mac_notification_sys::set_application(&id);
+        });
+        let app = app.clone();
+        let wait = WAITING.fetch_add(1, Ordering::SeqCst) < 12;
+        if !wait {
+            WAITING.fetch_sub(1, Ordering::SeqCst);
+        }
+        std::thread::spawn(move || {
+            let (subtitle, message) = n.body.split_once('\n').unwrap_or(("", n.body.as_str()));
+            let mut opts = mac_notification_sys::Notification::new();
+            opts.wait_for_click(wait);
+            let res = mac_notification_sys::send_notification(
+                &n.title,
+                (!subtitle.is_empty()).then_some(subtitle),
+                message,
+                Some(&opts),
+            );
+            if wait {
+                WAITING.fetch_sub(1, Ordering::SeqCst);
+            }
+            if let Ok(mac_notification_sys::NotificationResponse::Click) = res {
+                if let Some(id) = &n.item_id {
+                    let state = app.state::<AppState>();
+                    let _ = db::mark_seen(&state.db.lock().unwrap(), id, &now());
+                    let _ = app.emit("inbox-updated", ());
+                }
+                match &n.url {
+                    Some(url) => {
+                        let _ = app.opener().open_url(url, None::<&str>);
+                    }
+                    None => show_main(&app),
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app.notification().builder().title(&n.title).body(&n.body).show();
     }
 }
 
@@ -259,8 +314,18 @@ fn set_state(
         // Normalise so snooze times compare correctly against our own timestamps.
         let until = until.as_deref().and_then(derive::parse_ts).map(derive::fmt_ts);
         let tx = conn.unchecked_transaction().map_err(err)?;
+        let titles = db::open_titles(&tx).map_err(err)?;
         for pr_id in &pr_ids {
             let Some(pr) = db::PrRef::load(&tx, pr_id).map_err(err)? else { continue };
+            // "after #392" or "after the API migration" (matched to a PR title) → come back when it merges.
+            let waits_on = (state.as_deref() == Some(derive::LATER))
+                .then(|| note.as_deref())
+                .flatten()
+                .and_then(|n| {
+                    intent::parse_refs(n, &pr.repo).into_iter().next().or_else(|| {
+                        intent::condition_of(n).and_then(|c| intent::match_condition(&c, &titles, pr_id))
+                    })
+                });
             let detail = match state.as_deref() {
                 None => {
                     db::clear_personal(&tx, pr_id).map_err(err)?;
@@ -270,12 +335,21 @@ fn set_state(
                     db::set_personal(
                         &tx,
                         pr_id,
-                        &db::Personal { state: s.to_string(), note: note.clone(), until: until.clone(), set_at: at.clone() },
+                        &db::Personal {
+                            state: s.to_string(),
+                            note: note.clone(),
+                            until: until.clone(),
+                            set_at: at.clone(),
+                            waits_on: waits_on.clone(),
+                        },
                     )
                     .map_err(err)?;
                     let mut d = format!("Marked “{}”", sync::state_label(s));
                     if let Some(u) = &until {
                         d.push_str(&format!(" until {}", local_time(u)));
+                    }
+                    if let Some(w) = &waits_on {
+                        d.push_str(&format!(" until {w} merges or closes"));
                     }
                     if let Some(n) = &note {
                         d.push_str(&format!(" — {n}"));
@@ -289,6 +363,53 @@ fn set_state(
                 &db::ActivityRow { key: format!("marked:{pr_id}:{at}"), at: &at, kind: "marked", pr: Some(&pr), detail },
             )
             .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+    }
+    refresh_count(&app);
+    Ok(())
+}
+
+/// Sends a sample notification; clicking it opens GitHub notifications (checks permissions work).
+#[tauri::command]
+fn test_notification(app: AppHandle) {
+    notify(
+        &app,
+        sync::Notice {
+            title: "🔔 Dev Inbox notifications work".into(),
+            body: "Click me\nThis would open the PR or issue that changed".into(),
+            url: Some("https://github.com/notifications".into()),
+            item_id: None,
+        },
+    );
+}
+
+#[tauri::command]
+fn get_following(state: State<AppState>) -> CmdResult<Vec<db::FollowItem>> {
+    db::list_following(&state.db.lock().unwrap()).map_err(err)
+}
+
+/// Follow or stop following items. Unfollowed items vanish from Today, counts and notifications.
+#[tauri::command]
+fn set_followed(app: AppHandle, ids: Vec<String>, followed: bool) -> CmdResult<()> {
+    {
+        let st = app.state::<AppState>();
+        let conn = st.db.lock().unwrap();
+        let at = now();
+        let tx = conn.unchecked_transaction().map_err(err)?;
+        for id in &ids {
+            db::set_followed(&tx, id, followed, &at).map_err(err)?;
+            // Keep the timeline readable when (un)following in bulk.
+            if ids.len() <= 5 {
+                if let Some(r) = db::PrRef::load(&tx, id).map_err(err)? {
+                    let detail = if followed { "Following again" } else { "Stopped following" };
+                    db::record_activity(
+                        &tx,
+                        &db::ActivityRow { key: format!("follow:{id}:{at}"), at: &at, kind: "marked", pr: Some(&r), detail: detail.into() },
+                    )
+                    .map_err(err)?;
+                }
+            }
         }
         tx.commit().map_err(err)?;
     }
@@ -435,7 +556,8 @@ fn maybe_digest(app: &AppHandle) {
     let conn = state.db.lock().unwrap();
     let _ = db::set_setting(&conn, "last_digest", &today);
     if let Ok(Some(summary)) = sync::digest(&conn) {
-        let _ = app.notification().builder().title("☀️ Today in Dev Inbox").body(&summary).show();
+        drop(conn);
+        notify(app, sync::Notice { title: "☀️ Today in Dev Inbox".into(), body: summary, url: None, item_id: None });
     }
 }
 
@@ -455,6 +577,24 @@ fn palette_shortcut() -> Shortcut {
     #[cfg(not(target_os = "macos"))]
     let mods = Modifiers::CONTROL | Modifiers::ALT;
     Shortcut::new(Some(mods), Code::KeyK)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod notify_tests {
+    /// Shows a real notification through the same macOS path the app uses (no click wait):
+    /// `cargo test notify_smoke -- --ignored`
+    #[test]
+    #[ignore]
+    fn notify_smoke() {
+        let _ = mac_notification_sys::set_application("com.apple.Terminal");
+        let res = mac_notification_sys::send_notification(
+            "🔔 Dev Inbox test",
+            Some("acme/web#482 Checkout refactor"),
+            "sarah replied in your thread",
+            None,
+        );
+        assert!(res.is_ok(), "{res:?}");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -539,6 +679,9 @@ pub fn run() {
             set_state,
             mark_seen,
             rerun_checks,
+            get_following,
+            set_followed,
+            test_notification,
             get_activity,
             get_repos,
             set_repo_hidden,

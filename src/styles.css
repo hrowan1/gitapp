@@ -784,3 +784,59 @@ a {
     transform: translateY(6px);
   }
 }
+
+/* ---------- kinds & following ---------- */
+
+.kind {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 5px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  align-self: center;
+}
+.kind-issue {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+.kind-run {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.bulk {
+  padding: 8px 8px 0;
+}
+.follow-repo {
+  margin-top: 14px;
+}
+.follow-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.chevron-btn {
+  border: none;
+  background: none;
+  padding: 0 2px;
+  color: var(--faint);
+}
+.follow-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px 5px 30px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.follow-row:hover {
+  background: var(--hover);
+}
+.follow-row.off {
+  opacity: 0.5;
+}

@@ -1,12 +1,12 @@
-//! Local SQLite store: mirrored PR metadata (no source code), personal states,
-//! and the personal activity timeline.
+//! Local SQLite store: mirrored PR/issue/branch metadata (no source code), personal states,
+//! the follow list, and the personal activity timeline.
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::derive::Derived;
-use crate::github::PullRequest;
+use crate::github::{Issue, PullRequest};
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -58,7 +58,29 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS seen (pr_id TEXT PRIMARY KEY, at TEXT NOT NULL);
         "#,
     )?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// Schema changes for databases created by earlier versions.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 1 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE prs ADD COLUMN kind TEXT NOT NULL DEFAULT 'pr';   -- pr | issue | run
+            ALTER TABLE personal ADD COLUMN waits_on TEXT;                -- "owner/repo#123" this snooze waits for
+            CREATE TABLE IF NOT EXISTS unfollowed (id TEXT PRIMARY KEY, at TEXT NOT NULL);
+            -- "Mute" became "stop following".
+            INSERT OR IGNORE INTO unfollowed (id, at) SELECT pr_id, set_at FROM personal WHERE state = 'muted';
+            DELETE FROM personal WHERE state = 'muted';
+            PRAGMA user_version = 1;
+            COMMIT;
+            "#,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -87,45 +109,104 @@ pub struct Prev {
     pub since: String,
 }
 
-pub fn upsert_pr(conn: &Connection, pr: &PullRequest, d: &Derived, sync_id: i64) -> Result<Option<Prev>> {
+/// Anything we track: a PR, an issue, or a failing default branch ("run").
+pub struct Tracked {
+    pub id: String,
+    pub kind: &'static str,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub author: String,
+    pub author_avatar: Option<String>,
+    pub is_draft: bool,
+    pub gh_state: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub review_requested: bool,
+}
+
+impl Tracked {
+    pub fn from_pr(pr: &PullRequest) -> Self {
+        Self {
+            id: pr.id.clone(),
+            kind: "pr",
+            repo: pr.repository.name_with_owner.clone(),
+            number: pr.number,
+            title: pr.title.clone(),
+            url: pr.url.clone(),
+            author: pr.author.as_ref().map_or("ghost".into(), |a| a.login.clone()),
+            author_avatar: pr.author.as_ref().and_then(|a| a.avatar_url.clone()),
+            is_draft: pr.is_draft,
+            gh_state: pr.state.clone(),
+            created_at: pr.created_at.clone(),
+            updated_at: pr.updated_at.clone(),
+            review_requested: pr.matched_review_requested,
+        }
+    }
+
+    pub fn from_issue(i: &Issue) -> Self {
+        Self {
+            id: i.id.clone(),
+            kind: "issue",
+            repo: i.repository.name_with_owner.clone(),
+            number: i.number,
+            title: i.title.clone(),
+            url: i.url.clone(),
+            author: i.author.as_ref().map_or("ghost".into(), |a| a.login.clone()),
+            author_avatar: i.author.as_ref().and_then(|a| a.avatar_url.clone()),
+            is_draft: false,
+            gh_state: i.state.clone(),
+            created_at: i.created_at.clone(),
+            updated_at: i.updated_at.clone(),
+            review_requested: false,
+        }
+    }
+
+    pub fn as_ref(&self) -> PrRef {
+        PrRef { id: self.id.clone(), repo: self.repo.clone(), number: self.number, title: self.title.clone(), url: self.url.clone() }
+    }
+}
+
+pub fn upsert(conn: &Connection, t: &Tracked, d: &Derived, sync_id: i64) -> Result<Option<Prev>> {
     let prev = conn
-        .query_row("SELECT auto_state, since FROM prs WHERE id = ?1", [&pr.id], |r| {
+        .query_row("SELECT auto_state, since FROM prs WHERE id = ?1", [&t.id], |r| {
             Ok(Prev { auto_state: r.get(0)?, since: r.get(1)? })
         })
         .optional()?;
-    let author = pr.author.as_ref();
     conn.execute(
         "INSERT INTO prs (id, repo, number, title, url, author, author_avatar, is_draft, is_mine, ci,
                           auto_state, auto_reason, since, created_at, updated_at, gh_state, is_open, last_sync,
-                          review_requested)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                          review_requested, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(id) DO UPDATE SET
             repo = excluded.repo, number = excluded.number, title = excluded.title, url = excluded.url,
             author = excluded.author, author_avatar = excluded.author_avatar, is_draft = excluded.is_draft,
             is_mine = excluded.is_mine, ci = excluded.ci, auto_state = excluded.auto_state,
             auto_reason = excluded.auto_reason, since = excluded.since, updated_at = excluded.updated_at,
             gh_state = excluded.gh_state, is_open = excluded.is_open, last_sync = excluded.last_sync,
-            review_requested = excluded.review_requested",
+            review_requested = excluded.review_requested, kind = excluded.kind",
         params![
-            pr.id,
-            pr.repository.name_with_owner,
-            pr.number,
-            pr.title,
-            pr.url,
-            author.map(|a| a.login.as_str()).unwrap_or("ghost"),
-            author.and_then(|a| a.avatar_url.as_deref()),
-            pr.is_draft,
+            t.id,
+            t.repo,
+            t.number,
+            t.title,
+            t.url,
+            t.author,
+            t.author_avatar,
+            t.is_draft,
             d.is_mine,
             d.ci.as_str(),
             d.state,
             d.reason,
             crate::derive::fmt_ts(d.since),
-            pr.created_at,
-            pr.updated_at,
-            pr.state,
-            pr.state == "OPEN",
+            t.created_at,
+            t.updated_at,
+            t.gh_state,
+            t.gh_state == "OPEN",
             sync_id,
-            pr.matched_review_requested,
+            t.review_requested,
+            t.kind,
         ],
     )?;
     Ok(prev)
@@ -156,7 +237,7 @@ pub fn touch(conn: &Connection, id: &str, sync_id: i64) -> Result<()> {
 
 /// Open PRs we know about that weren't returned by the latest sync.
 pub fn stale_open_ids(conn: &Connection, sync_id: i64) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM prs WHERE is_open = 1 AND last_sync != ?1")?;
+    let mut stmt = conn.prepare("SELECT id FROM prs WHERE is_open = 1 AND last_sync != ?1 AND kind != 'run'")?;
     let ids = stmt.query_map([sync_id], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
     Ok(ids)
 }
@@ -166,6 +247,33 @@ pub fn mark_gone(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ids of failing-branch items currently open.
+pub fn open_runs(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM prs WHERE is_open = 1 AND kind = 'run'")?;
+    let ids = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
+/// Repos with recent activity among followed items: where we watch default-branch CI.
+pub fn active_repos(conn: &Connection, since: &str, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT repo FROM prs
+         WHERE kind != 'run' AND updated_at >= ?1
+           AND repo NOT IN (SELECT repo FROM hidden_repos)
+           AND id NOT IN (SELECT id FROM unfollowed)
+         GROUP BY repo ORDER BY MAX(updated_at) DESC LIMIT ?2",
+    )?;
+    let repos = stmt.query_map(params![since, limit as i64], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(repos)
+}
+
+/// (key "owner/repo#n", title) for every open PR/issue, used to match "after the API migration" to a PR.
+pub fn open_titles(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, repo || '#' || number, title FROM prs WHERE is_open = 1 AND kind != 'run'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Personal {
@@ -173,22 +281,24 @@ pub struct Personal {
     pub note: Option<String>,
     pub until: Option<String>,
     pub set_at: String,
+    /// "owner/repo#123": come back when that PR/issue merges or closes.
+    pub waits_on: Option<String>,
 }
 
 pub fn get_personal(conn: &Connection, pr_id: &str) -> Result<Option<Personal>> {
     Ok(conn
-        .query_row("SELECT state, note, until, set_at FROM personal WHERE pr_id = ?1", [pr_id], |r| {
-            Ok(Personal { state: r.get(0)?, note: r.get(1)?, until: r.get(2)?, set_at: r.get(3)? })
+        .query_row("SELECT state, note, until, set_at, waits_on FROM personal WHERE pr_id = ?1", [pr_id], |r| {
+            Ok(Personal { state: r.get(0)?, note: r.get(1)?, until: r.get(2)?, set_at: r.get(3)?, waits_on: r.get(4)? })
         })
         .optional()?)
 }
 
 pub fn set_personal(conn: &Connection, pr_id: &str, p: &Personal) -> Result<()> {
     conn.execute(
-        "INSERT INTO personal (pr_id, state, note, until, set_at) VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO personal (pr_id, state, note, until, set_at, waits_on) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(pr_id) DO UPDATE SET state = excluded.state, note = excluded.note,
-            until = excluded.until, set_at = excluded.set_at",
-        params![pr_id, p.state, p.note, p.until, p.set_at],
+            until = excluded.until, set_at = excluded.set_at, waits_on = excluded.waits_on",
+        params![pr_id, p.state, p.note, p.until, p.set_at, p.waits_on],
     )?;
     Ok(())
 }
@@ -204,6 +314,13 @@ pub fn mark_seen(conn: &Connection, pr_id: &str, at: &str) -> Result<()> {
 pub fn clear_personal(conn: &Connection, pr_id: &str) -> Result<()> {
     conn.execute("DELETE FROM personal WHERE pr_id = ?1", [pr_id])?;
     Ok(())
+}
+
+/// Snoozes waiting on another PR/issue: (pr_id, waits_on, note).
+pub fn waiting_on_refs(conn: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT pr_id, waits_on, note FROM personal WHERE state = 'later' AND waits_on IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Snoozes whose time has come.
@@ -235,16 +352,6 @@ pub struct PrRef {
 }
 
 impl PrRef {
-    pub fn from_pr(pr: &PullRequest) -> Self {
-        Self {
-            id: pr.id.clone(),
-            repo: pr.repository.name_with_owner.clone(),
-            number: pr.number,
-            title: pr.title.clone(),
-            url: pr.url.clone(),
-        }
-    }
-
     pub fn load(conn: &Connection, id: &str) -> Result<Option<Self>> {
         Ok(conn
             .query_row("SELECT id, repo, number, title, url FROM prs WHERE id = ?1", [id], |r| {
@@ -252,6 +359,10 @@ impl PrRef {
             })
             .optional()?)
     }
+}
+
+pub fn activity_exists(conn: &Connection, key: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT 1 FROM activity WHERE key = ?1", [key], |_| Ok(())).optional()?.is_some())
 }
 
 /// Returns true if the row was new.
@@ -313,6 +424,8 @@ pub fn list_activity(conn: &Connection, since: &str) -> Result<Vec<Activity>> {
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub id: String,
+    /// pr | issue | run
+    pub kind: String,
     pub repo: String,
     pub number: i64,
     pub title: String,
@@ -341,9 +454,11 @@ pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
         "SELECT p.id, p.repo, p.number, p.title, p.url, p.author, p.author_avatar, p.is_draft, p.is_mine, p.ci,
                 p.auto_state, p.auto_reason, p.since, p.updated_at,
                 s.state, s.note, s.until, s.set_at,
-                COALESCE(v.at, (SELECT value FROM settings WHERE key = 'initialized_at'), '')
+                COALESCE(v.at, (SELECT value FROM settings WHERE key = 'initialized_at'), ''),
+                p.kind, s.waits_on
          FROM prs p LEFT JOIN personal s ON s.pr_id = p.id LEFT JOIN seen v ON v.pr_id = p.id
          WHERE p.is_open = 1 AND p.repo NOT IN (SELECT repo FROM hidden_repos)
+           AND p.id NOT IN (SELECT id FROM unfollowed)
          ORDER BY p.since DESC",
     )?;
     let rows = stmt
@@ -353,6 +468,7 @@ pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
                 note: r.get(15).unwrap_or(None),
                 until: r.get(16).unwrap_or(None),
                 set_at: r.get(17).unwrap_or_default(),
+                waits_on: r.get(20).unwrap_or(None),
             });
             let auto_state: String = r.get(10)?;
             let (state, reminder_due) = match personal.as_ref().map(|p| p.state.as_str()) {
@@ -366,6 +482,7 @@ pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
             let is_new = (reminder_due || crate::derive::is_actionable(&state)) && event_at > seen_at;
             Ok(Item {
                 id: r.get(0)?,
+                kind: r.get(19)?,
                 repo: r.get(1)?,
                 number: r.get(2)?,
                 title: r.get(3)?,
@@ -408,6 +525,61 @@ pub fn list_repos(conn: &Connection) -> Result<Vec<RepoInfo>> {
     Ok(rows)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowItem {
+    pub id: String,
+    pub kind: String,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub author: String,
+    pub is_mine: bool,
+    pub state: String,
+    pub updated_at: String,
+    pub followed: bool,
+}
+
+/// Every open item, followed or not, for the Following screen.
+pub fn list_following(conn: &Connection) -> Result<Vec<FollowItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.kind, p.repo, p.number, p.title, p.author, p.is_mine, p.auto_state, p.updated_at,
+                NOT EXISTS(SELECT 1 FROM unfollowed u WHERE u.id = p.id)
+         FROM prs p WHERE p.is_open = 1 AND p.repo NOT IN (SELECT repo FROM hidden_repos)
+         ORDER BY p.repo COLLATE NOCASE, p.updated_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(FollowItem {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                repo: r.get(2)?,
+                number: r.get(3)?,
+                title: r.get(4)?,
+                author: r.get(5)?,
+                is_mine: r.get(6)?,
+                state: r.get(7)?,
+                updated_at: r.get(8)?,
+                followed: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn set_followed(conn: &Connection, id: &str, followed: bool, at: &str) -> Result<()> {
+    if followed {
+        conn.execute("DELETE FROM unfollowed WHERE id = ?1", [id])?;
+    } else {
+        conn.execute("INSERT OR IGNORE INTO unfollowed (id, at) VALUES (?1, ?2)", params![id, at])?;
+    }
+    Ok(())
+}
+
+pub fn is_followed(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT 1 FROM unfollowed WHERE id = ?1", [id], |_| Ok(())).optional()?.is_none())
+}
+
 pub fn set_repo_hidden(conn: &Connection, repo: &str, hidden: bool) -> Result<()> {
     if hidden {
         conn.execute("INSERT OR IGNORE INTO hidden_repos (repo) VALUES (?1)", [repo])?;
@@ -427,7 +599,27 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed;",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    /// Opens a copy of a real database with the current schema code:
+    /// `DEV_INBOX_DB_COPY=/path/to/copy.sqlite3 cargo test migrate_copy -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn migrate_copy() {
+        let path = std::env::var("DEV_INBOX_DB_COPY").expect("DEV_INBOX_DB_COPY");
+        let conn = super::open(std::path::Path::new(&path)).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let items = super::list_items(&conn).unwrap();
+        let following = super::list_following(&conn).unwrap();
+        println!("user_version={v} items={} following={} kinds={:?}", items.len(), following.len(),
+            items.iter().map(|i| i.kind.as_str()).collect::<std::collections::BTreeSet<_>>());
+        // Opening twice must be a no-op.
+        drop(conn);
+        super::open(std::path::Path::new(&path)).unwrap();
+    }
 }

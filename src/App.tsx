@@ -5,6 +5,8 @@ import { groupItems } from "./lib/states";
 import { age } from "./lib/time";
 import { CommandPalette, type View } from "./components/CommandPalette";
 import { AllPrs, History, SettingsView, SignIn, Today } from "./components/Views";
+import { Following } from "./components/Following";
+import { setAllItems } from "./lib/store";
 import { onToast, type Toast } from "./lib/toast";
 import "./styles.css";
 
@@ -12,6 +14,7 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "today", label: "Today" },
   { id: "all", label: "All" },
   { id: "history", label: "History" },
+  { id: "following", label: "Following" },
   { id: "settings", label: "Settings" },
 ];
 
@@ -36,6 +39,7 @@ export default function App() {
 
   const reload = useCallback(async () => {
     const next = await api.getInbox();
+    setAllItems(next.items);
     setInbox(next);
     setSyncing(next.syncing);
     setVersion((v) => v + 1);
@@ -74,7 +78,7 @@ export default function App() {
       }
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
       if (palette || tag === "input" || tag === "select" || e.metaKey || e.ctrlKey || e.altKey) return;
-      const idx = ["1", "2", "3", "4"].indexOf(e.key);
+      const idx = ["1", "2", "3", "4", "5"].indexOf(e.key);
       if (idx >= 0) setView(VIEWS[idx].id);
       else if (e.key === "r") sync();
       else if (e.key === "/") {
@@ -126,7 +130,7 @@ export default function App() {
       )}
 
       <main className="content">
-        {firstLoad && view !== "settings" ? (
+        {firstLoad && view !== "settings" && view !== "following" ? (
           <div className="empty big">
             <div className="spin big">↻</div>
             Fetching your pull requests from GitHub… the first sync can take up to a minute.
@@ -136,6 +140,7 @@ export default function App() {
             {view === "today" && <Today items={items} now={now} active={!palette} />}
             {view === "all" && <AllPrs items={items} now={now} active={!palette} />}
             {view === "history" && <History version={version} />}
+            {view === "following" && <Following version={version} />}
           </>
         )}
         {view === "settings" && (

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { Item, StateId } from "../lib/api";
-import { copyCheckout, openItem, rerunChecks, setStates } from "../lib/actions";
-import { MANUAL_STATES, STATES } from "../lib/states";
+import { copyCheckout, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
+import { MANUAL_STATES, STATES, shortRef } from "../lib/states";
+import { matchTitles } from "../lib/store";
 import { SNOOZE_PRESETS, age, untilLabel } from "../lib/time";
 
 const CI_LABEL: Record<Item["ci"], string | null> = {
@@ -39,9 +40,12 @@ export function PrRow({
   let reason = item.reason;
   if (item.reminderDue) reason = item.personal?.note ? `⏰ ${item.personal.note}` : "⏰ Reminder due";
   else if (personal?.state === "later") {
-    reason = [personal.note, personal.until ? `until ${untilLabel(personal.until)}` : "until something changes"]
-      .filter(Boolean)
-      .join(" · ");
+    const when = personal.until
+      ? `until ${untilLabel(personal.until)}`
+      : personal.waitsOn
+        ? `until ${personal.waitsOn.split("/")[1] ?? personal.waitsOn} merges or closes`
+        : "until something changes";
+    reason = [personal.note, when].filter(Boolean).join(" · ");
   } else if (personal) reason = `Marked ${STATES[personal.state as StateId]?.label.toLowerCase() ?? personal.state} · ${item.reason}`;
 
   const ci = CI_LABEL[item.ci];
@@ -65,17 +69,16 @@ export function PrRow({
       <div className="row-main">
         <div className="row-title">
           {item.isNew && <span className="new-dot" title="New since you last looked" />}
+          {item.kind !== "pr" && <span className={`kind kind-${item.kind}`}>{item.kind === "issue" ? "Issue" : "Branch"}</span>}
           <span className="who">{item.isMine ? "You" : item.author}</span>
           <span className="sep">·</span>
           <span className="title">{item.title}</span>
         </div>
         <div className="row-sub">
-          <span className="repo">
-            {item.repo.split("/")[1]}#{item.number}
-          </span>
+          <span className="repo">{shortRef(item)}</span>
           <span className="sep">·</span>
           <span className="reason">{reason}</span>
-          {ci && !reason.toLowerCase().includes("ci") && !reason.includes("checks") && (
+          {ci && item.kind === "pr" && !reason.toLowerCase().includes("ci") && !reason.includes("checks") && (
             <span className={`pill ci-${item.ci}`}>{ci}</span>
           )}
           {item.isDraft && !item.isMine && <span className="pill">Draft</span>}
@@ -125,10 +128,12 @@ export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => v
     };
   }, [onClose]);
 
-  const act = async (state: StateId | null, until?: string | null) => {
+  const act = async (state: StateId | null, until?: string | null, noteOverride?: string) => {
     onClose();
-    await setStates(items, state, { until, note: state === "later" ? note : null });
+    await setStates(items, state, { until, note: state === "later" ? (noteOverride ?? note) : null });
   };
+  // "after the API migration" → offer to wait for the PR that matches.
+  const waitFor = single && note.trim().length >= 3 ? matchTitles(note, single.id) : [];
   const run = (fn: () => void) => {
     onClose();
     fn();
@@ -147,6 +152,16 @@ export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => v
           if (e.key === "Enter") act("later", SNOOZE_PRESETS[1].until());
         }}
       />
+      {waitFor.map((w) => (
+        <button
+          key={w.id}
+          className="menu-item"
+          title="Comes back when this merges or closes"
+          onClick={() => act("later", null, `${note.trim()} (${w.repo}#${w.number})`)}
+        >
+          ⏳ Until {shortRef(w)} merges: <span className="muted">{w.title}</span>
+        </button>
+      ))}
       {SNOOZE_PRESETS.map((p) => (
         <button key={p.id} className="menu-item" onClick={() => act("later", p.until())}>
           📌 {p.label}
@@ -162,12 +177,16 @@ export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => v
           {STATES[s].emoji} {STATES[s].label}
         </button>
       ))}
-      <button className="menu-item" onClick={() => act("muted")} title="Hide from Today; never resurfaces">
-        🔇 Mute
+      <div className="menu-sep" />
+      <button
+        className="menu-item"
+        onClick={() => run(() => unfollow(items))}
+        title="Gone from Today, counts and notifications. Re-follow from the Following tab."
+      >
+        🔕 Stop following{items.length > 1 ? ` all ${items.length}` : ""}
       </button>
-      {single && (
+      {single?.kind === "pr" && (
         <>
-          <div className="menu-sep" />
           {single.ci === "failure" && (
             <button className="menu-item" onClick={() => run(() => rerunChecks(single))}>
               ↻ Re-run failed checks

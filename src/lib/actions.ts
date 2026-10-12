@@ -11,7 +11,7 @@ export function openItem(item: Item) {
   openUrl(item.url);
 }
 
-const plural = (n: number) => (n === 1 ? "1 PR" : `${n} PRs`);
+const plural = (n: number) => (n === 1 ? "1 item" : `${n} items`);
 
 export async function setStates(
   items: Item[],
@@ -29,9 +29,26 @@ export async function setStates(
     if (opts.quiet) return;
     const what = items.length === 1 ? `“${items[0].title}”` : plural(items.length);
     if (state === null) toast(`${what} back to automatic`);
-    else if (state === "later")
-      toast(`${what} parked ${opts.until ? `until ${untilLabel(opts.until)}` : "until something changes"}`);
+    else if (state === "later") {
+      const ref = opts.note?.match(/[\w.-]+\/[\w.-]+#\d+|#\d+/)?.[0];
+      const when = opts.until ? `until ${untilLabel(opts.until)}` : ref ? `until ${ref} merges or closes` : "until something changes";
+      toast(`${what} parked ${when}`);
+    }
     else toast(`${what} → ${STATES[state].emoji} ${STATES[state].label}`);
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+export async function unfollow(items: Item[]) {
+  if (!items.length) return;
+  try {
+    await api.setFollowed(
+      items.map((i) => i.id),
+      false,
+    );
+    const what = items.length === 1 ? `“${items[0].title}”` : plural(items.length);
+    toast(`Stopped following ${what} · undo in the Following tab`);
   } catch (e) {
     toast(String(e), true);
   }

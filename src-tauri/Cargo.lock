@@ -815,6 +815,8 @@ dependencies = [
  "chrono",
  "futures",
  "keyring",
+ "mac-notification-sys",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

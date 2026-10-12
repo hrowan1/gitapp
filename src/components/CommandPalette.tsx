@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Item } from "../lib/api";
-import { copyCheckout, openItem, rerunChecks, setStates } from "../lib/actions";
+import { copyCheckout, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
 import { parseAction, parseQuery, SUGGESTIONS, type PaletteAction } from "../lib/query";
-import { STATES, compareItems, groupItems } from "../lib/states";
+import { STATES, compareItems, groupItems, shortRef } from "../lib/states";
 import { SNOOZE_PRESETS, age } from "../lib/time";
 
-export type View = "today" | "all" | "history" | "settings";
+export type View = "today" | "all" | "history" | "following" | "settings";
 
 interface Command {
   id: string;
@@ -32,6 +32,8 @@ function runAction(action: PaletteAction, item: Item) {
       return rerunChecks(item);
     case "checkout":
       return copyCheckout(item);
+    case "unfollow":
+      return unfollow([item]);
   }
 }
 
@@ -46,10 +48,10 @@ function actionsFor(item: Item): { label: string; action: PaletteAction }[] {
     })),
     { label: "⏳ Mark as waiting for response", action: { kind: "state", state: "waiting" } },
     { label: "🔧 Mark as I need to make changes", action: { kind: "state", state: "needs_changes" } },
-    { label: "🔇 Mute", action: { kind: "state", state: "muted" } },
-    { label: "⧉ Copy checkout command", action: { kind: "checkout" } },
+    { label: "🔕 Stop following", action: { kind: "unfollow" } },
   ];
-  if (item.ci === "failure") list.splice(2, 0, { label: "↻ Re-run failed checks", action: { kind: "rerun" } });
+  if (item.kind === "pr") list.push({ label: "⧉ Copy checkout command", action: { kind: "checkout" } });
+  if (item.kind === "pr" && item.ci === "failure") list.splice(2, 0, { label: "↻ Re-run failed checks", action: { kind: "rerun" } });
   if (item.personal) list.push({ label: "↺ Back to automatic", action: { kind: "reset" } });
   return list;
 }
@@ -76,7 +78,8 @@ export function CommandPalette({
     { id: "today", label: "Go to Today", hint: "1", run: () => onNavigate("today") },
     { id: "all", label: "Go to All pull requests", hint: "2", run: () => onNavigate("all") },
     { id: "history", label: "Go to History", hint: "3", run: () => onNavigate("history") },
-    { id: "settings", label: "Go to Settings", hint: "4", run: () => onNavigate("settings") },
+    { id: "following", label: "Choose what to follow", hint: "4", run: () => onNavigate("following") },
+    { id: "settings", label: "Go to Settings", hint: "5", run: () => onNavigate("settings") },
     { id: "sync", label: "Sync with GitHub now", hint: "r", run: onSync },
   ];
 
@@ -140,7 +143,7 @@ export function CommandPalette({
 
   const prCount = entries.filter((e) => e.kind === "pr").length;
   let summary: string | null = null;
-  if (focus) summary = `${focus.repo.split("/")[1]}#${focus.number} · ${focus.title}`;
+  if (focus) summary = `${shortRef(focus)} · ${focus.title}`;
   else if (action) summary = `${action.label} → ${prCount ? "pick a PR" : "no matching PR"}`;
   else if (q.trim() && parsed.understood && !parsed.view) summary = `${prCount} ${prCount === 1 ? "PR" : "PRs"} ${parsed.label}`;
 
@@ -150,7 +153,7 @@ export function CommandPalette({
         <div className="pal-input-row">
           {focus && (
             <span className="pal-chip" title="Backspace to go back">
-              #{focus.number}
+              {focus.kind === "run" ? "branch" : `#${focus.number}`}
             </span>
           )}
           <input
@@ -221,7 +224,7 @@ export function CommandPalette({
                     <span className="strong">{e.item.title}</span>
                     <span className="muted">
                       {" "}
-                      · {e.item.repo.split("/")[1]}#{e.item.number} · {e.item.isMine ? "you" : e.item.author} ·{" "}
+                      · {shortRef(e.item)} · {e.item.isMine ? "you" : e.item.author} ·{" "}
                       {e.item.reason}
                     </span>
                   </span>

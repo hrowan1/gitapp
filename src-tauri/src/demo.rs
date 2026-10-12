@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::db;
 use crate::derive::{self, fmt_ts};
-use crate::github::PullRequest;
+use crate::github::{Issue, PullRequest};
 
 const ME: &str = "you";
 
@@ -72,6 +72,29 @@ fn build(i: usize, s: &Spec) -> PullRequest {
     pr
 }
 
+/// (number, title, author, assigned to me, [(comment author, hours ago, body)], created hours ago)
+type IssueSpec = (i64, &'static str, &'static str, bool, &'static [(&'static str, i64, &'static str)], i64);
+
+fn build_issue(repo: &str, (number, title, author, assigned, comments, created_h): &IssueSpec) -> Issue {
+    let latest = comments.iter().map(|c| c.1).min().unwrap_or(*created_h);
+    serde_json::from_value(json!({
+        "id": format!("DEMO_ISSUE_{number}"),
+        "number": number, "title": title,
+        "url": format!("https://github.com/{repo}/issues/{number}"),
+        "state": "OPEN", "createdAt": ago(*created_h), "updatedAt": ago(latest), "closedAt": null,
+        "author": user(author),
+        "repository": { "nameWithOwner": repo },
+        "assignees": { "nodes": if *assigned { vec![json!({ "login": ME })] } else { vec![] } },
+        "comments": { "nodes": comments.iter().enumerate().map(|(j, (a, h, body))| json!({
+            "id": format!("DEMO_IC_{number}_{j}"), "createdAt": ago(*h), "body": body, "author": user(a)
+        })).collect::<Vec<_>>() },
+        "timelineItems": { "nodes": if *assigned {
+            vec![json!({ "__typename": "AssignedEvent", "createdAt": ago(created_h - 1), "assignee": user(ME) })]
+        } else { vec![] } },
+    }))
+    .expect("demo issue")
+}
+
 pub fn seed(conn: &Connection) -> Result<()> {
     if db::get_setting(conn, "login")?.is_some() {
         return Ok(());
@@ -92,15 +115,25 @@ pub fn seed(conn: &Connection) -> Result<()> {
         Spec { repo: "acme/ios", number: 637, title: "Release 4.12: changelog", author: "release-train", created_h: 9, updated_h: 9, draft: false, ci: Some("FAILURE"), decision: None, requested: &[ME], reviews: &[], comments: &[], push_h: 9, review_requested: true },
         Spec { repo: "acme/ios", number: 636, title: "Release 4.12: feature flags", author: "release-train", created_h: 10, updated_h: 10, draft: false, ci: Some("SUCCESS"), decision: None, requested: &[ME], reviews: &[], comments: &[], push_h: 10, review_requested: true },
         Spec { repo: "acme/ios", number: 634, title: "Release 4.12: App Store metadata", author: "release-train", created_h: 12, updated_h: 12, draft: false, ci: Some("SUCCESS"), decision: None, requested: &[ME], reviews: &[], comments: &[], push_h: 12, review_requested: true },
+        Spec { repo: "acme/api", number: 1310, title: "API migration: move orders to v2", author: "james", created_h: 90, updated_h: 8, draft: false, ci: Some("SUCCESS"), decision: None, requested: &[], reviews: &[(ME, "APPROVED", 8)], comments: &[], push_h: 30, review_requested: false },
+        Spec { repo: "acme/web", number: 471, title: "Search: debounce the typeahead", author: "priya", created_h: 60, updated_h: 1, draft: false, ci: Some("SUCCESS"), decision: None, requested: &[], reviews: &[(ME, "COMMENTED", 20), ("priya", "COMMENTED", 1)], comments: &[], push_h: 50, review_requested: false },
         Spec { repo: "acme/admin", number: 301, title: "Bulk user import", author: "lena", created_h: 200, updated_h: 150, draft: false, ci: Some("SUCCESS"), decision: Some("APPROVED"), requested: &[], reviews: &[(ME, "APPROVED", 150)], comments: &[], push_h: 160, review_requested: false },
     ];
 
     let sync_id = Utc::now().timestamp_millis();
+    let ctx = derive::Ctx::new(ME, &[]);
     for (i, s) in specs.iter().enumerate() {
-        let pr = build(i, s);
-        let d = derive::derive(&pr, &derive::Ctx::new(ME, &[]));
-        db::upsert_pr(conn, &pr, &d, sync_id)?;
-        let r = db::PrRef::from_pr(&pr);
+        let mut pr = build(i, s);
+        if s.number == 471 {
+            // A reply inside a review thread the user started.
+            pr.review_threads = serde_json::from_value(json!({ "nodes": [{ "comments": { "nodes": [
+                { "id": "DEMO_T1", "createdAt": ago(20), "body": "Should this be 300ms?", "author": user(ME) },
+                { "id": "DEMO_T2", "createdAt": ago(1), "body": "Good call, changed it", "author": user("priya") }
+            ] } }] }))?;
+        }
+        let d = derive::derive(&pr, &ctx);
+        db::upsert(conn, &db::Tracked::from_pr(&pr), &d, sync_id)?;
+        let r = db::Tracked::from_pr(&pr).as_ref();
         if s.author == ME {
             db::record_activity(conn, &db::ActivityRow { key: format!("opened:{}", pr.id), at: &pr.created_at, kind: "opened", pr: Some(&r), detail: "Opened".into() })?;
         }
@@ -116,9 +149,56 @@ pub fn seed(conn: &Connection) -> Result<()> {
     let snoozed = build(99, &Spec { repo: "acme/api", number: 1302, title: "Rename legacy order fields", author: "mike", created_h: 80, updated_h: 30, draft: false, ci: Some("SUCCESS"), decision: None, requested: &[], reviews: &[(ME, "COMMENTED", 30)], comments: &[], push_h: 79, review_requested: false });
     let mut snoozed = snoozed;
     snoozed.id = r.id.clone();
-    db::upsert_pr(conn, &snoozed, &derive::derive(&snoozed, &derive::Ctx::new(ME, &[])), sync_id)?;
-    db::set_personal(conn, &r.id, &db::Personal { state: "later".into(), note: Some("after the API migration".into()), until: Some(fmt_ts(Utc::now() + Duration::days(2))), set_at: ago(30) })?;
-    db::record_activity(conn, &db::ActivityRow { key: "marked:demo".into(), at: &ago(30), kind: "marked", pr: Some(&r), detail: "Marked “Come back later” — after the API migration".into() })?;
+    db::upsert(conn, &db::Tracked::from_pr(&snoozed), &derive::derive(&snoozed, &ctx), sync_id)?;
+    db::set_personal(
+        conn,
+        &r.id,
+        &db::Personal {
+            state: "later".into(),
+            note: Some("“Let's come back to this after the API migration lands”".into()),
+            until: None,
+            set_at: ago(30),
+            waits_on: Some("acme/api#1310".into()),
+        },
+    )?;
+    db::record_activity(conn, &db::ActivityRow { key: "marked:demo".into(), at: &ago(30), kind: "marked", pr: Some(&r), detail: "Remembered from your comment — back when acme/api#1310 merges or closes".into() })?;
+
+    // Issues.
+    let issues: [IssueSpec; 3] = [
+        (88, "Order export times out for large accounts", "lena", true, &[], 5),
+        (91, "Flaky test: checkout_spec timeouts on CI", "james", false, &[("james", 2, "@you any idea why this started after the refactor?")], 30),
+        (64, "Support SSO with Okta", ME, false, &[("priya", 4, "We need this for the enterprise pilot")], 200),
+    ];
+    for spec in &issues {
+        let issue = build_issue("acme/web", spec);
+        let t = db::Tracked::from_issue(&issue);
+        db::upsert(conn, &t, &derive::derive_issue(&issue, &ctx), sync_id)?;
+    }
+
+    // A red default branch in a repo the user works in.
+    let run = db::Tracked {
+        id: "RUN:acme/api".into(),
+        kind: "run",
+        repo: "acme/api".into(),
+        number: 0,
+        title: "main is failing: test, lint".into(),
+        url: "https://github.com/acme/api/actions".into(),
+        author: "james".into(),
+        author_avatar: None,
+        is_draft: false,
+        gh_state: "OPEN".into(),
+        created_at: ago(2),
+        updated_at: ago(2),
+        review_requested: false,
+    };
+    let d = derive::Derived {
+        state: derive::BROKEN,
+        reason: "Latest commit by james: Bump serde to 1.0.230".into(),
+        since: Utc::now() - Duration::hours(2),
+        is_mine: false,
+        ci: derive::Ci::Failure,
+    };
+    db::upsert(conn, &run, &d, sync_id)?;
 
     db::set_setting(conn, "login", ME)?;
     db::set_setting(conn, "last_sync", &fmt_ts(Utc::now()))?;
