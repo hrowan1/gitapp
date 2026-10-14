@@ -60,16 +60,13 @@ export function sectionOf(item: Item): SectionId {
   return item.isMine ? "mine" : "waiting";
 }
 
-/** Most urgent first: due reminders, then by state priority, then most recent. */
+/** Due reminders first, then latest GitHub activity first. */
 export function compareItems(a: Item, b: Item): number {
   if (a.reminderDue !== b.reminderDue) return a.reminderDue ? -1 : 1;
-  const pa = ACTIONABLE.indexOf(a.state);
-  const pb = ACTIONABLE.indexOf(b.state);
-  if (pa !== pb) return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
   if (a.state === "later" && b.state === "later") {
     return (a.personal?.until ?? "9999").localeCompare(b.personal?.until ?? "9999");
   }
-  return b.since.localeCompare(a.since);
+  return b.updatedAt.localeCompare(a.updatedAt);
 }
 
 export function groupItems(items: Item[]): Record<SectionId, Item[]> {

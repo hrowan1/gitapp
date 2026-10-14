@@ -254,7 +254,7 @@ export function CommandPalette({
                       {e.item.reason}
                     </span>
                   </span>
-                  <span className="muted">{age(e.item.since)}</span>
+                  <span className="muted">{age(e.item.updatedAt)}</span>
                 </>
               )}
             </div>

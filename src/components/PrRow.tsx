@@ -91,8 +91,8 @@ export function PrRow({
         )}
       </div>
       <div className="row-right">
-        <span className="age" title={new Date(item.since).toLocaleString()}>
-          {age(item.since, now)}
+        <span className="age" title={`Last activity ${new Date(item.updatedAt).toLocaleString()}`}>
+          {age(item.updatedAt, now)}
         </span>
         <div className="row-actions" onClick={(e) => e.stopPropagation()}>
           {item.kind !== "run" && item.state === "replied" && (

@@ -12,6 +12,7 @@ import {
 } from "../lib/api";
 import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
+import { setTheme as applyThemeChoice, getTheme, type Theme } from "../lib/theme";
 import { clock, friendlyDate } from "../lib/time";
 import { PrList } from "./PrList";
 
@@ -228,6 +229,7 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
   const [settings, setSettings] = useState<Settings | null>(null);
   const [repos, setRepos] = useState<RepoInfo[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [theme, setTheme] = useState<Theme>(getTheme);
 
   useEffect(() => {
     api.getSettings().then(setSettings);
@@ -280,6 +282,25 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
             </button>
           )}
         </div>
+      </section>
+
+      <section className="card">
+        <h2>Appearance</h2>
+        <label className="field">
+          <span>Theme</span>
+          <select
+            value={theme}
+            onChange={(e) => {
+              const t = e.target.value as Theme;
+              setTheme(t);
+              applyThemeChoice(t);
+            }}
+          >
+            <option value="system">Match system</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
       </section>
 
       {settings && (
