@@ -20,6 +20,7 @@ export function PrRow({
   onSelect,
   menuOpen,
   onMenu,
+  focusNote,
   nested,
 }: {
   item: Item;
@@ -28,6 +29,8 @@ export function PrRow({
   onSelect: () => void;
   menuOpen: boolean;
   onMenu: (open: boolean) => void;
+  /** Menu was opened with `l`: put the cursor in the "come back later" note. */
+  focusNote?: boolean;
   nested?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -56,8 +59,20 @@ export function PrRow({
       ref={ref}
       className={`row${selected ? " selected" : ""}${nested ? " nested" : ""}`}
       onMouseEnter={onSelect}
-      onClick={() => openItem(item)}
+      // Click: actions menu. Double-click: open on GitHub. Right-click: actions menu.
+      onClick={(e) => {
+        if (e.detail === 1) onMenu(!menuOpen);
+      }}
+      onDoubleClick={() => {
+        onMenu(false);
+        openItem(item);
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onMenu(true);
+      }}
       role="button"
+      title="Click for actions · double-click to open on GitHub"
     >
       <span className="row-state" title={meta.label}>
         {meta.emoji}
@@ -94,7 +109,7 @@ export function PrRow({
         <span className="age" title={`Last activity ${new Date(item.updatedAt).toLocaleString()}`}>
           {age(item.updatedAt, now)}
         </span>
-        <div className="row-actions" onClick={(e) => e.stopPropagation()}>
+        <div className="row-actions" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
           {item.kind !== "run" && item.state === "replied" && (
             <button className="icon-btn" title="Reply (R)" onClick={() => openDialog("reply", item)}>
               ↩︎
@@ -110,20 +125,34 @@ export function PrRow({
           </button>
         </div>
       </div>
-      {menuOpen && <ActionMenu items={[item]} onClose={() => onMenu(false)} />}
+      {menuOpen && <ActionMenu items={[item]} onClose={() => onMenu(false)} focusNote={focusNote} />}
     </div>
   );
 }
 
 /** Snooze / mark / mute menu for one PR or a whole group. */
-export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => void }) {
+export function ActionMenu({
+  items,
+  onClose,
+  focusNote,
+}: {
+  items: Item[];
+  onClose: () => void;
+  focusNote?: boolean;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const single = items.length === 1 ? items[0] : null;
   const [note, setNote] = useState(single?.personal?.note ?? "");
 
   useEffect(() => {
+    ref.current?.scrollIntoView({ block: "nearest" });
+  }, []);
+
+  useEffect(() => {
     const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      // Clicks on the row that owns the menu toggle it themselves.
+      const owner = ref.current?.parentElement;
+      if (ref.current && !owner?.contains(e.target as Node)) onClose();
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -151,54 +180,20 @@ export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => v
   };
 
   return (
-    <div className="menu" ref={ref} onClick={(e) => e.stopPropagation()}>
-      <div className="menu-label">Come back later</div>
-      <input
-        className="menu-input"
-        placeholder="Why? e.g. after the API migration"
-        value={note}
-        autoFocus
-        onChange={(e) => setNote(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") act("later", SNOOZE_PRESETS[1].until());
-        }}
-      />
-      {waitFor.map((w) => (
-        <button
-          key={w.id}
-          className="menu-item"
-          title="Comes back when this merges or closes"
-          onClick={() => act("later", null, `${note.trim()} (${w.repo}#${w.number})`)}
-        >
-          ⏳ Until {shortRef(w)} merges: <span className="muted">{w.title}</span>
+    <div
+      className="menu"
+      ref={ref}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.stopPropagation()}
+    >
+      {single && (
+        <button className="menu-item" onClick={() => run(() => openItem(single))}>
+          ↗ Open on GitHub
         </button>
-      ))}
-      {SNOOZE_PRESETS.map((p) => (
-        <button key={p.id} className="menu-item" onClick={() => act("later", p.until())}>
-          📌 {p.label}
-        </button>
-      ))}
-      <div className="menu-label">Mark as</div>
-      {MANUAL_STATES.map((s) => (
-        <button
-          key={s}
-          className={`menu-item${single?.personal?.state === s ? " active" : ""}`}
-          onClick={() => act(s)}
-        >
-          {STATES[s].emoji} {STATES[s].label}
-        </button>
-      ))}
-      <div className="menu-sep" />
-      <button
-        className="menu-item"
-        onClick={() => run(() => unfollow(items))}
-        title="Gone from Today, counts and notifications. Re-follow from the Following tab."
-      >
-        🔕 Stop following{items.length > 1 ? ` all ${items.length}` : ""}
-      </button>
+      )}
       {single && single.kind !== "run" && (
         <>
-          <div className="menu-label">Act</div>
           <button className="menu-item" onClick={() => run(() => openDialog("reply", single))}>
             ↩︎ {single.context && single.state === "replied" ? `Reply to ${single.context.who}…` : "Comment…"}
           </button>
@@ -239,14 +234,55 @@ export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => v
           </button>
         </>
       )}
+      <div className="menu-label">Come back later</div>
+      <input
+        className="menu-input"
+        placeholder="Why? e.g. after the API migration"
+        value={note}
+        autoFocus={focusNote || !single}
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") act("later", SNOOZE_PRESETS[1].until());
+        }}
+      />
+      {waitFor.map((w) => (
+        <button
+          key={w.id}
+          className="menu-item"
+          title="Comes back when this merges or closes"
+          onClick={() => act("later", null, `${note.trim()} (${w.repo}#${w.number})`)}
+        >
+          ⏳ Until {shortRef(w)} merges: <span className="muted">{w.title}</span>
+        </button>
+      ))}
+      {SNOOZE_PRESETS.map((p) => (
+        <button key={p.id} className="menu-item" onClick={() => act("later", p.until())}>
+          📌 {p.label}
+        </button>
+      ))}
+      <div className="menu-label">Mark as</div>
+      {MANUAL_STATES.map((s) => (
+        <button
+          key={s}
+          className={`menu-item${single?.personal?.state === s ? " active" : ""}`}
+          onClick={() => act(s)}
+        >
+          {STATES[s].emoji} {STATES[s].label}
+        </button>
+      ))}
+      <div className="menu-sep" />
+      <button
+        className="menu-item"
+        onClick={() => run(() => unfollow(items))}
+        title="Gone from Today, counts and notifications. Re-follow from the Following tab."
+      >
+        🔕 Stop following{items.length > 1 ? ` all ${items.length}` : ""}
+      </button>
       {items.some((i) => i.personal) && (
-        <>
-          <div className="menu-sep" />
-          <button className="menu-item" onClick={() => act(null)}>
-            ↺ Back to automatic
-            {single ? ` (${STATES[single.autoState].label.toLowerCase()})` : ""}
-          </button>
-        </>
+        <button className="menu-item" onClick={() => act(null)}>
+          ↺ Back to automatic
+          {single ? ` (${STATES[single.autoState].label.toLowerCase()})` : ""}
+        </button>
       )}
     </div>
   );

@@ -55,6 +55,8 @@ Build a release `.app`/`.dmg`: `npm run tauri build`.
 - **Desktop notifications** when something new needs you (bursts are collapsed); on macOS, clicking one opens the PR/issue. Optional **morning summary** on weekdays.
 - **Filters** (All tab) by repo/org, author, state, CI, mine/others; hide repos in Settings.
 
+Mouse: click a row for its actions menu (open, reply, approve, merge, editor, come back later, mark as…) · double-click opens it on GitHub · right-click also opens the menu.
+
 Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `R` reply · `a` approve · `m` merge · `c` check out & open in editor · `s` standup · `r` sync · `1`–`5` switch tabs · `⌘K` or `/` command bar.
 
 ## How syncing works

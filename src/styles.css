@@ -350,6 +350,13 @@ a {
   padding: 9px 10px;
   border-radius: 8px;
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* Keep the note field in the actions menu editable. */
+.row .menu {
+  user-select: text;
+  -webkit-user-select: text;
 }
 .row.selected {
   background: var(--selected);
