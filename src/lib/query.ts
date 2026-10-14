@@ -66,7 +66,7 @@ const STOPWORDS = new Set(
 /** Words that only express intent; never used as title text. */
 const INTENT_WORD = /^(re-?review|review|repl|respon|answer|fail|broken|checks?$|merge|approv|ready|later|postpon|snooz|park|forg|stale|neglect|wait|block|pend|draft|change|fix|attention|focus|today|important|plate|new$|unread|changed|muted?$|mine$|yours?$|opened|wrote|issues?$|assigned$|branch|builds?$|main$|master$)/;
 
-const HISTORY = /yesterday|did i|i did|worked on|history|this week|last week|have i (done|reviewed)/;
+const HISTORY = /standup|stand-up|yesterday|did i|i did|worked on|history|this week|last week|have i (done|reviewed)/;
 
 export function parseQuery(raw: string, items: Item[]): ParsedQuery {
   const q = raw.toLowerCase().trim();
@@ -155,7 +155,9 @@ export type PaletteAction =
   | { kind: "open" }
   | { kind: "rerun" }
   | { kind: "checkout" }
-  | { kind: "unfollow" };
+  | { kind: "unfollow" }
+  | { kind: "dialog"; dialog: "reply" | "approve" | "request_changes" | "review_comment" | "merge" }
+  | { kind: "editor"; checkout: boolean };
 
 export interface ParsedAction {
   action: PaletteAction;
@@ -249,6 +251,18 @@ export function parseAction(raw: string): ParsedAction | null {
     return { action: { kind: "unfollow" }, label: "🔕 Stop following", target: q.slice(m[0].length).trim() };
   if (/^(unmute|reset|unsnooze)\b/.test(q))
     return { action: { kind: "reset" }, label: "↺ Back to automatic", target: q.replace(/^\S+/, "").trim() };
+  if ((m = q.match(/^approve\b/)))
+    return { action: { kind: "dialog", dialog: "approve" }, label: "✅ Approve", target: q.slice(m[0].length).trim() };
+  if ((m = q.match(/^request changes( on| to)?\b/)))
+    return { action: { kind: "dialog", dialog: "request_changes" }, label: "✋ Request changes", target: q.slice(m[0].length).trim() };
+  if ((m = q.match(/^(reply|respond|answer)( to| on)?\b/)))
+    return { action: { kind: "dialog", dialog: "reply" }, label: "↩︎ Reply", target: q.slice(m[0].length).trim() };
+  if ((m = q.match(/^comment( on)?\b/)))
+    return { action: { kind: "dialog", dialog: "reply" }, label: "↩︎ Comment", target: q.slice(m[0].length).trim() };
+  if ((m = q.match(/^merge\b/)))
+    return { action: { kind: "dialog", dialog: "merge" }, label: "🔀 Merge", target: q.slice(m[0].length).trim() };
+  if ((m = q.match(/^(open|edit)\b(.*)\bin (my )?(editor|ide|code|vs ?code|cursor|zed)$/)))
+    return { action: { kind: "editor", checkout: false }, label: "⌨︎ Open in editor", target: m[2].trim() };
   if (/^open\b/.test(q)) return { action: { kind: "open" }, label: "↗ Open", target: q.replace(/^open\b/, "").trim() };
   if (/^(re-?run|retry)\b/.test(q))
     return {
@@ -256,7 +270,9 @@ export function parseAction(raw: string): ParsedAction | null {
       label: "↻ Re-run failed checks",
       target: q.replace(/^(re-?run|retry)\b( (the )?(failed )?(checks?|ci|workflows?|jobs?|builds?)( on| for)?)?/, "").trim(),
     };
-  if (/^(check ?out|copy checkout)\b/.test(q))
-    return { action: { kind: "checkout" }, label: "⧉ Copy checkout command", target: q.replace(/^(check ?out|copy checkout)\b/, "").trim() };
+  if (/^copy checkout\b/.test(q))
+    return { action: { kind: "checkout" }, label: "⧉ Copy checkout command", target: q.replace(/^copy checkout\b/, "").trim() };
+  if (/^check ?out\b/.test(q))
+    return { action: { kind: "editor", checkout: true }, label: "⎇ Check out & open in editor", target: q.replace(/^check ?out\b/, "").trim() };
   return null;
 }

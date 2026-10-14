@@ -4,14 +4,15 @@ export interface Toast {
   id: number;
   text: string;
   error?: boolean;
+  action?: { label: string; run: () => void };
 }
 
 type Listener = (t: Toast) => void;
 const listeners = new Set<Listener>();
 let next = 1;
 
-export function toast(text: string, error = false) {
-  const t = { id: next++, text, error };
+export function toast(text: string, error = false, action?: Toast["action"]) {
+  const t = { id: next++, text, error, action };
   listeners.forEach((l) => l(t));
 }
 

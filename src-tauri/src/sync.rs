@@ -360,6 +360,8 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
                         created_at: b.committed_date.clone(),
                         updated_at: b.committed_date.clone(),
                         review_requested: false,
+                        branch: None,
+                        cross_repo: false,
                     };
                     let since = parse_ts(&b.committed_date).unwrap_or(now);
                     let red_days = (now - since).num_days();
@@ -373,6 +375,7 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
                         since,
                         is_mine: mine,
                         ci: Ci::Failure,
+                        context: None,
                     };
                     if red_days >= STALE_BRANCH_DAYS {
                         d.state = derive::STALE;

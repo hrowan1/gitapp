@@ -48,6 +48,31 @@ export interface Item {
   state: StateId;
   reminderDue: boolean;
   isNew: boolean;
+  branch?: string | null;
+  /** What the latest reply said, for "Replied to you". */
+  context?: ReplyContext | null;
+}
+
+export interface ReplyContext {
+  who: string;
+  body: string;
+  /** Reply goes into this review thread; otherwise it's a normal comment. */
+  threadId?: string | null;
+}
+
+export interface MergeOptions {
+  methods: ("SQUASH" | "MERGE" | "REBASE")[];
+  default: string;
+  mergeable: string;
+  state: string;
+}
+
+export interface EditorSettings {
+  editors: string[];
+  editor?: string | null;
+  roots: string[];
+  clones: Record<string, string>;
+  cloneDir: string;
 }
 
 export interface Inbox {
@@ -66,6 +91,8 @@ export interface Activity {
   title?: string | null;
   url?: string | null;
   detail: string;
+  isMine: boolean;
+  itemKind?: Kind | null;
 }
 
 export interface RepoInfo {
@@ -112,6 +139,18 @@ export const api = {
   markSeen: (prIds: string[]) => invoke<void>("mark_seen", { prIds }),
   rerunChecks: (prId: string) => invoke<string>("rerun_checks", { prId }),
   testNotification: () => invoke<void>("test_notification"),
+  submitReview: (prId: string, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body?: string) =>
+    invoke<string>("submit_review", { prId, event, body: body ?? null }),
+  sendComment: (itemId: string, body: string, threadId?: string | null) =>
+    invoke<string>("send_comment", { itemId, body, threadId: threadId ?? null }),
+  mergeOptions: (prId: string) => invoke<MergeOptions>("merge_options", { prId }),
+  mergePr: (prId: string, method: string) => invoke<string>("merge_pr", { prId, method }),
+  editorSettings: () => invoke<EditorSettings>("editor_settings"),
+  updateEditorSettings: (editor: string | null, roots: string[], cloneDir: string) =>
+    invoke<number>("update_editor_settings", { editor, roots, cloneDir }),
+  setRepoPath: (repo: string, path: string | null) => invoke<void>("set_repo_path", { repo, path }),
+  openLocally: (itemId: string, checkout: boolean) => invoke<string>("open_locally", { itemId, checkout }),
+  cloneAndOpen: (itemId: string, checkout: boolean) => invoke<string>("clone_and_open", { itemId, checkout }),
   getFollowing: () => invoke<FollowItem[]>("get_following"),
   setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),

@@ -63,6 +63,31 @@ export async function rerunChecks(item: Item) {
   }
 }
 
+/** Open the repo in the user's editor; with `checkout`, switch to the PR branch first (only if clean). */
+export async function openInEditor(item: Item, checkout: boolean) {
+  toast(checkout ? `Checking out #${item.number}…` : `Opening ${item.repo}…`);
+  try {
+    toast(await api.openLocally(item.id, checkout));
+  } catch (e) {
+    const msg = String(e);
+    if (msg.startsWith("NO_CLONE:")) {
+      toast(`${item.repo} isn't cloned on this machine.`, false, {
+        label: "Clone it",
+        run: async () => {
+          toast(`Cloning ${item.repo}…`);
+          try {
+            toast(await api.cloneAndOpen(item.id, checkout));
+          } catch (e2) {
+            toast(String(e2), true);
+          }
+        },
+      });
+    } else {
+      toast(msg, true);
+    }
+  }
+}
+
 export async function copyCheckout(item: Item) {
   const cmd = `gh pr checkout ${item.number} -R ${item.repo}`;
   try {

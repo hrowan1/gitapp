@@ -1,6 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { api, type Activity, type Item, type RepoInfo, type Session, type Settings, type StateId } from "../lib/api";
+import {
+  api,
+  type Activity,
+  type EditorSettings,
+  type Item,
+  type RepoInfo,
+  type Session,
+  type Settings,
+  type StateId,
+} from "../lib/api";
+import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
 import { clock, friendlyDate } from "../lib/time";
 import { PrList } from "./PrList";
@@ -142,7 +152,7 @@ const KIND_ICON: Record<Activity["kind"], string> = {
   update: "🔔",
 };
 
-export function History({ version }: { version: number }) {
+export function History({ version, onStandup }: { version: number; onStandup: () => void }) {
   const [days, setDays] = useState(7);
   const [mineOnly, setMineOnly] = useState(false);
   const [rows, setRows] = useState<Activity[]>([]);
@@ -170,6 +180,9 @@ export function History({ version }: { version: number }) {
           <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Only things I
           did
         </label>
+        <button className="primary standup-btn" onClick={onStandup} title="Write my standup (s)">
+          📝 Write my standup
+        </button>
       </div>
       {shown.length === 0 && (
         <div className="empty big">
@@ -324,6 +337,8 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
 
       {settings && <IgnoredUsers settings={settings} onSave={save} />}
 
+      <CodeAndEditor repos={repos.filter((r) => !r.hidden && r.openPrs > 0).map((r) => r.repo)} />
+
       <section className="card">
         <h2>Repositories</h2>
         <p className="muted">Hidden repositories are still synced but never shown or notified.</p>
@@ -440,6 +455,122 @@ function IgnoredUsers({ settings, onSave }: { settings: Settings; onSave: (s: Se
           Save
         </button>
       </div>
+    </section>
+  );
+}
+
+/** Which editor to use and where the user's clones live. */
+function CodeAndEditor({ repos }: { repos: string[] }) {
+  const [es, setEs] = useState<EditorSettings | null>(null);
+  const [roots, setRoots] = useState("");
+  const [cloneDir, setCloneDir] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState<Record<string, string>>({});
+
+  const load = () =>
+    api
+      .editorSettings()
+      .then((e) => {
+        setEs(e);
+        setRoots(e.roots.join("\n"));
+        setCloneDir(e.cloneDir);
+      })
+      .catch((e) => toast(String(e), true));
+  useEffect(() => {
+    load();
+  }, []);
+
+  if (!es) return null;
+  const save = async (editor: string | null) => {
+    setBusy(true);
+    try {
+      const n = await api.updateEditorSettings(
+        editor,
+        roots.split("\n").map((r) => r.trim()).filter(Boolean),
+        cloneDir,
+      );
+      toast(`Found ${n} local clone${n === 1 ? "" : "s"}`);
+      await load();
+    } catch (e) {
+      toast(String(e), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const setPath = async (repo: string, path: string | null) => {
+    try {
+      await api.setRepoPath(repo, path);
+      setEditing(({ [repo]: _, ...rest }) => rest);
+      await load();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+
+  return (
+    <section className="card">
+      <h2>Code & editor</h2>
+      <label className="field">
+        <span>Open repos in</span>
+        <select value={es.editor ?? ""} onChange={(e) => save(e.target.value || null)}>
+          {es.editors.length === 0 && <option value="">No supported editor found</option>}
+          {es.editors.map((e) => (
+            <option key={e}>{e}</option>
+          ))}
+        </select>
+      </label>
+      <label className="field top">
+        <span>Look for clones in</span>
+        <textarea className="grow" rows={2} value={roots} onChange={(e) => setRoots(e.target.value)} />
+      </label>
+      <label className="field">
+        <span>Clone new repos into</span>
+        <input className="grow" value={cloneDir} onChange={(e) => setCloneDir(e.target.value)} />
+      </label>
+      <div className="actions">
+        <button disabled={busy} onClick={() => save(es.editor ?? null)}>
+          {busy ? "Scanning…" : "Save & rescan"}
+        </button>
+        <span className="muted small">
+          {Object.keys(es.clones).length} clones found. “Check out” only switches branch when you have no
+          uncommitted changes.
+        </span>
+      </div>
+      {repos.length > 0 && (
+        <div className="repo-list clones">
+          {repos.map((repo) => {
+            const path = es.clones[repo.toLowerCase()];
+            const draft = editing[repo];
+            return (
+              <div key={repo} className="clone-row">
+                <span className="grow ellipsis">{repo}</span>
+                {draft !== undefined ? (
+                  <>
+                    <input
+                      autoFocus
+                      className="grow"
+                      placeholder="/path/to/clone"
+                      value={draft}
+                      onChange={(e) => setEditing({ ...editing, [repo]: e.target.value })}
+                      onKeyDown={(e) => e.key === "Enter" && setPath(repo, draft || null)}
+                    />
+                    <button className="link small" onClick={() => setPath(repo, draft || null)}>
+                      save
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className={`grow ellipsis small ${path ? "muted" : "faint"}`}>{path ?? "not cloned"}</span>
+                    <button className="link small" onClick={() => setEditing({ ...editing, [repo]: path ?? "" })}>
+                      set folder
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }

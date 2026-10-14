@@ -60,7 +60,8 @@ fn build(i: usize, s: &Spec) -> PullRequest {
             "id": format!("DEMO_R_{i}_{j}"), "state": st, "submittedAt": ago(*h), "author": user(a)
         })).collect::<Vec<_>>() },
         "comments": { "nodes": s.comments.iter().enumerate().map(|(j, (a, h))| json!({
-            "id": format!("DEMO_C_{i}_{j}"), "createdAt": ago(*h), "author": user(a)
+            "id": format!("DEMO_C_{i}_{j}"), "createdAt": ago(*h), "author": user(a),
+            "body": "Good point on the cursor format, I switched to opaque cursors. Mind taking another look?"
         })).collect::<Vec<_>>() },
         "commits": { "nodes": [{ "commit": { "committedDate": ago(s.push_h), "statusCheckRollup": s.ci.map(|c| json!({ "state": c })) } }] },
         "timelineItems": { "nodes": if s.review_requested {
@@ -190,6 +191,8 @@ pub fn seed(conn: &Connection) -> Result<()> {
         created_at: ago(2),
         updated_at: ago(2),
         review_requested: false,
+        branch: None,
+        cross_repo: false,
     };
     let d = derive::Derived {
         state: derive::BROKEN,
@@ -197,6 +200,7 @@ pub fn seed(conn: &Connection) -> Result<()> {
         since: Utc::now() - Duration::hours(2),
         is_mine: false,
         ci: derive::Ci::Failure,
+        context: None,
     };
     db::upsert(conn, &run, &d, sync_id)?;
 

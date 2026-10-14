@@ -80,6 +80,18 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 2 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE prs ADD COLUMN branch TEXT;                          -- PR head branch
+            ALTER TABLE prs ADD COLUMN cross_repo INTEGER NOT NULL DEFAULT 0; -- PR from a fork
+            ALTER TABLE prs ADD COLUMN context TEXT;                         -- JSON ReplyContext
+            PRAGMA user_version = 2;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -124,6 +136,8 @@ pub struct Tracked {
     pub created_at: String,
     pub updated_at: String,
     pub review_requested: bool,
+    pub branch: Option<String>,
+    pub cross_repo: bool,
 }
 
 impl Tracked {
@@ -142,6 +156,8 @@ impl Tracked {
             created_at: pr.created_at.clone(),
             updated_at: pr.updated_at.clone(),
             review_requested: pr.matched_review_requested,
+            branch: pr.head_ref_name.clone(),
+            cross_repo: pr.is_cross_repository.unwrap_or(false),
         }
     }
 
@@ -160,6 +176,8 @@ impl Tracked {
             created_at: i.created_at.clone(),
             updated_at: i.updated_at.clone(),
             review_requested: false,
+            branch: None,
+            cross_repo: false,
         }
     }
 
@@ -177,15 +195,16 @@ pub fn upsert(conn: &Connection, t: &Tracked, d: &Derived, sync_id: i64) -> Resu
     conn.execute(
         "INSERT INTO prs (id, repo, number, title, url, author, author_avatar, is_draft, is_mine, ci,
                           auto_state, auto_reason, since, created_at, updated_at, gh_state, is_open, last_sync,
-                          review_requested, kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                          review_requested, kind, branch, cross_repo, context)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
          ON CONFLICT(id) DO UPDATE SET
             repo = excluded.repo, number = excluded.number, title = excluded.title, url = excluded.url,
             author = excluded.author, author_avatar = excluded.author_avatar, is_draft = excluded.is_draft,
             is_mine = excluded.is_mine, ci = excluded.ci, auto_state = excluded.auto_state,
             auto_reason = excluded.auto_reason, since = excluded.since, updated_at = excluded.updated_at,
             gh_state = excluded.gh_state, is_open = excluded.is_open, last_sync = excluded.last_sync,
-            review_requested = excluded.review_requested, kind = excluded.kind",
+            review_requested = excluded.review_requested, kind = excluded.kind, branch = excluded.branch,
+            cross_repo = excluded.cross_repo, context = excluded.context",
         params![
             t.id,
             t.repo,
@@ -207,6 +226,9 @@ pub fn upsert(conn: &Connection, t: &Tracked, d: &Derived, sync_id: i64) -> Resu
             sync_id,
             t.review_requested,
             t.kind,
+            t.branch,
+            t.cross_repo,
+            d.context.as_ref().and_then(|c| serde_json::to_string(c).ok()),
         ],
     )?;
     Ok(prev)
@@ -396,12 +418,25 @@ pub struct Activity {
     pub title: Option<String>,
     pub url: Option<String>,
     pub detail: String,
+    /// The item is the user's own PR/issue.
+    pub is_mine: bool,
+    pub item_kind: Option<String>,
+}
+
+/// What's needed to open a PR locally: (kind, repo, number, branch, cross_repo).
+pub fn checkout_info(conn: &Connection, id: &str) -> Result<Option<(String, String, i64, Option<String>, bool)>> {
+    Ok(conn
+        .query_row("SELECT kind, repo, number, branch, cross_repo FROM prs WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .optional()?)
 }
 
 pub fn list_activity(conn: &Connection, since: &str) -> Result<Vec<Activity>> {
     let mut stmt = conn.prepare(
-        "SELECT at, kind, pr_id, repo, number, title, url, detail FROM activity
-         WHERE at >= ?1 ORDER BY at DESC LIMIT 500",
+        "SELECT a.at, a.kind, a.pr_id, a.repo, a.number, a.title, a.url, a.detail, COALESCE(p.is_mine, 0), p.kind
+         FROM activity a LEFT JOIN prs p ON p.id = a.pr_id
+         WHERE a.at >= ?1 ORDER BY a.at DESC LIMIT 2000",
     )?;
     let rows = stmt
         .query_map([since], |r| {
@@ -414,6 +449,8 @@ pub fn list_activity(conn: &Connection, since: &str) -> Result<Vec<Activity>> {
                 title: r.get(5)?,
                 url: r.get(6)?,
                 detail: r.get(7)?,
+                is_mine: r.get(8)?,
+                item_kind: r.get(9)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -447,6 +484,9 @@ pub struct Item {
     pub reminder_due: bool,
     /// Needs you, and arrived since you last opened it in the app.
     pub is_new: bool,
+    pub branch: Option<String>,
+    /// What the latest reply said (for "Replied to you").
+    pub context: Option<crate::derive::ReplyContext>,
 }
 
 pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
@@ -455,7 +495,7 @@ pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
                 p.auto_state, p.auto_reason, p.since, p.updated_at,
                 s.state, s.note, s.until, s.set_at,
                 COALESCE(v.at, (SELECT value FROM settings WHERE key = 'initialized_at'), ''),
-                p.kind, s.waits_on
+                p.kind, s.waits_on, p.branch, p.context
          FROM prs p LEFT JOIN personal s ON s.pr_id = p.id LEFT JOIN seen v ON v.pr_id = p.id
          WHERE p.is_open = 1 AND p.repo NOT IN (SELECT repo FROM hidden_repos)
            AND p.id NOT IN (SELECT id FROM unfollowed)
@@ -500,6 +540,8 @@ pub fn list_items(conn: &Connection) -> Result<Vec<Item>> {
                 state,
                 reminder_due,
                 is_new,
+                branch: r.get(21)?,
+                context: r.get::<_, Option<String>>(22)?.and_then(|c| serde_json::from_str(&c).ok()),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

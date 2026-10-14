@@ -8,6 +8,9 @@ import { AllPrs, History, SettingsView, SignIn, Today } from "./components/Views
 import { Following } from "./components/Following";
 import { setAllItems } from "./lib/store";
 import { onToast, type Toast } from "./lib/toast";
+import { onDialog, type DialogRequest } from "./lib/dialog";
+import { ActionDialog } from "./components/ActionDialog";
+import { Standup } from "./components/Standup";
 import "./styles.css";
 
 const VIEWS: { id: View; label: string }[] = [
@@ -27,12 +30,17 @@ export default function App() {
   const [now, setNow] = useState(Date.now());
   const [version, setVersion] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [dialog, setDialog] = useState<DialogRequest | null>(null);
+  const [standup, setStandup] = useState(false);
+  const overlay = palette || !!dialog || standup;
+
+  useEffect(() => onDialog(setDialog), []);
 
   useEffect(
     () =>
       onToast((t) => {
         setToasts((ts) => [...ts.slice(-2), t]);
-        setTimeout(() => setToasts((ts) => ts.filter((x) => x.id !== t.id)), t.error ? 6000 : 3000);
+        setTimeout(() => setToasts((ts) => ts.filter((x) => x.id !== t.id)), t.error || t.action ? 8000 : 3000);
       }),
     [],
   );
@@ -77,18 +85,19 @@ export default function App() {
         return;
       }
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
-      if (palette || tag === "input" || tag === "select" || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (overlay || tag === "input" || tag === "select" || tag === "textarea" || e.metaKey || e.ctrlKey || e.altKey) return;
       const idx = ["1", "2", "3", "4", "5"].indexOf(e.key);
+      // preventDefault so the key isn't also typed into whatever the shortcut opens.
       if (idx >= 0) setView(VIEWS[idx].id);
       else if (e.key === "r") sync();
-      else if (e.key === "/") {
-        e.preventDefault();
-        setPalette(true);
-      }
+      else if (e.key === "s") setStandup(true);
+      else if (e.key === "/") setPalette(true);
+      else return;
+      e.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, sync]);
+  }, [palette, overlay, sync]);
 
   if (session === undefined) return null;
   if (session === null) return <SignIn onSignedIn={setSession} />;
@@ -137,9 +146,9 @@ export default function App() {
           </div>
         ) : (
           <>
-            {view === "today" && <Today items={items} now={now} active={!palette} />}
-            {view === "all" && <AllPrs items={items} now={now} active={!palette} />}
-            {view === "history" && <History version={version} />}
+            {view === "today" && <Today items={items} now={now} active={!overlay} />}
+            {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
+            {view === "history" && <History version={version} onStandup={() => setStandup(true)} />}
             {view === "following" && <Following version={version} />}
           </>
         )}
@@ -158,6 +167,17 @@ export default function App() {
         {toasts.map((t) => (
           <div key={t.id} className={`toast${t.error ? " error" : ""}`}>
             {t.text}
+            {t.action && (
+              <button
+                className="toast-action"
+                onClick={() => {
+                  setToasts((ts) => ts.filter((x) => x.id !== t.id));
+                  t.action!.run();
+                }}
+              >
+                {t.action.label}
+              </button>
+            )}
           </div>
         ))}
       </div>
@@ -171,8 +191,14 @@ export default function App() {
             setPalette(false);
           }}
           onSync={sync}
+          onStandup={() => {
+            setPalette(false);
+            setStandup(true);
+          }}
         />
       )}
+      {dialog && <ActionDialog request={dialog} onClose={() => setDialog(null)} />}
+      {standup && <Standup items={items} onClose={() => setStandup(false)} />}
     </div>
   );
 }

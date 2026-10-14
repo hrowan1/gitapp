@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Item } from "../lib/api";
-import { copyCheckout, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
+import { copyCheckout, openInEditor, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
+import { openDialog } from "../lib/dialog";
 import { parseAction, parseQuery, SUGGESTIONS, type PaletteAction } from "../lib/query";
 import { STATES, compareItems, groupItems, shortRef } from "../lib/states";
 import { SNOOZE_PRESETS, age } from "../lib/time";
@@ -34,6 +35,10 @@ function runAction(action: PaletteAction, item: Item) {
       return copyCheckout(item);
     case "unfollow":
       return unfollow([item]);
+    case "dialog":
+      return openDialog(action.dialog, item);
+    case "editor":
+      return openInEditor(item, action.checkout && item.kind === "pr");
   }
 }
 
@@ -50,7 +55,22 @@ function actionsFor(item: Item): { label: string; action: PaletteAction }[] {
     { label: "🔧 Mark as I need to make changes", action: { kind: "state", state: "needs_changes" } },
     { label: "🔕 Stop following", action: { kind: "unfollow" } },
   ];
-  if (item.kind === "pr") list.push({ label: "⧉ Copy checkout command", action: { kind: "checkout" } });
+  if (item.kind !== "run") {
+    list.splice(1, 0, {
+      label: item.context && item.state === "replied" ? `↩︎ Reply to ${item.context.who}…` : "↩︎ Comment…",
+      action: { kind: "dialog", dialog: "reply" },
+    });
+    list.push({ label: "⌨︎ Open repo in editor", action: { kind: "editor", checkout: false } });
+  }
+  if (item.kind === "pr") {
+    if (!item.isMine) {
+      list.splice(2, 0, { label: "✅ Approve…", action: { kind: "dialog", dialog: "approve" } });
+      list.splice(3, 0, { label: "✋ Request changes…", action: { kind: "dialog", dialog: "request_changes" } });
+    }
+    list.push({ label: "🔀 Merge…", action: { kind: "dialog", dialog: "merge" } });
+    list.push({ label: "⎇ Check out & open in editor", action: { kind: "editor", checkout: true } });
+    list.push({ label: "⧉ Copy checkout command", action: { kind: "checkout" } });
+  }
   if (item.kind === "pr" && item.ci === "failure") list.splice(2, 0, { label: "↻ Re-run failed checks", action: { kind: "rerun" } });
   if (item.personal) list.push({ label: "↺ Back to automatic", action: { kind: "reset" } });
   return list;
@@ -61,11 +81,13 @@ export function CommandPalette({
   onClose,
   onNavigate,
   onSync,
+  onStandup,
 }: {
   items: Item[];
   onClose: () => void;
   onNavigate: (v: View) => void;
   onSync: () => void;
+  onStandup: () => void;
 }) {
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
@@ -81,6 +103,7 @@ export function CommandPalette({
     { id: "following", label: "Choose what to follow", hint: "4", run: () => onNavigate("following") },
     { id: "settings", label: "Go to Settings", hint: "5", run: () => onNavigate("settings") },
     { id: "sync", label: "Sync with GitHub now", hint: "r", run: onSync },
+    { id: "standup", label: "Write my standup", hint: "s", run: onStandup },
   ];
 
   const action = useMemo(() => (focus ? null : parseAction(q)), [q, focus]);
@@ -108,7 +131,10 @@ export function CommandPalette({
       .filter((c) => c.label.toLowerCase().includes(lower))
       .map((command) => ({ kind: "command" as const, command }));
     if (parsed.view === "history") {
-      return [{ kind: "command", command: { id: "h", label: "Show your history", run: () => onNavigate("history") } }];
+      return [
+        { kind: "command", command: { id: "standup", label: "Write my standup", hint: "s", run: onStandup } },
+        { kind: "command", command: { id: "h", label: "Show your history", run: () => onNavigate("history") } },
+      ];
     }
     const prs = items.filter(parsed.filter).sort(compareItems).slice(0, 50);
     return [...cmds, ...prs.map((item) => ({ kind: "pr" as const, item }))];

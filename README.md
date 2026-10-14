@@ -43,14 +43,19 @@ Build a release `.app`/`.dmg`: `npm run tauri build`.
 - **Noise control**: a repo with 4+ items in one section collapses into a single group row with bulk "✓ all" / snooze / stop following. **Ignore people & bots** (Settings): their comments don't count as replies and their PRs go to FYI.
 - **⌘K command bar**:
   - Questions: "what do I need to review?", "what's new since I last looked?", "show me Sarah's PRs", "what have I forgotten about?", "what did I work on yesterday?"
-  - Actions: "remind me about the checkout PR tomorrow", "come back to auth middleware after the API migration", "mark sarah's checkout pr as done", "mute …", "rerun checks on billing", "open …", "checkout …"
+  - Actions: "remind me about the checkout PR tomorrow", "come back to auth middleware after the API migration", "mark sarah's checkout pr as done", "approve sarah's checkout pr", "reply to priya", "merge export reports", "check out the checkout refactor", "open web in my editor", "stop following …", "rerun checks on billing"
   - `Tab` on any PR lists everything you can do to it.
-- **PR actions**: re-run failed GitHub Actions workflows; copy `gh pr checkout` to the clipboard.
+- **Act from the app** (each asks first, then posts to GitHub as you):
+  - **Reply**: "Replied to you" rows quote what was said; reply goes into the right review thread, or as a comment.
+  - **Approve / request changes / comment**, and **merge** using a method your repo allows.
+  - **Open in editor**: finds your clones by scanning your home folder (or folders you choose) for GitHub remotes and opens the repo in your editor (VS Code, Cursor, Zed, JetBrains, Xcode… whatever's installed). **Check out & open** switches to the PR branch first, **only if the working tree is clean**. Not cloned? It offers to clone it (via `gh`) into `~/code`.
+  - Re-run failed GitHub Actions workflows; copy `gh pr checkout`.
+- **Standup** (`s`, History → "Write my standup", or ⌘K "standup"): Yesterday / Today / Blocked from your history and inbox; since the last working day, today, this week or 7 days; Markdown with links or plain text; leave repos out; edit, then copy.
 - **Menu bar / tray** with a monochrome icon and needs-you count; closing the window keeps it running. Global shortcut **⌥⌘K** (Ctrl+Alt+K elsewhere).
 - **Desktop notifications** when something new needs you (bursts are collapsed); on macOS, clicking one opens the PR/issue. Optional **morning summary** on weekdays.
 - **Filters** (All tab) by repo/org, author, state, CI, mine/others; hide repos in Settings.
 
-Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `r` sync · `1`–`5` switch tabs · `⌘K` or `/` command bar.
+Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `R` reply · `a` approve · `m` merge · `c` check out & open in editor · `s` standup · `r` sync · `1`–`5` switch tabs · `⌘K` or `/` command bar.
 
 ## How syncing works
 
@@ -69,6 +74,7 @@ src-tauri/src/
   github.rs   GraphQL client (search hits + batched detail fetch, retries)
   derive.rs   GitHub data → personal state (unit tested)
   intent.rs   references, time phrases, "come back to this" in comments (unit tested)
+  editor.rs   finding local clones, safe branch checkout, launching the editor (unit tested)
   sync.rs     sync pass, memory updates, notifications
   db.rs       SQLite schema & queries
   demo.rs     fictional seed data for DEV_INBOX_DEMO=1
@@ -76,6 +82,7 @@ src-tauri/src/
 src/
   App.tsx, components/   Today / All / History / Following / Settings / ⌘K palette
   lib/query.ts           command-bar intent parsing
+  lib/standup.ts         standup text from history + inbox
   lib/states.ts          state metadata & Today sections
 ```
 

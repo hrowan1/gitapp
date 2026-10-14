@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Item, StateId } from "../lib/api";
-import { copyCheckout, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
+import { copyCheckout, openInEditor, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
+import { openDialog } from "../lib/dialog";
 import { MANUAL_STATES, STATES, shortRef } from "../lib/states";
 import { matchTitles } from "../lib/store";
 import { SNOOZE_PRESETS, age, untilLabel } from "../lib/time";
@@ -83,12 +84,22 @@ export function PrRow({
           )}
           {item.isDraft && !item.isMine && <span className="pill">Draft</span>}
         </div>
+        {item.context?.body && item.state === "replied" && (
+          <div className="row-quote" title={item.context.body}>
+            “{item.context.body}”
+          </div>
+        )}
       </div>
       <div className="row-right">
         <span className="age" title={new Date(item.since).toLocaleString()}>
           {age(item.since, now)}
         </span>
         <div className="row-actions" onClick={(e) => e.stopPropagation()}>
+          {item.kind !== "run" && item.state === "replied" && (
+            <button className="icon-btn" title="Reply (R)" onClick={() => openDialog("reply", item)}>
+              ↩︎
+            </button>
+          )}
           {item.state !== "done" && (
             <button className="icon-btn" title="Done (e)" onClick={() => setStates([item], "done")}>
               ✓
@@ -185,6 +196,37 @@ export function ActionMenu({ items, onClose }: { items: Item[]; onClose: () => v
       >
         🔕 Stop following{items.length > 1 ? ` all ${items.length}` : ""}
       </button>
+      {single && single.kind !== "run" && (
+        <>
+          <div className="menu-label">Act</div>
+          <button className="menu-item" onClick={() => run(() => openDialog("reply", single))}>
+            ↩︎ {single.context && single.state === "replied" ? `Reply to ${single.context.who}…` : "Comment…"}
+          </button>
+          {single.kind === "pr" && !single.isMine && (
+            <>
+              <button className="menu-item" onClick={() => run(() => openDialog("approve", single))}>
+                ✅ Approve…
+              </button>
+              <button className="menu-item" onClick={() => run(() => openDialog("request_changes", single))}>
+                ✋ Request changes…
+              </button>
+            </>
+          )}
+          {single.kind === "pr" && (
+            <button className="menu-item" onClick={() => run(() => openDialog("merge", single))}>
+              🔀 Merge…
+            </button>
+          )}
+          {single.kind === "pr" && (
+            <button className="menu-item" onClick={() => run(() => openInEditor(single, true))}>
+              ⎇ Check out & open in editor
+            </button>
+          )}
+          <button className="menu-item" onClick={() => run(() => openInEditor(single, false))}>
+            ⌨︎ Open repo in editor
+          </button>
+        </>
+      )}
       {single?.kind === "pr" && (
         <>
           {single.ci === "failure" && (

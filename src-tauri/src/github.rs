@@ -1,7 +1,7 @@
 //! Minimal GitHub GraphQL client: fetches the PRs and issues a user is involved in, plus
 //! default-branch CI for their active repos, with just enough metadata to derive personal state.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -19,6 +19,7 @@ const ISSUES_QUERY: &str = "is:issue is:open archived:false involves:@me sort:up
 const PR_FRAGMENT: &str = r#"
 fragment PrFields on PullRequest {
   id number title url isDraft state createdAt updatedAt mergedAt closedAt mergeable reviewDecision
+  headRefName isCrossRepository
   author { __typename login avatarUrl(size: 64) }
   repository { nameWithOwner }
   assignees(first: 10) { nodes { login } }
@@ -27,7 +28,7 @@ fragment PrFields on PullRequest {
   }
   reviews(last: 30) { nodes { id state submittedAt body author { __typename login } } }
   comments(last: 20) { nodes { id createdAt body author { __typename login } } }
-  reviewThreads(last: 30) { nodes { comments(last: 10) { nodes { id createdAt body author { __typename login } } } } }
+  reviewThreads(last: 30) { nodes { id comments(last: 10) { nodes { id createdAt body author { __typename login } } } } }
   commits(last: 1) { nodes { commit { committedDate statusCheckRollup { state } } } }
   timelineItems(last: 10, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, REVIEW_REQUESTED_EVENT]) {
     nodes {
@@ -123,6 +124,8 @@ pub struct Comment {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewThread {
+    #[serde(default)]
+    pub id: String,
     pub comments: Nodes<Comment>,
 }
 
@@ -174,6 +177,10 @@ pub struct PullRequest {
     pub closed_at: Option<String>,
     pub mergeable: Option<String>,
     pub review_decision: Option<String>,
+    #[serde(default)]
+    pub head_ref_name: Option<String>,
+    #[serde(default)]
+    pub is_cross_repository: Option<bool>,
     pub author: Option<Actor>,
     pub repository: Repository,
     pub assignees: Nodes<Login>,
@@ -245,6 +252,17 @@ pub struct BranchStatus {
 pub struct RefState {
     pub state: String,
     pub title: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeOptions {
+    pub methods: Vec<String>,
+    pub default: String,
+    /// MERGEABLE | CONFLICTING | UNKNOWN
+    pub mergeable: String,
+    /// CLEAN | BLOCKED | BEHIND | DIRTY | UNSTABLE | HAS_HOOKS | UNKNOWN …
+    pub state: String,
 }
 
 pub struct Rerun {
@@ -433,6 +451,100 @@ impl Client {
         Ok(out)
     }
 
+    /// Run a mutation; unlike queries, any GraphQL error means it didn't happen.
+    async fn mutate(&self, query: &str, variables: Value) -> Result<Value> {
+        let res = self
+            .http
+            .post(ENDPOINT)
+            .bearer_auth(&self.token)
+            .json(&json!({ "query": query, "variables": variables }))
+            .send()
+            .await
+            .context("GitHub request failed")?;
+        let status = res.status();
+        let body: Value = res.json().await.context("invalid GitHub response")?;
+        if let Some(errors) = body.get("errors").and_then(|e| e.as_array()).filter(|e| !e.is_empty()) {
+            let msg = errors.iter().filter_map(|e| e["message"].as_str()).collect::<Vec<_>>().join("; ");
+            bail!("{msg}");
+        }
+        if !status.is_success() {
+            bail!("GitHub returned {status}: {}", body["message"].as_str().unwrap_or(""));
+        }
+        Ok(body["data"].clone())
+    }
+
+    /// Submit a review: event is APPROVE, REQUEST_CHANGES or COMMENT.
+    pub async fn submit_review(&self, pr_id: &str, event: &str, body: Option<&str>) -> Result<()> {
+        self.mutate(
+            "mutation($id: ID!, $event: PullRequestReviewEvent!, $body: String) {
+                addPullRequestReview(input: { pullRequestId: $id, event: $event, body: $body }) { pullRequestReview { id } }
+            }",
+            json!({ "id": pr_id, "event": event, "body": body }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A conversation comment on a PR or issue.
+    pub async fn add_comment(&self, subject_id: &str, body: &str) -> Result<()> {
+        self.mutate(
+            "mutation($id: ID!, $body: String!) { addComment(input: { subjectId: $id, body: $body }) { clientMutationId } }",
+            json!({ "id": subject_id, "body": body }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reply inside a review thread.
+    pub async fn reply_in_thread(&self, thread_id: &str, body: &str) -> Result<()> {
+        self.mutate(
+            "mutation($id: ID!, $body: String!) {
+                addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $id, body: $body }) { comment { id } }
+            }",
+            json!({ "id": thread_id, "body": body }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Which merge methods the repo allows, its default, and whether the PR can merge now.
+    pub async fn merge_options(&self, pr_id: &str) -> Result<MergeOptions> {
+        let data = self
+            .graphql(
+                "query($id: ID!) { node(id: $id) { ... on PullRequest {
+                    mergeable mergeStateStatus viewerCanUpdate
+                    repository { mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerDefaultMergeMethod }
+                } } }",
+                json!({ "id": pr_id }),
+            )
+            .await?;
+        let n = &data["node"];
+        let r = &n["repository"];
+        let mut methods = Vec::new();
+        for (flag, method) in [("squashMergeAllowed", "SQUASH"), ("mergeCommitAllowed", "MERGE"), ("rebaseMergeAllowed", "REBASE")] {
+            if r[flag].as_bool() == Some(true) {
+                methods.push(method.to_string());
+            }
+        }
+        Ok(MergeOptions {
+            methods,
+            default: r["viewerDefaultMergeMethod"].as_str().unwrap_or("MERGE").to_string(),
+            mergeable: n["mergeable"].as_str().unwrap_or("UNKNOWN").to_string(),
+            state: n["mergeStateStatus"].as_str().unwrap_or("UNKNOWN").to_string(),
+        })
+    }
+
+    pub async fn merge(&self, pr_id: &str, method: &str) -> Result<()> {
+        self.mutate(
+            "mutation($id: ID!, $method: PullRequestMergeMethod!) {
+                mergePullRequest(input: { pullRequestId: $id, mergeMethod: $method }) { pullRequest { state } }
+            }",
+            json!({ "id": pr_id, "method": method }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn rest_post(&self, path: &str) -> Result<()> {
         let res = self
             .http
@@ -609,6 +721,12 @@ mod live_tests {
             println!("branch {} {} ci={} failures={:?}", b.repo, b.branch, b.ci, b.failures);
         }
         let prs = &fetched.prs;
+        if let Some(pr) = prs.first() {
+            let threads_with_ids = prs.iter().flat_map(|p| p.review_threads.iter()).filter(|t| !t.id.is_empty()).count();
+            println!("branch of {}#{} = {:?} cross={:?}; threads with ids={threads_with_ids}", pr.repository.name_with_owner, pr.number, pr.head_ref_name, pr.is_cross_repository);
+            let m = client.merge_options(&pr.id).await.unwrap();
+            println!("merge options: {m:?}");
+        }
         for pr in prs.iter().take(15) {
             let d = crate::derive::derive(pr, &crate::derive::Ctx::new(&viewer.login, &[]));
             println!("{:>16} | {}#{} | {} | {}", d.state, pr.repository.name_with_owner, pr.number, d.reason, d.ci.as_str());

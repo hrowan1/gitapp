@@ -1,6 +1,7 @@
 mod db;
 mod demo;
 mod derive;
+mod editor;
 mod github;
 mod intent;
 mod sync;
@@ -432,6 +433,225 @@ fn mark_seen(app: AppHandle, pr_ids: Vec<String>) -> CmdResult<()> {
     Ok(())
 }
 
+fn client(app: &AppHandle) -> CmdResult<github::Client> {
+    let state = app.state::<AppState>();
+    if state.demo {
+        return Err("Not available in demo mode".into());
+    }
+    Ok(github::Client::new(&state.token().ok_or("Not signed in")?))
+}
+
+/// Approve, request changes, or leave a review comment. These act on GitHub as the user.
+#[tauri::command]
+async fn submit_review(app: AppHandle, pr_id: String, event: String, body: Option<String>) -> CmdResult<String> {
+    if !matches!(event.as_str(), "APPROVE" | "REQUEST_CHANGES" | "COMMENT") {
+        return Err(format!("Unknown review action {event}"));
+    }
+    let body = body.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+    if event != "APPROVE" && body.is_none() {
+        return Err("Write a message first".into());
+    }
+    client(&app)?.submit_review(&pr_id, &event, body.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+    app.state::<AppState>().wake.notify_one();
+    Ok(match event.as_str() {
+        "APPROVE" => "Approved",
+        "REQUEST_CHANGES" => "Requested changes",
+        _ => "Review comment posted",
+    }
+    .into())
+}
+
+/// Comment on a PR/issue, or reply inside a review thread when `thread_id` is given.
+#[tauri::command]
+async fn send_comment(app: AppHandle, item_id: String, body: String, thread_id: Option<String>) -> CmdResult<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err("Write a message first".into());
+    }
+    let c = client(&app)?;
+    match thread_id.filter(|t| !t.is_empty()) {
+        Some(t) => c.reply_in_thread(&t, body).await,
+        None => c.add_comment(&item_id, body).await,
+    }
+    .map_err(|e| format!("{e:#}"))?;
+    let state = app.state::<AppState>();
+    let _ = db::mark_seen(&state.db.lock().unwrap(), &item_id, &now());
+    state.wake.notify_one();
+    Ok("Reply posted".into())
+}
+
+#[tauri::command]
+async fn merge_options(app: AppHandle, pr_id: String) -> CmdResult<github::MergeOptions> {
+    client(&app)?.merge_options(&pr_id).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn merge_pr(app: AppHandle, pr_id: String, method: String) -> CmdResult<String> {
+    if !matches!(method.as_str(), "MERGE" | "SQUASH" | "REBASE") {
+        return Err(format!("Unknown merge method {method}"));
+    }
+    client(&app)?.merge(&pr_id, &method).await.map_err(|e| format!("{e:#}"))?;
+    app.state::<AppState>().wake.notify_one();
+    Ok("Merged".into())
+}
+
+// ---------- local clones & editor ----------
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorSettings {
+    /// Installed editors we can launch.
+    editors: Vec<String>,
+    editor: Option<String>,
+    /// Folders scanned for clones.
+    roots: Vec<String>,
+    /// "owner/repo" → path, discovered or set by hand.
+    clones: std::collections::BTreeMap<String, String>,
+    /// Where "clone and open" puts new clones.
+    clone_dir: String,
+}
+
+fn json_setting<T: serde::de::DeserializeOwned>(state: &AppState, key: &str) -> Option<T> {
+    state.setting(key).and_then(|v| serde_json::from_str(&v).ok())
+}
+
+fn roots(state: &AppState) -> Vec<String> {
+    json_setting(state, "code_roots").unwrap_or_else(editor::default_roots)
+}
+
+/// Discovered clones merged with manual overrides (overrides win).
+fn clones(state: &AppState) -> std::collections::BTreeMap<String, String> {
+    let mut map: std::collections::BTreeMap<String, String> = json_setting(state, "clones").unwrap_or_default();
+    let overrides: std::collections::BTreeMap<String, String> = json_setting(state, "repo_paths").unwrap_or_default();
+    map.extend(overrides);
+    map
+}
+
+async fn scan(app: &AppHandle) -> CmdResult<usize> {
+    let roots = roots(&app.state::<AppState>());
+    let found = tauri::async_runtime::spawn_blocking(move || editor::discover(&roots)).await.map_err(err)?;
+    let n = found.len();
+    let state = app.state::<AppState>();
+    db::set_setting(&state.db.lock().unwrap(), "clones", &serde_json::to_string(&found).map_err(err)?).map_err(err)?;
+    Ok(n)
+}
+
+#[tauri::command]
+async fn editor_settings(app: AppHandle) -> CmdResult<EditorSettings> {
+    if app.state::<AppState>().setting("clones").is_none() {
+        scan(&app).await?;
+    }
+    let state = app.state::<AppState>();
+    let editors = editor::installed_editors();
+    let editor = state.setting("editor").or_else(|| editors.first().cloned());
+    Ok(EditorSettings {
+        editors,
+        editor,
+        roots: roots(&state),
+        clones: clones(&state),
+        clone_dir: state.setting("clone_dir").unwrap_or_else(editor::default_clone_dir),
+    })
+}
+
+#[tauri::command]
+async fn update_editor_settings(
+    app: AppHandle,
+    editor: Option<String>,
+    roots: Vec<String>,
+    clone_dir: Option<String>,
+) -> CmdResult<usize> {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        if let Some(dir) = clone_dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+            db::set_setting(&conn, "clone_dir", &dir).map_err(err)?;
+        }
+        match editor {
+            Some(e) => db::set_setting(&conn, "editor", &e).map_err(err)?,
+            None => db::delete_setting(&conn, "editor").map_err(err)?,
+        }
+        let roots: Vec<String> = roots.into_iter().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
+        db::set_setting(&conn, "code_roots", &serde_json::to_string(&roots).map_err(err)?).map_err(err)?;
+    }
+    scan(&app).await
+}
+
+/// Point a repo at a specific local folder (or clear the override with `None`).
+#[tauri::command]
+fn set_repo_path(state: State<AppState>, repo: String, path: Option<String>) -> CmdResult<()> {
+    let mut overrides: std::collections::BTreeMap<String, String> = json_setting(&state, "repo_paths").unwrap_or_default();
+    match path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            if !std::path::Path::new(&p).join(".git").exists() {
+                return Err(format!("{p} isn't a git repository"));
+            }
+            overrides.insert(repo.to_lowercase(), p);
+        }
+        None => {
+            overrides.remove(&repo.to_lowercase());
+        }
+    }
+    db::set_setting(&state.db.lock().unwrap(), "repo_paths", &serde_json::to_string(&overrides).map_err(err)?).map_err(err)
+}
+
+/// Open an item's repo in the editor, optionally switching to the PR's branch first.
+#[tauri::command]
+async fn open_locally(app: AppHandle, item_id: String, checkout: bool) -> CmdResult<String> {
+    if app.state::<AppState>().setting("clones").is_none() {
+        scan(&app).await?;
+    }
+    let state = app.state::<AppState>();
+    let (kind, repo, number, branch, cross_repo) =
+        db::checkout_info(&state.db.lock().unwrap(), &item_id).map_err(err)?.ok_or("Unknown item")?;
+    let path = clones(&state)
+        .get(&repo.to_lowercase())
+        .cloned()
+        // The UI recognises this prefix and offers to clone.
+        .ok_or_else(|| format!("NO_CLONE:{repo}"))?;
+    let editor = state
+        .setting("editor")
+        .or_else(|| editor::installed_editors().into_iter().next())
+        .ok_or("No editor found. Pick one in Settings → Code & editor.")?;
+    let mut msg = format!("Opened {repo} in {editor}");
+    if checkout && kind == "pr" {
+        let p = path.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || editor::checkout_pr(&p, number, branch.as_deref(), cross_repo))
+            .await
+            .map_err(err)?;
+        match result {
+            Ok(b) => msg = format!("Checked out {b} and opened {repo} in {editor}"),
+            // Still open the editor; just say why the branch didn't change.
+            Err(e) => msg = format!("Opened {repo} in {editor} — {e:#}"),
+        }
+    }
+    editor::open_in(&editor, &path).map_err(|e| format!("{e:#}"))?;
+    let _ = db::mark_seen(&state.db.lock().unwrap(), &item_id, &now());
+    Ok(msg)
+}
+
+/// Clone a repo into the clone folder (default ~/code), remember it, then open the item.
+#[tauri::command]
+async fn clone_and_open(app: AppHandle, item_id: String, checkout: bool) -> CmdResult<String> {
+    let (repo, parent) = {
+        let state = app.state::<AppState>();
+        let repo = db::checkout_info(&state.db.lock().unwrap(), &item_id).map_err(err)?.ok_or("Unknown item")?.1;
+        (repo, state.setting("clone_dir").unwrap_or_else(editor::default_clone_dir))
+    };
+    let r = repo.clone();
+    let path = tauri::async_runtime::spawn_blocking(move || editor::clone_repo(&r, &parent))
+        .await
+        .map_err(err)?
+        .map_err(|e| format!("{e:#}"))?;
+    {
+        let state = app.state::<AppState>();
+        let mut found: std::collections::BTreeMap<String, String> = json_setting(&state, "clones").unwrap_or_default();
+        found.insert(repo.to_lowercase(), path.clone());
+        db::set_setting(&state.db.lock().unwrap(), "clones", &serde_json::to_string(&found).map_err(err)?).map_err(err)?;
+    }
+    let msg = open_locally(app, item_id, checkout).await?;
+    Ok(format!("Cloned to {path} · {msg}"))
+}
+
 /// Re-run failed GitHub Actions on a PR. Returns a human-readable summary.
 #[tauri::command]
 async fn rerun_checks(app: AppHandle, pr_id: String) -> CmdResult<String> {
@@ -682,6 +902,15 @@ pub fn run() {
             get_following,
             set_followed,
             test_notification,
+            submit_review,
+            send_comment,
+            merge_options,
+            merge_pr,
+            editor_settings,
+            update_editor_settings,
+            set_repo_path,
+            open_locally,
+            clone_and_open,
             get_activity,
             get_repos,
             set_repo_hidden,

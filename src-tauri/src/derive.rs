@@ -78,6 +78,33 @@ pub struct Derived {
     pub since: Ts,
     pub is_mine: bool,
     pub ci: Ci,
+    /// For replies: what was said, so it can be shown and answered in place.
+    pub context: Option<ReplyContext>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyContext {
+    pub who: String,
+    pub body: String,
+    /// Review thread to reply into; None means a normal conversation comment.
+    pub thread_id: Option<String>,
+}
+
+fn snippet(body: &str) -> String {
+    let flat: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() > 280 {
+        format!("{}…", flat.chars().take(280).collect::<String>())
+    } else {
+        flat
+    }
 }
 
 /// One human message on a PR or issue.
@@ -87,6 +114,7 @@ struct Msg<'a> {
     body: &'a str,
     /// Index of the review thread it belongs to, if any.
     thread: Option<usize>,
+    thread_id: Option<&'a str>,
     /// Comments and commented/changes-requested reviews. A bare approval isn't a "reply".
     conversational: bool,
 }
@@ -114,6 +142,8 @@ struct Reply<'a> {
     who: &'a str,
     at: Ts,
     why: Why,
+    body: &'a str,
+    thread_id: Option<&'a str>,
 }
 
 struct Conversation<'a> {
@@ -153,22 +183,31 @@ impl<'a> Conversation<'a> {
                 None
             };
             if let Some(why) = why {
-                out.push(Reply { who: m.who, at: m.at, why });
+                out.push(Reply { who: m.who, at: m.at, why, body: m.body, thread_id: m.thread_id });
             }
         }
         out
     }
 }
 
-fn describe_replies(replies: &[Reply]) -> (String, Ts) {
+fn describe_replies(replies: &[Reply]) -> (String, Ts, Option<ReplyContext>) {
     let last = replies.iter().max_by_key(|r| r.at).expect("non-empty");
+    let context = Some(ReplyContext {
+        who: last.who.to_string(),
+        body: snippet(last.body),
+        thread_id: last.thread_id.map(String::from),
+    });
     let reason = match (replies.len(), last.why) {
         (1, Why::Mention) => format!("{} mentioned you", last.who),
         (1, Why::Thread) => format!("{} replied in your thread", last.who),
         (1, Why::Author) => format!("{} replied", last.who),
         (n, _) => format!("{n} replies to you · latest from {}", last.who),
     };
-    (reason, last.at)
+    (reason, last.at, context)
+}
+
+fn context_of(m: &Msg) -> Option<ReplyContext> {
+    Some(ReplyContext { who: m.who.to_string(), body: snippet(m.body), thread_id: m.thread_id.map(String::from) })
 }
 
 /// Who "me" is, plus people whose activity should never count (machine users, noisy bots).
@@ -262,7 +301,7 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
     let mut msgs: Vec<Msg> = Vec::new();
     for c in pr.comments.iter() {
         if let (Some(a), Some(at)) = (ctx.human(&c.author), parse_ts(&c.created_at)) {
-            msgs.push(Msg { who: &a.login, at, body: &c.body, thread: None, conversational: true });
+            msgs.push(Msg { who: &a.login, at, body: &c.body, thread: None, thread_id: None, conversational: true });
         }
     }
     for r in pr.reviews.iter().filter(|r| r.state != "PENDING") {
@@ -270,13 +309,14 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
             // A review's thread comments are counted per thread below; its body only if it has one.
             let conversational = r.state == "CHANGES_REQUESTED"
                 || (r.state == "COMMENTED" && (!r.body.trim().is_empty() || !threads_known));
-            msgs.push(Msg { who: &a.login, at, body: &r.body, thread: None, conversational });
+            msgs.push(Msg { who: &a.login, at, body: &r.body, thread: None, thread_id: None, conversational });
         }
     }
     for (i, t) in pr.review_threads.iter().enumerate() {
         for c in t.comments.iter() {
             if let (Some(a), Some(at)) = (ctx.human(&c.author), parse_ts(&c.created_at)) {
-                msgs.push(Msg { who: &a.login, at, body: &c.body, thread: Some(i), conversational: true });
+                let thread_id = (!t.id.is_empty()).then_some(t.id.as_str());
+                msgs.push(Msg { who: &a.login, at, body: &c.body, thread: Some(i), thread_id, conversational: true });
             }
         }
     }
@@ -324,6 +364,7 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
         since,
         is_mine,
         ci: ci.clone(),
+        context: None,
     };
     let checks_note = if ci == Ci::Failure { " · checks failing" } else { "" };
     let push_or_created = last_push_at.unwrap_or(created);
@@ -364,7 +405,9 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
                 }
             }
             let verb = if replies.len() == 1 { "commented" } else { "left comments" };
-            return d(REPLIED, format!("{} {verb}", join_names(&who)), last.at);
+            let mut out = d(REPLIED, format!("{} {verb}", join_names(&who)), last.at);
+            out.context = context_of(last);
+            return out;
         }
         if pr.review_decision.as_deref() == Some("APPROVED") {
             if ci == Ci::Pending {
@@ -400,21 +443,20 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
     }
 
     let replies = convo.replies_to_me(author);
+    let replied = |(reason, at, context): (String, Ts, Option<ReplyContext>)| Derived { context, ..d(REPLIED, reason, at) };
     match my_decisive {
         Some(("CHANGES_REQUESTED", reviewed_at)) => {
             if let Some(p) = last_push_at.filter(|p| *p > reviewed_at) {
                 return d(NEEDS_REREVIEW, "New commits since you requested changes".into(), p);
             }
             if !replies.is_empty() {
-                let (reason, at) = describe_replies(&replies);
-                return d(REPLIED, reason, at);
+                return replied(describe_replies(&replies));
             }
             return d(WAITING, format!("Waiting for {author} to address your changes"), reviewed_at);
         }
         Some(("APPROVED", approved_at)) => {
             if !replies.is_empty() {
-                let (reason, at) = describe_replies(&replies);
-                return d(REPLIED, reason, at);
+                return replied(describe_replies(&replies));
             }
             return d(DONE, "You approved".into(), approved_at);
         }
@@ -422,8 +464,7 @@ fn derive_state(pr: &PullRequest, ctx: &Ctx) -> Derived {
     }
 
     if !replies.is_empty() {
-        let (reason, at) = describe_replies(&replies);
-        return d(REPLIED, reason, at);
+        return replied(describe_replies(&replies));
     }
     if let Some(mine) = my_last_activity {
         return d(WAITING, "Waiting for a response".into(), mine);
@@ -447,12 +488,13 @@ fn derive_issue_state(issue: &Issue, ctx: &Ctx) -> Derived {
         since,
         is_mine: authored || assigned,
         ci: Ci::None,
+        context: None,
     };
 
     let mut msgs: Vec<Msg> = Vec::new();
     for c in issue.comments.iter() {
         if let (Some(a), Some(at)) = (ctx.human(&c.author), parse_ts(&c.created_at)) {
-            msgs.push(Msg { who: &a.login, at, body: &c.body, thread: None, conversational: true });
+            msgs.push(Msg { who: &a.login, at, body: &c.body, thread: None, thread_id: None, conversational: true });
         }
     }
     let convo = Conversation { msgs, me };
@@ -466,13 +508,13 @@ fn derive_issue_state(issue: &Issue, ctx: &Ctx) -> Derived {
             } else {
                 format!("{} new comments on your issue", replies.len())
             };
-            return d(REPLIED, reason, last.at);
+            return Derived { context: context_of(last), ..d(REPLIED, reason, last.at) };
         }
     } else {
         let replies = convo.replies_to_me(author);
         if !replies.is_empty() {
-            let (reason, at) = describe_replies(&replies);
-            return d(REPLIED, reason, at);
+            let (reason, at, context) = describe_replies(&replies);
+            return Derived { context, ..d(REPLIED, reason, at) };
         }
     }
 

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Item } from "../lib/api";
-import { openItem, setStates } from "../lib/actions";
+import { openInEditor, openItem, setStates } from "../lib/actions";
+import { openDialog } from "../lib/dialog";
 import { STATES } from "../lib/states";
 import { ActionMenu, PrRow } from "./PrRow";
 
@@ -121,6 +122,18 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
           break;
         case "x":
           if (targets.some((t) => t.personal)) setStates(targets, null);
+          break;
+        case "R":
+          if (cur?.item && cur.item.kind !== "run") openDialog("reply", cur.item);
+          break;
+        case "a":
+          if (cur?.item?.kind === "pr" && !cur.item.isMine) openDialog("approve", cur.item);
+          break;
+        case "m":
+          if (cur?.item?.kind === "pr") openDialog("merge", cur.item);
+          break;
+        case "c":
+          if (cur?.item && cur.item.kind !== "run") openInEditor(cur.item, cur.item.kind === "pr");
           break;
         default:
           return;
