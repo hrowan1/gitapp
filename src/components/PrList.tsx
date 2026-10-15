@@ -2,7 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import type { Item } from "../lib/api";
 import { openInEditor, openItem, setStates } from "../lib/actions";
 import { openDialog } from "../lib/dialog";
+import { emit } from "../lib/events";
 import { STATES } from "../lib/states";
+import type { Selection } from "./DetailPane";
+import { Icon } from "./Icon";
 import { ActionMenu, PrRow } from "./PrRow";
 
 /** A repo with at least this many PRs in one section is collapsed into a single group row. */
@@ -51,11 +54,23 @@ function summarise(items: Item[]): string {
 
 type Entry = { id: string; item?: Item; group?: Block & { kind: "group" } };
 
-/** Sectioned PR list with keyboard navigation (j/k, ↵ open/expand, e done, l later, x reset). */
-export function PrList({ sections, now, active }: { sections: ListSection[]; now: number; active: boolean }) {
+/** Sectioned list with keyboard navigation (j/k, ↵ open/expand, e done, l later, x reset).
+ * Selection is owned by the parent so the detail pane can show it. */
+export function PrList({
+  sections,
+  now,
+  active,
+  selectedId,
+  onSelect,
+}: {
+  sections: ListSection[];
+  now: number;
+  active: boolean;
+  selectedId: string | null;
+  onSelect: (id: string | null, selection: Selection) => void;
+}) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [focusNote, setFocusNote] = useState(false);
   const openMenu = (id: string | null, note = false) => {
@@ -68,6 +83,11 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
     () => Object.fromEntries(sections.map((s) => [s.id, toBlocks(s.id, s.items)])),
     [sections],
   );
+
+  const selectEntry = (e: Entry | undefined) => {
+    if (!e) return onSelect(null, null);
+    onSelect(e.id, e.group ? { group: { repo: e.group.repo, items: e.group.items } } : { item: e.item! });
+  };
 
   // Everything keyboard navigation can land on, in display order.
   const entries: Entry[] = useMemo(
@@ -99,7 +119,7 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
       const move = (d: number) => {
         if (!entries.length) return;
         const next = idx < 0 ? 0 : Math.min(entries.length - 1, Math.max(0, idx + d));
-        setSelectedId(entries[next].id);
+        selectEntry(entries[next]);
       };
       switch (e.key) {
         case "j":
@@ -122,8 +142,14 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
           }
           break;
         case "l":
+          if (cur) emit("focus-snooze");
+          break;
         case ".":
-          if (cur) openMenu(cur.id, e.key === "l");
+          if (cur) openMenu(cur.id);
+          break;
+        case "Escape":
+          if (!cur) return;
+          selectEntry(undefined);
           break;
         case "x":
           if (targets.some((t) => t.personal)) setStates(targets, null);
@@ -156,7 +182,7 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
       now={now}
       nested={nested}
       selected={item.id === selectedId}
-      onSelect={() => setSelectedId(item.id)}
+      onSelect={() => onSelect(item.id, { item })}
       menuOpen={menuFor === item.id}
       onMenu={(open) => openMenu(open ? item.id : null)}
       focusNote={focusNote}
@@ -171,7 +197,7 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
         return (
           <section key={s.id} className="section">
             <button className="section-head" onClick={() => setCollapsed({ ...collapsed, [s.id]: !closed })}>
-              <span className={`chevron${closed ? " closed" : ""}`}>▾</span>
+              <Icon name="chevronDown" size={13} className={`chevron${closed ? " closed" : ""}`} />
               <span className="section-title">{s.title}</span>
               <span className="count">{s.items.length}</span>
             </button>
@@ -186,43 +212,28 @@ export function PrList({ sections, now, active }: { sections: ListSection[]; now
                     <div
                       className={`row group-row${selectedId === b.key ? " selected" : ""}`}
                       role="button"
-                      onMouseEnter={() => setSelectedId(b.key)}
-                      onClick={() =>
-                        menuFor === b.key ? setMenuFor(null) : setExpanded({ ...expanded, [b.key]: !open })
-                      }
+                      onClick={() => {
+                        onSelect(b.key, { group: { repo: b.repo, items: b.items } });
+                        setExpanded({ ...expanded, [b.key]: !open });
+                      }}
                       onContextMenu={(e) => {
                         e.preventDefault();
+                        onSelect(b.key, { group: { repo: b.repo, items: b.items } });
                         openMenu(b.key);
                       }}
                     >
-                      <span className={`chevron${open ? "" : " closed"}`}>▾</span>
                       <span className="group-count">{b.items.length}</span>
                       <div className="row-main">
                         <div className="row-title">
-                          {newCount > 0 && <span className="new-dot" title={`${newCount} new`} />}
-                          <span className="who">{b.repo}</span>
+                          <span className="title">{b.repo}</span>
+                          <Icon name="chevronDown" size={13} className={`chevron${open ? "" : " closed"}`} />
                         </div>
                         <div className="row-sub">
                           <span className="reason">{summarise(b.items)}</span>
                         </div>
                       </div>
                       <div className="row-right">
-                        <div className="row-actions" onClick={(e) => e.stopPropagation()}>
-                          <button
-                            className="icon-btn"
-                            title="Mark all done (e)"
-                            onClick={() => setStates(b.items, "done")}
-                          >
-                            ✓ all
-                          </button>
-                          <button
-                            className="icon-btn"
-                            title="Snooze, mark or mute all (.)"
-                            onClick={() => openMenu(menuFor === b.key ? null : b.key)}
-                          >
-                            ⋯
-                          </button>
-                        </div>
+                        {newCount > 0 && <span className="new-dot" title={`${newCount} new`} />}
                       </div>
                       {menuFor === b.key && <ActionMenu items={b.items} onClose={() => setMenuFor(null)} />}
                     </div>

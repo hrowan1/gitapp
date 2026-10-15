@@ -154,6 +154,7 @@ export const api = {
   getFollowing: () => invoke<FollowItem[]>("get_following"),
   setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),
+  getItemActivity: (itemId: string) => invoke<Activity[]>("get_item_activity", { itemId }),
   getRepos: () => invoke<RepoInfo[]>("get_repos"),
   setRepoHidden: (repo: string, hidden: boolean) => invoke<void>("set_repo_hidden", { repo, hidden }),
   getSettings: () => invoke<Settings>("get_settings"),

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type FollowItem, type Kind } from "../lib/api";
-import { STATES, shortRef } from "../lib/states";
+import { shortRef } from "../lib/states";
+import { StateIcon } from "./StateIcon";
 import { toast } from "../lib/toast";
 
 /** Choose exactly which PRs, issues and branches you listen to. Everything is followed by default. */
@@ -56,8 +57,8 @@ export function Following({ version }: { version: number }) {
   const following = rows?.filter((r) => r.followed).length ?? 0;
 
   return (
-    <div className="following">
-      <div className="headline">
+    <div className="page following">
+      <div className="headline compact">
         <h1>
           Following {following} of {total}
         </h1>
@@ -121,9 +122,7 @@ export function Following({ version }: { version: number }) {
               items.map((r) => (
                 <label key={r.id} className={`follow-row${r.followed ? "" : " off"}`}>
                   <input type="checkbox" checked={r.followed} onChange={(e) => set([r], e.target.checked)} />
-                  <span className="row-state" title={STATES[r.state]?.label}>
-                    {STATES[r.state]?.emoji}
-                  </span>
+                  <StateIcon state={r.state} size={13} />
                   {r.kind !== "pr" && <span className={`kind kind-${r.kind}`}>{r.kind === "issue" ? "Issue" : "Branch"}</span>}
                   <span className="grow ellipsis">
                     {r.title} <span className="muted">· {shortRef(r)} · {r.isMine ? "you" : r.author}</span>

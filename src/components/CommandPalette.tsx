@@ -3,7 +3,9 @@ import type { Item } from "../lib/api";
 import { copyCheckout, openInEditor, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
 import { openDialog } from "../lib/dialog";
 import { parseAction, parseQuery, SUGGESTIONS, type PaletteAction } from "../lib/query";
-import { STATES, compareItems, groupItems, shortRef } from "../lib/states";
+import { compareItems, groupItems, shortRef } from "../lib/states";
+import { Icon } from "./Icon";
+import { StateIcon } from "./StateIcon";
 import { SNOOZE_PRESETS, age } from "../lib/time";
 
 export type View = "today" | "all" | "history" | "following" | "settings";
@@ -230,13 +232,17 @@ export function CommandPalette({
             >
               {e.kind === "suggestion" && (
                 <>
-                  <span className="pal-icon">↗</span>
+                  <span className="pal-icon">
+                    <Icon name="search" size={15} />
+                  </span>
                   <span className="grow">{e.text}</span>
                 </>
               )}
               {e.kind === "command" && (
                 <>
-                  <span className="pal-icon">⌘</span>
+                  <span className="pal-icon">
+                    <Icon name="chevronRight" size={15} />
+                  </span>
                   <span className="grow">{e.command.label}</span>
                   {e.command.hint && <kbd>{e.command.hint}</kbd>}
                 </>
@@ -244,7 +250,9 @@ export function CommandPalette({
               {e.kind === "action" && <span className="grow">{e.label}</span>}
               {e.kind === "pr" && (
                 <>
-                  <span className="pal-icon">{STATES[e.item.state].emoji}</span>
+                  <span className="pal-icon">
+                    <StateIcon state={e.item.state} size={14} />
+                  </span>
                   <span className="grow ellipsis">
                     {e.item.isNew && <span className="new-dot" />}
                     <span className="strong">{e.item.title}</span>

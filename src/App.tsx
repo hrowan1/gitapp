@@ -2,8 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, type Inbox, type Session } from "./lib/api";
 import { groupItems } from "./lib/states";
-import { age } from "./lib/time";
 import { CommandPalette, type View } from "./components/CommandPalette";
+import { NAV, Sidebar } from "./components/Sidebar";
+import { Shortcuts } from "./components/Shortcuts";
+import { Icon } from "./components/Icon";
 import { AllPrs, History, SettingsView, SignIn, Today } from "./components/Views";
 import { Following } from "./components/Following";
 import { setAllItems } from "./lib/store";
@@ -12,14 +14,6 @@ import { onDialog, type DialogRequest } from "./lib/dialog";
 import { ActionDialog } from "./components/ActionDialog";
 import { Standup } from "./components/Standup";
 import "./styles.css";
-
-const VIEWS: { id: View; label: string }[] = [
-  { id: "today", label: "Today" },
-  { id: "all", label: "All" },
-  { id: "history", label: "History" },
-  { id: "following", label: "Following" },
-  { id: "settings", label: "Settings" },
-];
 
 export default function App() {
   const [session, setSession] = useState<Session | null | undefined>(undefined);
@@ -32,7 +26,8 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
   const [standup, setStandup] = useState(false);
-  const overlay = palette || !!dialog || standup;
+  const [shortcuts, setShortcuts] = useState(false);
+  const overlay = palette || !!dialog || standup || shortcuts;
 
   useEffect(() => onDialog(setDialog), []);
 
@@ -86,12 +81,13 @@ export default function App() {
       }
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
       if (overlay || tag === "input" || tag === "select" || tag === "textarea" || e.metaKey || e.ctrlKey || e.altKey) return;
-      const idx = ["1", "2", "3", "4", "5"].indexOf(e.key);
+      const nav = NAV.find((n) => n.key === e.key);
       // preventDefault so the key isn't also typed into whatever the shortcut opens.
-      if (idx >= 0) setView(VIEWS[idx].id);
+      if (nav) setView(nav.id);
       else if (e.key === "r") sync();
       else if (e.key === "s") setStandup(true);
       else if (e.key === "/") setPalette(true);
+      else if (e.key === "?") setShortcuts(true);
       else return;
       e.preventDefault();
     };
@@ -107,42 +103,35 @@ export default function App() {
   const firstLoad = !inbox?.lastSync;
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <nav className="tabs">
-          {VIEWS.map((v) => (
-            <button key={v.id} className={`tab${view === v.id ? " active" : ""}`} onClick={() => setView(v.id)}>
-              {v.label}
-              {v.id === "today" && needs > 0 && <span className="badge">{needs}</span>}
+    <div className="app shell">
+      <Sidebar
+        view={view}
+        onView={setView}
+        counts={{ today: needs, all: items.length }}
+        session={session}
+        syncing={syncing}
+        lastSync={inbox?.lastSync}
+        now={now}
+        onSync={sync}
+        onAsk={() => setPalette(true)}
+        onShortcuts={() => setShortcuts(true)}
+      />
+
+      <main className="main">
+        {inbox?.lastError && (
+          <div className="banner error">
+            <Icon name="alert" size={14} />
+            <span className="grow">Last sync failed: {inbox.lastError}</span>
+            <button className="link" onClick={sync}>
+              Retry
             </button>
-          ))}
-        </nav>
-        <button className="ask" onClick={() => setPalette(true)}>
-          <span>What needs my attention?</span>
-          <kbd>⌘K</kbd>
-        </button>
-        <button className="sync" onClick={sync} disabled={syncing} title="Sync now (r)">
-          <span className={syncing ? "spin" : ""}>↻</span>
-          <span className="muted small">
-            {syncing ? "Syncing…" : inbox?.lastSync ? `Synced ${age(inbox.lastSync, now)} ago` : "Not synced"}
-          </span>
-        </button>
-      </header>
-
-      {inbox?.lastError && (
-        <div className="banner error">
-          Last sync failed: {inbox.lastError}{" "}
-          <button className="link" onClick={sync}>
-            Retry
-          </button>
-        </div>
-      )}
-
-      <main className="content">
+          </div>
+        )}
         {firstLoad && view !== "settings" && view !== "following" ? (
           <div className="empty big">
-            <div className="spin big">↻</div>
-            Fetching your pull requests from GitHub… the first sync can take up to a minute.
+            <Icon name="refresh" size={22} className="spin" />
+            <p>Fetching your pull requests and issues from GitHub…</p>
+            <p className="muted small">The first sync can take up to a minute.</p>
           </div>
         ) : (
           <>
@@ -199,6 +188,7 @@ export default function App() {
       )}
       {dialog && <ActionDialog request={dialog} onClose={() => setDialog(null)} />}
       {standup && <Standup items={items} onClose={() => setStandup(false)} />}
+      {shortcuts && <Shortcuts onClose={() => setShortcuts(false)} />}
     </div>
   );
 }

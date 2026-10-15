@@ -696,6 +696,11 @@ fn get_activity(state: State<AppState>, days: i64) -> CmdResult<Vec<db::Activity
 }
 
 #[tauri::command]
+fn get_item_activity(state: State<AppState>, item_id: String) -> CmdResult<Vec<db::Activity>> {
+    db::item_activity(&state.db.lock().unwrap(), &item_id, 30).map_err(err)
+}
+
+#[tauri::command]
 fn get_repos(state: State<AppState>) -> CmdResult<Vec<db::RepoInfo>> {
     db::list_repos(&state.db.lock().unwrap()).map_err(err)
 }
@@ -915,6 +920,7 @@ pub fn run() {
             open_locally,
             clone_and_open,
             get_activity,
+            get_item_activity,
             get_repos,
             set_repo_hidden,
             get_settings,

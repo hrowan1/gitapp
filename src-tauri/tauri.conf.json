@@ -14,9 +14,9 @@
       {
         "label": "main",
         "title": "Dev Inbox",
-        "width": 980,
-        "height": 760,
-        "minWidth": 560,
+        "width": 1320,
+        "height": 860,
+        "minWidth": 600,
         "minHeight": 480
       }
     ],

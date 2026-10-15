@@ -1,4 +1,26 @@
 import type { Item, StateId } from "./api";
+import type { IconName } from "../components/Icon";
+
+export type Tone = "blue" | "violet" | "orange" | "red" | "green" | "yellow" | "gray";
+
+/** How each state looks: an icon and a colour tone (replaces emojis in the UI). */
+export const STATE_STYLE: Record<StateId, { icon: IconName; tone: Tone }> = {
+  needs_review: { icon: "eye", tone: "blue" },
+  needs_rereview: { icon: "refresh", tone: "blue" },
+  replied: { icon: "message", tone: "violet" },
+  needs_changes: { icon: "alert", tone: "orange" },
+  ready_to_merge: { icon: "merge", tone: "green" },
+  waiting: { icon: "clock", tone: "gray" },
+  waiting_ci: { icon: "loader", tone: "yellow" },
+  draft: { icon: "pencil", tone: "gray" },
+  later: { icon: "pin", tone: "gray" },
+  done: { icon: "checkCircle", tone: "green" },
+  fyi: { icon: "eye", tone: "gray" },
+  stale: { icon: "clock", tone: "gray" },
+  muted: { icon: "bellOff", tone: "gray" },
+  assigned: { icon: "issue", tone: "blue" },
+  broken: { icon: "xCircle", tone: "red" },
+};
 
 export const STATES: Record<StateId, { emoji: string; label: string }> = {
   needs_review: { emoji: "👀", label: "Need to review" },

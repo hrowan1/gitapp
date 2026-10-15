@@ -14,43 +14,46 @@ import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
 import { setTheme as applyThemeChoice, getTheme, type Theme } from "../lib/theme";
 import { clock, friendlyDate } from "../lib/time";
+import { Icon, type IconName } from "./Icon";
 import { PrList } from "./PrList";
+import { useSelection, Workspace } from "./Workspace";
 
 export function Today({ items, now, active }: { items: Item[]; now: number; active: boolean }) {
   const groups = useMemo(() => groupItems(items), [items]);
-  const sections = SECTIONS.map((s) => ({
-    ...s,
-    items: groups[s.id],
-    collapsedByDefault: s.id === "done" || s.id === "stale",
-  }));
+  const sections = useMemo(
+    () =>
+      SECTIONS.map((s) => ({
+        ...s,
+        items: groups[s.id],
+        collapsedByDefault: s.id === "done" || s.id === "stale",
+      })),
+    [groups],
+  );
+  const { selectedId, selection, onSelect, clear } = useSelection(items);
   const needs = groups.needs.length;
   const fresh = items.filter((i) => i.isNew);
-  return (
-    <>
-      <div className="headline">
-        {needs === 0 ? (
-          <h1>You're all caught up.</h1>
-        ) : (
-          <h1>
-            {needs} {needs === 1 ? "thing needs" : "things need"} you.
-          </h1>
+  const header = (
+    <div className="headline">
+      <h1>{needs === 0 ? "You're all caught up" : `${needs} ${needs === 1 ? "thing needs" : "things need"} you`}</h1>
+      <p className="muted">
+        {fresh.length > 0 && (
+          <>
+            <span className="new-text">{fresh.length} new</span>{" "}
+            <button className="link" onClick={() => api.markSeen(fresh.map((i) => i.id))}>
+              mark seen
+            </button>
+            {" · "}
+          </>
         )}
-        <p className="muted">
-          {fresh.length > 0 && (
-            <>
-              <span className="new-text">{fresh.length} new since you last looked</span>{" "}
-              <button className="link small" onClick={() => api.markSeen(fresh.map((i) => i.id))}>
-                mark seen
-              </button>
-              {" · "}
-            </>
-          )}
-          {groups.later.length > 0 && `${groups.later.length} parked · `}
-          {groups.waiting.length + groups.mine.length} waiting on others or in progress
-        </p>
-      </div>
-      <PrList sections={sections} now={now} active={active} />
-    </>
+        {groups.later.length > 0 && `${groups.later.length} parked · `}
+        {groups.waiting.length + groups.mine.length} in progress or waiting
+      </p>
+    </div>
+  );
+  return (
+    <Workspace header={header} selection={selection} now={now} onClose={clear}>
+      <PrList sections={sections} now={now} active={active} selectedId={selectedId} onSelect={onSelect} />
+    </Workspace>
   );
 }
 
@@ -62,29 +65,51 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
   const [ci, setCi] = useState("");
   const [kind, setKind] = useState("");
   const [text, setText] = useState("");
+  const { selectedId, selection, onSelect, clear } = useSelection(items);
 
   const repos = useMemo(() => [...new Set(items.map((i) => i.repo))].sort(), [items]);
   const authors = useMemo(() => [...new Set(items.map((i) => i.author))].sort((a, b) => a.localeCompare(b)), [items]);
-  const filtered = items
-    .filter(
-      (i) =>
-        (!repo || i.repo === repo || i.repo.startsWith(repo + "/")) &&
-        (!author || i.author === author) &&
-        (!state || i.state === state) &&
-        (!ci || i.ci === ci) &&
-        (!kind || i.kind === kind) &&
-        (!owner || (owner === "mine") === i.isMine) &&
-        (!text || `${i.title} ${i.repo} #${i.number}`.toLowerCase().includes(text.toLowerCase())),
-    )
-    .sort(compareItems);
+  const filtered = useMemo(
+    () =>
+      items
+        .filter(
+          (i) =>
+            (!repo || i.repo === repo || i.repo.startsWith(repo + "/")) &&
+            (!author || i.author === author) &&
+            (!state || i.state === state) &&
+            (!ci || i.ci === ci) &&
+            (!kind || i.kind === kind) &&
+            (!owner || (owner === "mine") === i.isMine) &&
+            (!text || `${i.title} ${i.repo} #${i.number}`.toLowerCase().includes(text.toLowerCase())),
+        )
+        .sort(compareItems),
+    [items, repo, author, state, ci, kind, owner, text],
+  );
   const orgs = [...new Set(repos.map((r) => r.split("/")[0]))];
+  const sections = useMemo(
+    () => [{ id: "all", title: `${filtered.length} items`, items: filtered, empty: "No matches." }],
+    [filtered],
+  );
 
-  return (
+  const header = (
     <>
+      <div className="headline compact">
+        <h1>Inbox</h1>
+        <p className="muted">Everything you're involved in, across every repository.</p>
+      </div>
       <div className="filters">
-        <input className="search" placeholder="Filter…" value={text} onChange={(e) => setText(e.target.value)} />
+        <div className="search-box">
+          <Icon name="search" size={14} />
+          <input placeholder="Filter by title, repo or number" value={text} onChange={(e) => setText(e.target.value)} />
+        </div>
+        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          <option value="">All types</option>
+          <option value="pr">Pull requests</option>
+          <option value="issue">Issues</option>
+          <option value="run">Branches</option>
+        </select>
         <select value={repo} onChange={(e) => setRepo(e.target.value)}>
-          <option value="">All repositories</option>
+          <option value="">All repos</option>
           {orgs.length > 1 && (
             <optgroup label="Organisations">
               {orgs.map((o) => (
@@ -102,25 +127,19 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
             ))}
           </optgroup>
         </select>
-        <select value={author} onChange={(e) => setAuthor(e.target.value)}>
-          <option value="">Any author</option>
-          {authors.map((a) => (
-            <option key={a}>{a}</option>
-          ))}
-        </select>
         <select value={state} onChange={(e) => setStateFilter(e.target.value)}>
           <option value="">Any state</option>
           {(Object.keys(STATES) as StateId[]).map((s) => (
             <option key={s} value={s}>
-              {STATES[s].emoji} {STATES[s].label}
+              {STATES[s].label}
             </option>
           ))}
         </select>
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
-          <option value="">PRs, issues & branches</option>
-          <option value="pr">Pull requests</option>
-          <option value="issue">Issues</option>
-          <option value="run">Branches</option>
+        <select value={author} onChange={(e) => setAuthor(e.target.value)}>
+          <option value="">Anyone</option>
+          {authors.map((a) => (
+            <option key={a}>{a}</option>
+          ))}
         </select>
         <select value={ci} onChange={(e) => setCi(e.target.value)}>
           <option value="">Any CI</option>
@@ -129,28 +148,29 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
           <option value="success">Passing</option>
         </select>
         <select value={owner} onChange={(e) => setOwner(e.target.value as typeof owner)}>
-          <option value="">Everyone's</option>
+          <option value="">Mine & others'</option>
           <option value="mine">Mine</option>
           <option value="others">Others'</option>
         </select>
       </div>
-      <PrList
-        sections={[{ id: "all", title: `${filtered.length} items`, items: filtered, empty: "No matches." }]}
-        now={now}
-        active={active}
-      />
     </>
+  );
+
+  return (
+    <Workspace header={header} selection={selection} now={now} onClose={clear}>
+      <PrList sections={sections} now={now} active={active} selectedId={selectedId} onSelect={onSelect} />
+    </Workspace>
   );
 }
 
-const KIND_ICON: Record<Activity["kind"], string> = {
-  reviewed: "🔍",
-  commented: "💬",
-  opened: "🆕",
-  merged: "🟣",
-  closed: "⚪️",
-  marked: "📝",
-  update: "🔔",
+const KIND_ICON: Record<Activity["kind"], IconName> = {
+  reviewed: "eye",
+  commented: "message",
+  opened: "pr",
+  merged: "merge",
+  closed: "xCircle",
+  marked: "pin",
+  update: "refresh",
 };
 
 export function History({ version, onStandup }: { version: number; onStandup: () => void }) {
@@ -169,7 +189,11 @@ export function History({ version, onStandup }: { version: number; onStandup: ()
   }
 
   return (
-    <>
+    <div className="page">
+      <div className="headline compact">
+        <h1>History</h1>
+        <p className="muted">What you did, and what changed on things you follow.</p>
+      </div>
       <div className="filters">
         <select value={days} onChange={(e) => setDays(Number(e.target.value))}>
           <option value={1}>Last 24 hours</option>
@@ -181,8 +205,8 @@ export function History({ version, onStandup }: { version: number; onStandup: ()
           <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Only things I
           did
         </label>
-        <button className="primary standup-btn" onClick={onStandup} title="Write my standup (s)">
-          📝 Write my standup
+        <button className="standup-btn" onClick={onStandup} title="Write my standup (s)">
+          Write my standup
         </button>
       </div>
       {shown.length === 0 && (
@@ -204,7 +228,9 @@ export function History({ version, onStandup }: { version: number; onStandup: ()
               onClick={() => a.url && openUrl(a.url)}
             >
               <span className="time">{clock(a.at)}</span>
-              <span className="row-state">{KIND_ICON[a.kind]}</span>
+              <span className={`state-icon act-${a.kind}`}>
+                <Icon name={KIND_ICON[a.kind]} size={15} />
+              </span>
               <div className="row-main">
                 <div className="row-title">
                   <span className="who">{a.detail}</span>
@@ -221,7 +247,7 @@ export function History({ version, onStandup }: { version: number; onStandup: ()
           ))}
         </section>
       ))}
-    </>
+    </div>
   );
 }
 
@@ -247,7 +273,10 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
   const shortcut = navigator.platform.toLowerCase().includes("mac") ? "⌥⌘K" : "Ctrl+Alt+K";
 
   return (
-    <div className="settings">
+    <div className="page settings">
+      <div className="headline compact">
+        <h1>Settings</h1>
+      </div>
       <section className="card">
         <h2>Account</h2>
         <div className="account">

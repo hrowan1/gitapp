@@ -5,6 +5,8 @@ import { openDialog } from "../lib/dialog";
 import { MANUAL_STATES, STATES, shortRef } from "../lib/states";
 import { matchTitles } from "../lib/store";
 import { SNOOZE_PRESETS, age, untilLabel } from "../lib/time";
+import { Icon } from "./Icon";
+import { StateIcon } from "./StateIcon";
 
 const CI_LABEL: Record<Item["ci"], string | null> = {
   failure: "Checks failing",
@@ -34,7 +36,6 @@ export function PrRow({
   nested?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const meta = STATES[item.state];
   const personal = item.personal && item.personal.state !== "due" ? item.personal : null;
 
   useEffect(() => {
@@ -42,88 +43,62 @@ export function PrRow({
   }, [selected]);
 
   let reason = item.reason;
-  if (item.reminderDue) reason = item.personal?.note ? `⏰ ${item.personal.note}` : "⏰ Reminder due";
+  if (item.reminderDue) reason = item.personal?.note ? `Reminder: ${item.personal.note}` : "Reminder due";
   else if (personal?.state === "later") {
     const when = personal.until
       ? `until ${untilLabel(personal.until)}`
       : personal.waitsOn
-        ? `until ${personal.waitsOn.split("/")[1] ?? personal.waitsOn} merges or closes`
+        ? `until ${personal.waitsOn.split("/")[1] ?? personal.waitsOn} merges`
         : "until something changes";
     reason = [personal.note, when].filter(Boolean).join(" · ");
-  } else if (personal) reason = `Marked ${STATES[personal.state as StateId]?.label.toLowerCase() ?? personal.state} · ${item.reason}`;
+  } else if (personal) reason = `Marked ${STATES[personal.state as StateId]?.label.toLowerCase() ?? personal.state}`;
 
   const ci = CI_LABEL[item.ci];
 
   return (
     <div
       ref={ref}
-      className={`row${selected ? " selected" : ""}${nested ? " nested" : ""}`}
-      onMouseEnter={onSelect}
-      // Click: actions menu. Double-click: open on GitHub. Right-click: actions menu.
-      onClick={(e) => {
-        if (e.detail === 1) onMenu(!menuOpen);
-      }}
+      className={`row${selected ? " selected" : ""}${nested ? " nested" : ""}${item.isNew ? " is-new" : ""}`}
+      // Click: select (details on the right). Double-click: open on GitHub. Right-click: quick menu.
+      onClick={onSelect}
       onDoubleClick={() => {
         onMenu(false);
         openItem(item);
       }}
       onContextMenu={(e) => {
         e.preventDefault();
+        onSelect();
         onMenu(true);
       }}
       role="button"
-      title="Click for actions · double-click to open on GitHub"
+      aria-selected={selected}
     >
-      <span className="row-state" title={meta.label}>
-        {meta.emoji}
-      </span>
-      {item.authorAvatar ? (
-        <img className="avatar" src={item.authorAvatar} alt="" />
-      ) : (
-        <span className="avatar placeholder">{item.author.slice(0, 1)}</span>
-      )}
+      <StateIcon state={item.reminderDue ? "later" : item.state} />
       <div className="row-main">
         <div className="row-title">
-          {item.isNew && <span className="new-dot" title="New since you last looked" />}
           {item.kind !== "pr" && <span className={`kind kind-${item.kind}`}>{item.kind === "issue" ? "Issue" : "Branch"}</span>}
-          <span className="who">{item.isMine ? "You" : item.author}</span>
-          <span className="sep">·</span>
           <span className="title">{item.title}</span>
         </div>
         <div className="row-sub">
+          <span className="who">{item.isMine ? "You" : item.author}</span>
+          <span className="sep">·</span>
           <span className="repo">{shortRef(item)}</span>
           <span className="sep">·</span>
           <span className="reason">{reason}</span>
-          {ci && item.kind === "pr" && !reason.toLowerCase().includes("ci") && !reason.includes("checks") && (
-            <span className={`pill ci-${item.ci}`}>{ci}</span>
-          )}
+          {ci && item.kind === "pr" && !/ci|checks/i.test(reason) && <span className={`pill ci-${item.ci}`}>{ci}</span>}
           {item.isDraft && !item.isMine && <span className="pill">Draft</span>}
         </div>
         {item.context?.body && item.state === "replied" && (
           <div className="row-quote" title={item.context.body}>
-            “{item.context.body}”
+            {item.context.who}: {item.context.body}
           </div>
         )}
       </div>
       <div className="row-right">
+        {item.isNew && <span className="new-dot" title="New since you last looked" />}
         <span className="age" title={`Last activity ${new Date(item.updatedAt).toLocaleString()}`}>
           {age(item.updatedAt, now)}
         </span>
-        <div className="row-actions" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
-          {item.kind !== "run" && item.state === "replied" && (
-            <button className="icon-btn" title="Reply (R)" onClick={() => openDialog("reply", item)}>
-              ↩︎
-            </button>
-          )}
-          {item.state !== "done" && (
-            <button className="icon-btn" title="Done (e)" onClick={() => setStates([item], "done")}>
-              ✓
-            </button>
-          )}
-          <button className="icon-btn" title="More (.)" onClick={() => onMenu(!menuOpen)}>
-            ⋯
-          </button>
-        </div>
       </div>
       {menuOpen && <ActionMenu items={[item]} onClose={() => onMenu(false)} focusNote={focusNote} />}
     </div>
@@ -189,36 +164,36 @@ export function ActionMenu({
     >
       {single && (
         <button className="menu-item" onClick={() => run(() => openItem(single))}>
-          ↗ Open on GitHub
+          <Icon name="external" size={14} /> Open on GitHub
         </button>
       )}
       {single && single.kind !== "run" && (
         <>
           <button className="menu-item" onClick={() => run(() => openDialog("reply", single))}>
-            ↩︎ {single.context && single.state === "replied" ? `Reply to ${single.context.who}…` : "Comment…"}
+            <Icon name="reply" size={14} /> {single.context && single.state === "replied" ? `Reply to ${single.context.who}…` : "Comment…"}
           </button>
           {single.kind === "pr" && !single.isMine && (
             <>
               <button className="menu-item" onClick={() => run(() => openDialog("approve", single))}>
-                ✅ Approve…
+                <Icon name="checkCircle" size={14} /> Approve…
               </button>
               <button className="menu-item" onClick={() => run(() => openDialog("request_changes", single))}>
-                ✋ Request changes…
+                <Icon name="minusCircle" size={14} /> Request changes…
               </button>
             </>
           )}
           {single.kind === "pr" && (
             <button className="menu-item" onClick={() => run(() => openDialog("merge", single))}>
-              🔀 Merge…
+              <Icon name="merge" size={14} /> Merge…
             </button>
           )}
           {single.kind === "pr" && (
             <button className="menu-item" onClick={() => run(() => openInEditor(single, true))}>
-              ⎇ Check out & open in editor
+              <Icon name="branch" size={14} /> Check out & open in editor
             </button>
           )}
           <button className="menu-item" onClick={() => run(() => openInEditor(single, false))}>
-            ⌨︎ Open repo in editor
+            <Icon name="code" size={14} /> Open repo in editor
           </button>
         </>
       )}
@@ -226,11 +201,11 @@ export function ActionMenu({
         <>
           {single.ci === "failure" && (
             <button className="menu-item" onClick={() => run(() => rerunChecks(single))}>
-              ↻ Re-run failed checks
+              <Icon name="rerun" size={14} /> Re-run failed checks
             </button>
           )}
           <button className="menu-item" onClick={() => run(() => copyCheckout(single))}>
-            ⧉ Copy checkout command
+            <Icon name="copy" size={14} /> Copy checkout command
           </button>
         </>
       )}
@@ -252,12 +227,12 @@ export function ActionMenu({
           title="Comes back when this merges or closes"
           onClick={() => act("later", null, `${note.trim()} (${w.repo}#${w.number})`)}
         >
-          ⏳ Until {shortRef(w)} merges: <span className="muted">{w.title}</span>
+          <Icon name="merge" size={14} /> Until {shortRef(w)} merges: <span className="muted">{w.title}</span>
         </button>
       ))}
       {SNOOZE_PRESETS.map((p) => (
         <button key={p.id} className="menu-item" onClick={() => act("later", p.until())}>
-          📌 {p.label}
+          <Icon name="pin" size={14} /> {p.label}
         </button>
       ))}
       <div className="menu-label">Mark as</div>
@@ -267,7 +242,7 @@ export function ActionMenu({
           className={`menu-item${single?.personal?.state === s ? " active" : ""}`}
           onClick={() => act(s)}
         >
-          {STATES[s].emoji} {STATES[s].label}
+          <StateIcon state={s} size={14} /> {STATES[s].label}
         </button>
       ))}
       <div className="menu-sep" />
@@ -276,11 +251,11 @@ export function ActionMenu({
         onClick={() => run(() => unfollow(items))}
         title="Gone from Today, counts and notifications. Re-follow from the Following tab."
       >
-        🔕 Stop following{items.length > 1 ? ` all ${items.length}` : ""}
+        <Icon name="bellOff" size={14} /> Stop following{items.length > 1 ? ` all ${items.length}` : ""}
       </button>
       {items.some((i) => i.personal) && (
         <button className="menu-item" onClick={() => act(null)}>
-          ↺ Back to automatic
+          <Icon name="undo" size={14} /> Back to automatic
           {single ? ` (${STATES[single.autoState].label.toLowerCase()})` : ""}
         </button>
       )}

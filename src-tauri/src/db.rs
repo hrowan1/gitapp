@@ -432,6 +432,32 @@ pub fn checkout_info(conn: &Connection, id: &str) -> Result<Option<(String, Stri
         .optional()?)
 }
 
+/// The timeline of one item, newest first.
+pub fn item_activity(conn: &Connection, pr_id: &str, limit: i64) -> Result<Vec<Activity>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.at, a.kind, a.pr_id, a.repo, a.number, a.title, a.url, a.detail, COALESCE(p.is_mine, 0), p.kind
+         FROM activity a LEFT JOIN prs p ON p.id = a.pr_id
+         WHERE a.pr_id = ?1 ORDER BY a.at DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![pr_id, limit], |r| {
+            Ok(Activity {
+                at: r.get(0)?,
+                kind: r.get(1)?,
+                pr_id: r.get(2)?,
+                repo: r.get(3)?,
+                number: r.get(4)?,
+                title: r.get(5)?,
+                url: r.get(6)?,
+                detail: r.get(7)?,
+                is_mine: r.get(8)?,
+                item_kind: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub fn list_activity(conn: &Connection, since: &str) -> Result<Vec<Activity>> {
     let mut stmt = conn.prepare(
         "SELECT a.at, a.kind, a.pr_id, a.repo, a.number, a.title, a.url, a.detail, COALESCE(p.is_mine, 0), p.kind
