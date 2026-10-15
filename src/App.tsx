@@ -12,7 +12,7 @@ import { setAllItems } from "./lib/store";
 import { onToast, type Toast } from "./lib/toast";
 import { onDialog, type DialogRequest } from "./lib/dialog";
 import { ActionDialog } from "./components/ActionDialog";
-import { Standup } from "./components/Standup";
+import { DayView } from "./components/DayView";
 import "./styles.css";
 
 export default function App() {
@@ -25,9 +25,8 @@ export default function App() {
   const [version, setVersion] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
-  const [standup, setStandup] = useState(false);
   const [shortcuts, setShortcuts] = useState(false);
-  const overlay = palette || !!dialog || standup || shortcuts;
+  const overlay = palette || !!dialog || shortcuts;
 
   useEffect(() => onDialog(setDialog), []);
 
@@ -85,7 +84,7 @@ export default function App() {
       // preventDefault so the key isn't also typed into whatever the shortcut opens.
       if (nav) setView(nav.id);
       else if (e.key === "r") sync();
-      else if (e.key === "s") setStandup(true);
+      else if (e.key === "s") setView("day");
       else if (e.key === "/") setPalette(true);
       else if (e.key === "?") setShortcuts(true);
       else return;
@@ -127,7 +126,7 @@ export default function App() {
             </button>
           </div>
         )}
-        {firstLoad && view !== "settings" && view !== "following" ? (
+        {firstLoad && view !== "settings" && view !== "following" && view !== "day" ? (
           <div className="empty big">
             <Icon name="refresh" size={22} className="spin" />
             <p>Fetching your pull requests and issues from GitHub…</p>
@@ -137,7 +136,8 @@ export default function App() {
           <>
             {view === "today" && <Today items={items} now={now} active={!overlay} />}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
-            {view === "history" && <History version={version} onStandup={() => setStandup(true)} />}
+            {view === "day" && <DayView version={version} />}
+            {view === "history" && <History version={version} onOpenDay={() => setView("day")} />}
             {view === "following" && <Following version={version} />}
           </>
         )}
@@ -180,14 +180,9 @@ export default function App() {
             setPalette(false);
           }}
           onSync={sync}
-          onStandup={() => {
-            setPalette(false);
-            setStandup(true);
-          }}
         />
       )}
       {dialog && <ActionDialog request={dialog} onClose={() => setDialog(null)} />}
-      {standup && <Standup items={items} onClose={() => setStandup(false)} />}
       {shortcuts && <Shortcuts onClose={() => setShortcuts(false)} />}
     </div>
   );

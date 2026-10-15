@@ -204,10 +204,101 @@ pub fn seed(conn: &Connection) -> Result<()> {
     };
     db::upsert(conn, &run, &d, sync_id)?;
 
+    seed_work_day(conn)?;
+
     db::set_setting(conn, "login", ME)?;
     db::set_setting(conn, "last_sync", &fmt_ts(Utc::now()))?;
     db::set_setting(conn, "initialized", "1")?;
     // Things that arrived in the last 6 hours show as "new".
     db::set_setting(conn, "initialized_at", &ago(6))?;
     Ok(())
+}
+
+/// Yesterday as a realistic working day, for the Day view: editing sessions, commits and pushes on
+/// ticket branches, a review, a comment and a push to main.
+fn seed_work_day(conn: &Connection) -> Result<()> {
+    use chrono::{Local, TimeZone};
+    let y = Local::now().date_naive() - Duration::days(1);
+    let at = |hm: &str| -> String {
+        let (h, m) = hm.split_once(':').unwrap();
+        let t = y.and_hms_opt(h.parse().unwrap(), m.parse().unwrap(), 0).unwrap();
+        fmt_ts(Local.from_local_datetime(&t).earliest().unwrap().with_timezone(&Utc))
+    };
+    let pr = |id: &str| db::PrRef::load(conn, id).ok().flatten();
+    conn.execute("UPDATE prs SET branch = 'BILL-142-proration' WHERE id = 'DEMO_4'", [])?;
+    conn.execute("UPDATE prs SET branch = 'mob-77-offline-orders' WHERE id = 'DEMO_8'", [])?;
+
+    let work = |id: &str, branch: &str, repo: &str, samples: (u32, u32), commits: &[(&str, &str)], push: &str| -> Result<()> {
+        let r = pr(id);
+        let mut m = samples.0;
+        while m <= samples.1 {
+            db::record_sample(conn, &at(&format!("{}:{:02}", m / 60, m % 60)), repo, Some(branch))?;
+            m += 5;
+        }
+        for (i, (t, msg)) in commits.iter().enumerate() {
+            db::record_activity_on_branch(
+                conn,
+                &db::ActivityRow { key: format!("commit:demo-{id}-{i}"), at: &at(t), kind: "committed", pr: r.as_ref(), detail: msg.to_string() },
+                branch,
+            )?;
+        }
+        db::record_activity_on_branch(
+            conn,
+            &db::ActivityRow { key: format!("push:demo-{id}"), at: &at(push), kind: "pushed", pr: r.as_ref(), detail: format!("Pushed to {branch}") },
+            branch,
+        )?;
+        Ok(())
+    };
+    work(
+        "DEMO_4",
+        "BILL-142-proration",
+        "acme/billing",
+        (9 * 60, 10 * 60 + 55),
+        &[("09:42", "Prorate seat changes by remaining days"), ("10:18", "Handle downgrades mid-cycle"), ("11:02", "Fix rounding in proration tests")],
+        "11:06",
+    )?;
+    work(
+        "DEMO_8",
+        "mob-77-offline-orders",
+        "acme/mobile",
+        (13 * 60 + 35, 15 * 60 + 40),
+        &[("14:21", "Cache order list in SQLite"), ("15:44", "Sync queued edits when back online")],
+        "15:47",
+    )?;
+    if let Some(r) = pr("DEMO_3") {
+        db::record_activity(conn, &db::ActivityRow { key: "review:demo-y".into(), at: &at("11:34"), kind: "reviewed", pr: Some(&r), detail: "Requested changes".into() })?;
+    }
+    if let Some(r) = pr("DEMO_2") {
+        db::record_activity(conn, &db::ActivityRow { key: "comment:demo-y".into(), at: &at("16:12"), kind: "commented", pr: Some(&r), detail: "Commented".into() })?;
+    }
+    db::record_push(conn, "demo-main", &at("16:41"), "acme/infrastructure", "main", "https://github.com/acme/infrastructure")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The demo work day turns into sensible blocks: `cargo test demo_day -- --nocapture`
+    #[test]
+    fn demo_day() {
+        use chrono::{Local, TimeZone};
+        let path = std::env::temp_dir().join(format!("dev-inbox-demo-day-{}.sqlite3", std::process::id()));
+        let conn = crate::db::open(&path).unwrap();
+        super::seed(&conn).unwrap();
+        let y = Local::now().date_naive() - chrono::Duration::days(1);
+        let start = Local.from_local_datetime(&y.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().with_timezone(&chrono::Utc);
+        let end = start + chrono::Duration::days(1);
+        let (s, e) = (crate::derive::fmt_ts(start), crate::derive::fmt_ts(end));
+        let events = crate::day::gather(&conn, &s, &e).unwrap();
+        let r = crate::day::build(&y.to_string(), events, None, start, end);
+        if std::env::var("DAY_JSON").is_ok() {
+            println!("DAYJSON {}", serde_json::to_string(&r).unwrap());
+        }
+        let keys: Vec<&str> = r.groups.iter().map(|g| g.key.as_str()).collect();
+        assert!(keys.contains(&"T:BILL-142"), "{keys:?}");
+        assert!(keys.contains(&"T:MOB-77"), "{keys:?}");
+        let bill = r.groups.iter().find(|g| g.key == "T:BILL-142").unwrap();
+        assert!(bill.minutes >= 120 && bill.minutes <= 150, "{}", bill.minutes);
+        assert!(r.total_minutes > 240, "{}", r.total_minutes);
+        let _ = std::fs::remove_file(path);
+    }
 }

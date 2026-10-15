@@ -204,6 +204,75 @@ pub fn checkout_pr(path: &str, number: i64, branch: Option<&str>, cross_repo: bo
     }
 }
 
+/// A fingerprint of a clone's working state: branch, HEAD, which tracked files are dirty, and
+/// when they last changed. If it differs from the previous sample, the user was working there.
+pub struct Sample {
+    pub branch: Option<String>,
+    pub signature: u64,
+}
+
+pub fn sample(path: &str) -> Option<Sample> {
+    use std::hash::{Hash, Hasher};
+    let head = git(path, &["rev-parse", "HEAD"]).ok()?;
+    let branch = git(path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok().filter(|b| b != "HEAD");
+    let status = git(path, &["status", "--porcelain=v1", "--untracked-files=no"]).unwrap_or_default();
+    // Editing an already-modified file doesn't change `git status`, so include mtimes too.
+    let newest = status
+        .lines()
+        // "XY path" (or "R  old -> new"); output may have been trimmed, so split on the status token.
+        .filter_map(|l| l.trim_start().split_once(' ').map(|(_, rest)| rest.trim()))
+        .map(|f| f.rsplit(" -> ").next().unwrap_or(f).trim_matches('"'))
+        .filter_map(|f| std::fs::metadata(Path::new(path).join(f)).and_then(|m| m.modified()).ok())
+        .max();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (head, &branch, status, newest).hash(&mut h);
+    Some(Sample { branch, signature: h.finish() })
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalCommit {
+    pub oid: String,
+    pub at: String,
+    pub branch: Option<String>,
+    pub message: String,
+}
+
+/// The user's own commits in a clone between two instants, on any branch.
+pub fn local_commits(path: &str, since: &str, until: &str) -> Vec<LocalCommit> {
+    let Ok(email) = git(path, &["config", "user.email"]) else { return Vec::new() };
+    if email.is_empty() {
+        return Vec::new();
+    }
+    let out = git(
+        path,
+        &[
+            "log",
+            "--all",
+            "--source",
+            &format!("--since={since}"),
+            &format!("--until={until}"),
+            &format!("--author={email}"),
+            "--format=%H%x1f%aI%x1f%S%x1f%s",
+        ],
+    )
+    .unwrap_or_default();
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\u{1f}');
+            let oid = f.next()?.to_string();
+            let at = f.next()?.to_string();
+            let source = f.next().unwrap_or_default();
+            let message = f.next().unwrap_or_default().to_string();
+            let branch = source
+                .strip_prefix("refs/heads/")
+                .or_else(|| source.strip_prefix("refs/remotes/origin/"))
+                .filter(|b| *b != "HEAD")
+                .map(String::from);
+            Some(LocalCommit { oid, at, branch, message })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +297,36 @@ mod tests {
 #[cfg(test)]
 mod checkout_tests {
     use std::process::Command;
+
+    #[test]
+    fn samples_and_local_commits() {
+        let dir = std::env::temp_dir().join(format!("dev-inbox-sample-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        let run = |args: &[&str]| assert!(Command::new("git").arg("-C").arg(&path).args(args).output().unwrap().status.success());
+        run(&["init", "-q", "-b", "ABC-12-thing"]);
+        run(&["config", "user.email", "me@example.com"]);
+        run(&["config", "user.name", "Me"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "first"]);
+        let s1 = super::sample(&path).unwrap();
+        assert_eq!(s1.branch.as_deref(), Some("ABC-12-thing"));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        let s2 = super::sample(&path).unwrap();
+        assert_ne!(s1.signature, s2.signature, "an edit changes the signature");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("a.txt"), "three").unwrap();
+        let s3 = super::sample(&path).unwrap();
+        assert_ne!(s2.signature, s3.signature, "editing an already-dirty file still changes it");
+
+        let commits = super::local_commits(&path, "2000-01-01T00:00:00Z", "2037-01-01T00:00:00Z");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message, "first");
+        assert_eq!(commits[0].branch.as_deref(), Some("ABC-12-thing"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn refuses_with_uncommitted_changes() {

@@ -30,6 +30,7 @@ fragment PrFields on PullRequest {
   comments(last: 20) { nodes { id createdAt body author { __typename login } } }
   reviewThreads(last: 30) { nodes { id comments(last: 10) { nodes { id createdAt body author { __typename login } } } } }
   commits(last: 1) { nodes { commit { committedDate statusCheckRollup { state } } } }
+  recentCommits: commits(last: 30) { nodes { commit { oid authoredDate messageHeadline author { user { login } } } } }
   timelineItems(last: 10, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, REVIEW_REQUESTED_EVENT]) {
     nodes {
       __typename
@@ -142,6 +143,26 @@ pub struct Commit {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RecentCommitNode {
+    pub commit: RecentCommit,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentCommit {
+    pub oid: String,
+    pub authored_date: String,
+    #[serde(default)]
+    pub message_headline: String,
+    pub author: Option<CommitAuthor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitAuthor {
+    pub user: Option<Login>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Rollup {
     pub state: String,
 }
@@ -190,6 +211,9 @@ pub struct PullRequest {
     #[serde(default = "Nodes::empty")]
     pub review_threads: Nodes<ReviewThread>,
     pub commits: Nodes<CommitNode>,
+    /// The PR's latest commits (for the Day view's "when did I work on this").
+    #[serde(default = "Nodes::empty")]
+    pub recent_commits: Nodes<RecentCommitNode>,
     pub timeline_items: Nodes<TimelineItem>,
     /// Set locally from the search hit: the PR was returned by the `review-requested:@me` search
     /// (covers team review requests, which `reviewRequests` can't attribute to the user).
@@ -245,6 +269,15 @@ pub struct BranchStatus {
     pub ci: String,
     /// (workflow or app name, run url) for each failed suite.
     pub failures: Vec<(String, Option<String>)>,
+}
+
+/// A push to any branch, from the user's public + private event feed.
+#[derive(Debug, Clone)]
+pub struct Push {
+    pub id: String,
+    pub at: String,
+    pub repo: String,
+    pub branch: String,
 }
 
 /// Where a referenced PR or issue (e.g. "after #123 merges") currently stands.
@@ -543,6 +576,35 @@ impl Client {
         )
         .await?;
         Ok(())
+    }
+
+    /// The user's recent pushes (the events feed only keeps ~300 events, so callers store them).
+    pub async fn recent_pushes(&self, login: &str) -> Result<Vec<Push>> {
+        let res = self
+            .http
+            .get(format!("https://api.github.com/users/{login}/events?per_page=100"))
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| anyhow!(Transient(format!("GitHub request failed: {e}"))))?;
+        if !res.status().is_success() {
+            bail!("GitHub events returned {}", res.status());
+        }
+        let events: Vec<Value> = res.json().await.context("invalid events response")?;
+        Ok(events
+            .iter()
+            .filter(|e| e["type"] == "PushEvent")
+            .filter_map(|e| {
+                Some(Push {
+                    id: e["id"].as_str()?.to_string(),
+                    at: e["created_at"].as_str()?.to_string(),
+                    repo: e["repo"]["name"].as_str()?.to_string(),
+                    branch: e["payload"]["ref"].as_str()?.trim_start_matches("refs/heads/").to_string(),
+                })
+            })
+            .collect())
     }
 
     async fn rest_post(&self, path: &str) -> Result<()> {

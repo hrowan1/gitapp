@@ -92,6 +92,31 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 3 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE activity ADD COLUMN branch TEXT;
+            -- Local editing activity: a clone's branch/files changed since the last sample.
+            CREATE TABLE IF NOT EXISTS work_samples (at TEXT NOT NULL, repo TEXT NOT NULL, branch TEXT);
+            CREATE INDEX IF NOT EXISTS work_samples_at ON work_samples(at);
+            -- Time blocks the user has corrected; a day with any is "frozen" (no longer auto-generated).
+            CREATE TABLE IF NOT EXISTS time_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                start TEXT NOT NULL,
+                end TEXT NOT NULL,
+                note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS time_blocks_day ON time_blocks(day);
+            CREATE TABLE IF NOT EXISTS frozen_days (day TEXT PRIMARY KEY);
+            PRAGMA user_version = 3;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -387,6 +412,42 @@ pub fn activity_exists(conn: &Connection, key: &str) -> Result<bool> {
     Ok(conn.query_row("SELECT 1 FROM activity WHERE key = ?1", [key], |_| Ok(())).optional()?.is_some())
 }
 
+/// Like `record_activity`, also noting the branch (pushes, commits).
+pub fn record_activity_on_branch(conn: &Connection, a: &ActivityRow, branch: &str) -> Result<bool> {
+    let new = record_activity(conn, a)?;
+    if new {
+        conn.execute("UPDATE activity SET branch = ?2 WHERE key = ?1", params![a.key, branch])?;
+    }
+    Ok(new)
+}
+
+/// A push with no tracked PR behind it: stored with just the repo and branch.
+pub fn record_push(conn: &Connection, id: &str, at: &str, repo: &str, branch: &str, url: &str) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO activity (key, at, kind, repo, title, url, detail, branch)
+         VALUES (?1, ?2, 'pushed', ?3, ?4, ?5, ?6, ?4)",
+        params![format!("push:{id}"), at, repo, branch, url, format!("Pushed to {branch}")],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn record_sample(conn: &Connection, at: &str, repo: &str, branch: Option<&str>) -> Result<()> {
+    conn.execute("INSERT INTO work_samples (at, repo, branch) VALUES (?1, ?2, ?3)", params![at, repo, branch])?;
+    Ok(())
+}
+
+/// (open or closed) PR id for a repo + branch, used to tie pushes and local edits to a PR.
+pub fn pr_for_branch(conn: &Connection, repo: &str, branch: &str) -> Result<Option<PrRef>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, repo, number, title, url FROM prs
+             WHERE kind = 'pr' AND lower(repo) = lower(?1) AND branch = ?2 ORDER BY updated_at DESC LIMIT 1",
+            params![repo, branch],
+            |r| Ok(PrRef { id: r.get(0)?, repo: r.get(1)?, number: r.get(2)?, title: r.get(3)?, url: r.get(4)? }),
+        )
+        .optional()?)
+}
+
 /// Returns true if the row was new.
 pub fn record_activity(conn: &Connection, a: &ActivityRow) -> Result<bool> {
     let n = conn.execute(
@@ -667,7 +728,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days;",
     )?;
     Ok(())
 }

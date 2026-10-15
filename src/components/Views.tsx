@@ -164,6 +164,8 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
 }
 
 const KIND_ICON: Record<Activity["kind"], IconName> = {
+  committed: "code",
+  pushed: "branch",
   reviewed: "eye",
   commented: "message",
   opened: "pr",
@@ -173,7 +175,7 @@ const KIND_ICON: Record<Activity["kind"], IconName> = {
   update: "refresh",
 };
 
-export function History({ version, onStandup }: { version: number; onStandup: () => void }) {
+export function History({ version, onOpenDay }: { version: number; onOpenDay: () => void }) {
   const [days, setDays] = useState(7);
   const [mineOnly, setMineOnly] = useState(false);
   const [rows, setRows] = useState<Activity[]>([]);
@@ -205,8 +207,8 @@ export function History({ version, onStandup }: { version: number; onStandup: ()
           <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Only things I
           did
         </label>
-        <button className="standup-btn" onClick={onStandup} title="Write my standup (s)">
-          Write my standup
+        <button className="standup-btn" onClick={onOpenDay} title="Day view (s)">
+          <Icon name="calendar" size={14} /> Time spent per day
         </button>
       </div>
       {shown.length === 0 && (
@@ -382,6 +384,25 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
             Global shortcut: <kbd>{shortcut}</kbd> opens the command bar from anywhere. Closing the window keeps Dev
             Inbox running in the menu bar.
           </p>
+        </section>
+      )}
+
+      {settings && (
+        <section className="card">
+          <h2>Time tracking</h2>
+          <p className="muted">
+            The Day view estimates time from your commits, pushes, reviews and comments. It's more accurate if Dev
+            Inbox also notices when files change in your local clones (checked every 5 minutes). Only the repo, branch
+            and time are recorded, and nothing leaves this Mac.
+          </p>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={settings.trackLocal}
+              onChange={(e) => save({ ...settings, trackLocal: e.target.checked })}
+            />
+            Notice local editing activity
+          </label>
         </section>
       )}
 

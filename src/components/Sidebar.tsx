@@ -6,9 +6,10 @@ import { Icon, type IconName } from "./Icon";
 export const NAV: { id: View; label: string; icon: IconName; key: string }[] = [
   { id: "today", label: "Today", icon: "today", key: "1" },
   { id: "all", label: "Inbox", icon: "inbox", key: "2" },
-  { id: "history", label: "History", icon: "history", key: "3" },
-  { id: "following", label: "Following", icon: "eye", key: "4" },
-  { id: "settings", label: "Settings", icon: "settings", key: "5" },
+  { id: "day", label: "Day", icon: "calendar", key: "3" },
+  { id: "history", label: "History", icon: "history", key: "4" },
+  { id: "following", label: "Following", icon: "eye", key: "5" },
+  { id: "settings", label: "Settings", icon: "settings", key: "6" },
 ];
 
 export function Sidebar({

@@ -1,3 +1,4 @@
+mod day;
 mod db;
 mod demo;
 mod derive;
@@ -722,6 +723,13 @@ struct Settings {
     /// A once-a-day "here's what needs you" notification.
     digest: bool,
     digest_hour: u32,
+    /// Sample local clones for editing activity (feeds the Day view). Stays on this machine.
+    #[serde(default = "yes")]
+    track_local: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn ignored_users(state: &AppState) -> Vec<String> {
@@ -746,6 +754,7 @@ fn get_settings(state: State<AppState>) -> Settings {
         ignored_users: ignored_users(&state),
         digest: state.setting("digest").as_deref() != Some("0"),
         digest_hour: digest_hour(&state),
+        track_local: state.setting("track_local").as_deref() != Some("0"),
     }
 }
 
@@ -757,6 +766,7 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "notifications", if settings.notifications { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "digest", if settings.digest { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "digest_hour", &settings.digest_hour.min(23).to_string()).map_err(err)?;
+        db::set_setting(&conn, "track_local", if settings.track_local { "1" } else { "0" }).map_err(err)?;
         let ignored = settings.ignored_users.join(",");
         if db::get_setting(&conn, "ignored_users").map_err(err)?.unwrap_or_default() != ignored {
             db::set_setting(&conn, "ignored_users", &ignored).map_err(err)?;
@@ -787,6 +797,73 @@ fn maybe_digest(app: &AppHandle) {
         drop(conn);
         notify(app, sync::Notice { title: "☀️ Today in Dev Inbox".into(), body: summary, url: None, item_id: None });
     }
+}
+
+// ---------- Day view ----------
+
+/// Every few minutes, note which local clones changed (branch, dirty files, mtimes).
+/// Only the repo, branch and time are stored; nothing leaves the machine.
+fn start_local_tracker(app: AppHandle) {
+    const EVERY: Duration = Duration::from_secs(300);
+    std::thread::spawn(move || {
+        let mut last: std::collections::HashMap<String, u64> = Default::default();
+        loop {
+            let state = app.state::<AppState>();
+            if !state.demo && state.setting("track_local").as_deref() != Some("0") && state.setting("login").is_some() {
+                for (repo, path) in clones(&state) {
+                    let Some(s) = editor::sample(&path) else { continue };
+                    let changed = last.insert(repo.clone(), s.signature).is_some_and(|prev| prev != s.signature);
+                    if changed {
+                        let _ = db::record_sample(&state.db.lock().unwrap(), &now(), &repo, s.branch.as_deref());
+                    }
+                }
+            }
+            std::thread::sleep(EVERY);
+        }
+    });
+}
+
+/// A day's time report. `start`/`end` are the local day's bounds as ISO instants.
+#[tauri::command]
+async fn get_day(app: AppHandle, day: String, start: String, end: String) -> CmdResult<day::DayReport> {
+    let state = app.state::<AppState>();
+    let (Some(s), Some(e)) = (derive::parse_ts(&start), derive::parse_ts(&end)) else {
+        return Err("Bad day bounds".into());
+    };
+    let clones = clones(&state);
+    let (since, until) = (start.clone(), end.clone());
+    // Local git log runs outside the database lock.
+    let local = tauri::async_runtime::spawn_blocking(move || {
+        clones
+            .into_iter()
+            .flat_map(|(repo, path)| editor::local_commits(&path, &since, &until).into_iter().map(move |c| (repo.clone(), c)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(err)?;
+    let conn = state.db.lock().unwrap();
+    let mut events = day::gather(&conn, &start, &end).map_err(err)?;
+    events.extend(day::local_events(&conn, local).map_err(err)?);
+    let manual = day::manual_blocks(&conn, &day).map_err(err)?;
+    Ok(day::build(&day, events, manual, s, e))
+}
+
+/// Save corrected blocks for a day (freezes it).
+#[tauri::command]
+fn save_day(state: State<AppState>, day: String, blocks: Vec<day::Block>) -> CmdResult<()> {
+    for b in &blocks {
+        match (derive::parse_ts(&b.start), derive::parse_ts(&b.end)) {
+            (Some(s), Some(e)) if e > s => {}
+            _ => return Err(format!("“{}” ends before it starts", b.label)),
+        }
+    }
+    day::save_blocks(&state.db.lock().unwrap(), &day, &blocks).map_err(err)
+}
+
+/// Throw away corrections and go back to automatic for a day.
+#[tauri::command]
+fn reset_day(state: State<AppState>, day: String) -> CmdResult<()> {
+    day::unfreeze(&state.db.lock().unwrap(), &day).map_err(err)
 }
 
 // ---------- window / tray ----------
@@ -888,6 +965,7 @@ pub fn run() {
                 eprintln!("couldn't register global shortcut: {e}");
             }
             start_poller(app.handle().clone());
+            start_local_tracker(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -910,6 +988,9 @@ pub fn run() {
             get_following,
             set_followed,
             test_notification,
+            get_day,
+            save_day,
+            reset_day,
             submit_review,
             send_comment,
             merge_options,

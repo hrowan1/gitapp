@@ -8,7 +8,7 @@ import { Icon } from "./Icon";
 import { StateIcon } from "./StateIcon";
 import { SNOOZE_PRESETS, age } from "../lib/time";
 
-export type View = "today" | "all" | "history" | "following" | "settings";
+export type View = "today" | "all" | "day" | "history" | "following" | "settings";
 
 interface Command {
   id: string;
@@ -83,13 +83,11 @@ export function CommandPalette({
   onClose,
   onNavigate,
   onSync,
-  onStandup,
 }: {
   items: Item[];
   onClose: () => void;
   onNavigate: (v: View) => void;
   onSync: () => void;
-  onStandup: () => void;
 }) {
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
@@ -101,11 +99,11 @@ export function CommandPalette({
   const commands: Command[] = [
     { id: "today", label: "Go to Today", hint: "1", run: () => onNavigate("today") },
     { id: "all", label: "Go to All pull requests", hint: "2", run: () => onNavigate("all") },
-    { id: "history", label: "Go to History", hint: "3", run: () => onNavigate("history") },
-    { id: "following", label: "Choose what to follow", hint: "4", run: () => onNavigate("following") },
-    { id: "settings", label: "Go to Settings", hint: "5", run: () => onNavigate("settings") },
+    { id: "day", label: "Open Day view: what I worked on, and for how long", hint: "3", run: () => onNavigate("day") },
+    { id: "history", label: "Go to History", hint: "4", run: () => onNavigate("history") },
+    { id: "following", label: "Choose what to follow", hint: "5", run: () => onNavigate("following") },
+    { id: "settings", label: "Go to Settings", hint: "6", run: () => onNavigate("settings") },
     { id: "sync", label: "Sync with GitHub now", hint: "r", run: onSync },
-    { id: "standup", label: "Write my standup", hint: "s", run: onStandup },
   ];
 
   const action = useMemo(() => (focus ? null : parseAction(q)), [q, focus]);
@@ -134,7 +132,7 @@ export function CommandPalette({
       .map((command) => ({ kind: "command" as const, command }));
     if (parsed.view === "history") {
       return [
-        { kind: "command", command: { id: "standup", label: "Write my standup", hint: "s", run: onStandup } },
+        { kind: "command", command: { id: "day", label: "Open Day view", hint: "3", run: () => onNavigate("day") } },
         { kind: "command", command: { id: "h", label: "Show your history", run: () => onNavigate("history") } },
       ];
     }

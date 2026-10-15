@@ -84,7 +84,7 @@ export interface Inbox {
 
 export interface Activity {
   at: string;
-  kind: "reviewed" | "commented" | "opened" | "merged" | "closed" | "marked" | "update";
+  kind: "reviewed" | "commented" | "opened" | "merged" | "closed" | "marked" | "update" | "committed" | "pushed";
   prId?: string | null;
   repo?: string | null;
   number?: number | null;
@@ -107,6 +107,43 @@ export interface Settings {
   ignoredUsers: string[];
   digest: boolean;
   digestHour: number;
+  trackLocal: boolean;
+}
+
+export interface TimeBlock {
+  id?: number | null;
+  /** "T:IO-2641" (ticket), "PR:owner/repo#12", "B:repo:branch", "R:repo", or "M:…" (added by hand) */
+  key: string;
+  label: string;
+  start: string;
+  end: string;
+  minutes: number;
+  note?: string | null;
+}
+
+export interface DayEvent {
+  at: string;
+  kind: string;
+  text: string;
+  url?: string | null;
+  repo: string;
+  branch?: string | null;
+}
+
+export interface DayGroup {
+  key: string;
+  label: string;
+  url?: string | null;
+  minutes: number;
+  events: DayEvent[];
+}
+
+export interface DayReport {
+  day: string;
+  frozen: boolean;
+  totalMinutes: number;
+  blocks: TimeBlock[];
+  groups: DayGroup[];
 }
 
 export interface FollowItem {
@@ -151,6 +188,9 @@ export const api = {
   setRepoPath: (repo: string, path: string | null) => invoke<void>("set_repo_path", { repo, path }),
   openLocally: (itemId: string, checkout: boolean) => invoke<string>("open_locally", { itemId, checkout }),
   cloneAndOpen: (itemId: string, checkout: boolean) => invoke<string>("clone_and_open", { itemId, checkout }),
+  getDay: (day: string, start: string, end: string) => invoke<DayReport>("get_day", { day, start, end }),
+  saveDay: (day: string, blocks: TimeBlock[]) => invoke<void>("save_day", { day, blocks }),
+  resetDay: (day: string) => invoke<void>("reset_day", { day }),
   getFollowing: () => invoke<FollowItem[]>("get_following"),
   setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),

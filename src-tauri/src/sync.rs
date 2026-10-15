@@ -107,6 +107,24 @@ fn record_my_pr_actions(conn: &Connection, pr: &PullRequest, r: &PrRef, me: &str
             &ActivityRow { key: format!("opened:{}", pr.id), at: &pr.created_at, kind: "opened", pr: Some(r), detail: "Opened".into() },
         )?;
     }
+    // Your commits, with when you actually wrote them (authored date survives rebases).
+    let branch = pr.head_ref_name.as_deref().unwrap_or_default();
+    for c in pr.recent_commits.iter().map(|c| &c.commit) {
+        if !c.author.as_ref().and_then(|a| a.user.as_ref()).is_some_and(|u| u.login.eq_ignore_ascii_case(me)) {
+            continue;
+        }
+        db::record_activity_on_branch(
+            conn,
+            &ActivityRow {
+                key: format!("commit:{}", c.oid),
+                at: &c.authored_date,
+                kind: "committed",
+                pr: Some(r),
+                detail: c.message_headline.clone(),
+            },
+            branch,
+        )?;
+    }
     Ok(())
 }
 
@@ -279,6 +297,8 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
     // Phase 1: cheap search, then full details only for items that changed
     // (plus a periodic full refresh as a safety net).
     let hits = client.involved_hits().await?;
+    // Pushes age out of GitHub's event feed quickly, so capture them every sync. Not fatal if it fails.
+    let pushes = client.recent_pushes(me).await.unwrap_or_default();
     let (to_fetch, full, check_branches, first_branch_check, active) = {
         let conn = db_lock.lock().unwrap();
         let older_than = |key: &str, minutes: i64| -> Result<bool> {
@@ -393,6 +413,20 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
                 }
             }
             pass.first_sync = quiet;
+        }
+        for p in &pushes {
+            match db::pr_for_branch(&tx, &p.repo, &p.branch)? {
+                Some(r) => {
+                    db::record_activity_on_branch(
+                        &tx,
+                        &ActivityRow { key: format!("push:{}", p.id), at: &p.at, kind: "pushed", pr: Some(&r), detail: format!("Pushed to {}", p.branch) },
+                        &p.branch,
+                    )?;
+                }
+                None => {
+                    db::record_push(&tx, &p.id, &p.at, &p.repo, &p.branch, &format!("https://github.com/{}/tree/{}", p.repo, p.branch))?;
+                }
+            }
         }
         tx.commit()?;
         db::stale_open_ids(&conn, sync_id)?
@@ -541,6 +575,16 @@ mod live_tests {
             println!("  {:<15} {:<10} {} {}#{} {}", i.state, &i.since[..10], if i.is_mine {"mine"} else {&i.author}, i.repo, i.number, i.reason);
         }
         println!("activity rows={}", crate::db::list_activity(&conn, "2000-01-01T00:00:00Z").unwrap().len());
+        // The Day view for the most recent day with pushes or commits.
+        let day = std::env::var("DAY").unwrap_or_else(|_| "2026-10-14".into());
+        let (start, end) = (format!("{day}T00:00:00Z"), format!("{day}T23:59:59Z"));
+        let events = crate::day::gather(&conn, &start, &end).unwrap();
+        let r = crate::day::build(&day, events, None, crate::derive::parse_ts(&start).unwrap(), crate::derive::parse_ts(&end).unwrap());
+        println!("day {day}: total {}m in {} blocks", r.total_minutes, r.blocks.len());
+        for g in &r.groups {
+            println!("  {:>4}m  {}  ({} events: {})", g.minutes, g.label, g.events.len(),
+                g.events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>().join(","));
+        }
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
