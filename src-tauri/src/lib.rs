@@ -661,7 +661,10 @@ async fn rerun_checks(app: AppHandle, pr_id: String) -> CmdResult<String> {
     }
     let token = state.token().ok_or("Not signed in")?;
     let result = github::Client::new(&token).rerun_failed_checks(&pr_id).await.map_err(|e| format!("{e:#}"))?;
-    if let Some(pr) = db::PrRef::load(&state.db.lock().unwrap(), &pr_id).map_err(err)? {
+    // Load first so the lock is released before record_activity takes it again: a guard
+    // created in an `if let` condition lives for the whole block, and re-locking deadlocks.
+    let pr = db::PrRef::load(&state.db.lock().unwrap(), &pr_id).map_err(err)?;
+    if let Some(pr) = pr {
         let at = now();
         let _ = db::record_activity(
             &state.db.lock().unwrap(),
