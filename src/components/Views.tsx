@@ -11,6 +11,7 @@ import {
   type Settings,
   type StateId,
   type TicketAttention,
+  type SummaryStatus,
 } from "../lib/api";
 import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
@@ -270,6 +271,79 @@ export function History({ version, onOpenDay }: { version: number; onOpenDay: ()
   );
 }
 
+/** Who writes meeting notes, and the Anthropic key when that's Claude. */
+function SummarySettings({ settings, onSave }: { settings: Settings; onSave: (s: Settings) => void }) {
+  const [status, setStatus] = useState<SummaryStatus | null>(null);
+  const [key, setKey] = useState("");
+  const refresh = () => api.summaryStatus().then(setStatus).catch(() => {});
+  useEffect(() => {
+    refresh();
+  }, []);
+  const provider = settings.summaryProvider;
+  return (
+    <>
+      <label className="field">
+        <span>Summarise meetings</span>
+        <select value={provider} onChange={(e) => onSave({ ...settings, summaryProvider: e.target.value })}>
+          <option value="apple">On this Mac (Apple Intelligence)</option>
+          <option value="claude">With Claude (Anthropic)</option>
+          <option value="off">Off</option>
+        </select>
+      </label>
+      {provider === "apple" && (
+        <p className="muted small">
+          Notes are written on this Mac after each transcript; nothing leaves it.
+          {status && !status.appleReady && <span className="warn"> {status.appleReason}.</span>}
+        </p>
+      )}
+      {provider === "claude" && (
+        <>
+          <p className="muted small">
+            After each transcript, it's sent to Anthropic ({status?.claudeModel ?? "Claude"}) to write the notes, using your
+            own API key (billed to your Anthropic account).
+          </p>
+          {status?.claudeKey ? (
+            <p className="small">
+              <Icon name="checkCircle" size={13} /> API key saved in the keychain ·{" "}
+              <button className="link" onClick={() => api.clearAnthropicKey().then(refresh)}>
+                remove
+              </button>
+            </p>
+          ) : (
+            <div className="field">
+              <span>Anthropic API key</span>
+              <input
+                type="password"
+                className="grow"
+                placeholder="sk-ant-…"
+                autoComplete="off"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+              />
+              <button
+                className="primary"
+                disabled={!key.trim()}
+                onClick={async () => {
+                  try {
+                    await api.setAnthropicKey(key);
+                    setKey("");
+                    refresh();
+                    toast("API key saved");
+                  } catch (e) {
+                    toast(String(e), true);
+                  }
+                }}
+              >
+                Save
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
 export function SettingsView({ session, onSignedOut }: { session: Session; onSignedOut: () => void }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [repos, setRepos] = useState<RepoInfo[]>([]);
@@ -427,8 +501,8 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
         <section className="card">
           <h2>Meetings</h2>
           <p className="muted">
-            Recordings and transcripts stay on this Mac; transcription uses macOS's on-device speech recognition.
-            Transcripts are always kept.
+            Recordings stay on this Mac, and transcription uses macOS's on-device speech recognition. Transcripts are
+            always kept.
           </p>
           <label className="field">
             <span>Keep meeting audio</span>
@@ -447,6 +521,7 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
             The first recording asks for Microphone and Screen &amp; System Audio Recording permission (System Settings →
             Privacy &amp; Security).
           </p>
+          <SummarySettings settings={settings} onSave={save} />
         </section>
       )}
 
@@ -763,7 +838,8 @@ function JiraCard() {
     <section className="card">
       <h2>Jira</h2>
       <p className="muted">
-        Read-only. Shows tickets that are or were assigned to you, and how they moved, in Tickets and the Day view.
+        Read-only. Shows tickets that involve you (assigned, reported or worked on), and how they moved, in Today,
+        Tickets and the Day view.
         Nothing is written to Jira. The token is stored in your system keychain.
       </p>
       <form

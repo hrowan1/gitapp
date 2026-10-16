@@ -1,15 +1,18 @@
 // dev-inbox-recorder: records a meeting (microphone + system audio, as two files) and
-// transcribes audio on-device with Apple's SpeechTranscriber. Driven by the Dev Inbox app over
-// stdin/stdout; every line it prints is one JSON object.
+// transcribes audio on-device with Apple's SpeechTranscriber, and summarises transcripts with Apple
+// Intelligence's on-device model. Driven by the Dev Inbox app over stdin/stdout; every line it prints
+// is one JSON object.
 //
 //   dev-inbox-recorder record <dir>              -> <dir>/mic.m4a, <dir>/system.m4a; "stop" on stdin ends it
 //   dev-inbox-recorder transcribe <file> [locale] -> {"start","end","text"} lines, then {"event":"done"}
-//   dev-inbox-recorder check [locale]             -> {"speech":bool,"locale":...}
+//   dev-inbox-recorder summarise <transcript.txt> -> {"event":"summary","overview","decisions","actionItems"}
+//   dev-inbox-recorder check [locale]             -> {"speech":bool,"locale":...,"summary":bool,"summaryReason":...}
 
 import AVFAudio
 import AVFoundation
 import CoreAudio
 import Foundation
+import FoundationModels
 import Speech
 
 // MARK: - Output
@@ -298,7 +301,130 @@ func transcribe(path: String, localeID: String) async {
 @available(macOS 26, *)
 func checkSpeech(localeID: String) async {
     let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: localeID))
-    emit(["speech": SpeechTranscriber.isAvailable && locale != nil, "locale": locale?.identifier ?? NSNull()])
+    emit([
+        "speech": SpeechTranscriber.isAvailable && locale != nil,
+        "locale": locale?.identifier ?? NSNull(),
+        "summary": summaryUnavailableReason() == nil,
+        "summaryReason": summaryUnavailableReason() ?? NSNull(),
+    ])
+}
+
+// MARK: - Summaries (Apple Intelligence, on-device)
+
+@available(macOS 26, *)
+@Generable
+struct ActionItem {
+    @Guide(description: "Who agreed to do it: you (the person who recorded the meeting), others, or unclear", .anyOf(["you", "others", "unclear"]))
+    var owner: String
+    @Guide(description: "What will be done, as one short sentence")
+    var text: String
+}
+
+@available(macOS 26, *)
+@Generable
+struct MeetingNotes {
+    @Guide(description: "Two to four sentences on what the meeting was about and where it ended up")
+    var overview: String
+    @Guide(description: "Decisions that were made, each as one short sentence; empty if none")
+    var decisions: [String]
+    @Guide(description: "Things someone agreed to do; empty if none")
+    var actionItems: [ActionItem]
+}
+
+/// Why on-device summaries can't run on this Mac right now, in words; nil when they can.
+@available(macOS 26, *)
+func summaryUnavailableReason() -> String? {
+    switch SystemLanguageModel.default.availability {
+    case .available: return nil
+    case .unavailable(.deviceNotEligible): return "This Mac doesn't support Apple Intelligence"
+    case .unavailable(.appleIntelligenceNotEnabled): return "Turn on Apple Intelligence in System Settings to summarise on this Mac"
+    case .unavailable(.modelNotReady): return "Apple Intelligence is still downloading its model — try again later"
+    case .unavailable: return "Apple Intelligence isn't available right now"
+    }
+}
+
+let summaryInstructions = """
+    You write notes for a meeting from its transcript. Lines are labelled "You" (the person who recorded the \
+    meeting) or "Others" (everyone else on the call). Only use what is in the transcript; don't invent names, \
+    numbers or decisions. Transcripts come from speech recognition, so expect misheard words.
+    """
+
+/// Split lines into chunks of at most `limit` characters.
+func chunks(_ lines: [String], limit: Int) -> [String] {
+    var out: [String] = []
+    var current = ""
+    for line in lines {
+        if !current.isEmpty && current.count + line.count + 1 > limit {
+            out.append(current)
+            current = ""
+        }
+        current += (current.isEmpty ? "" : "\n") + line
+    }
+    if !current.isEmpty { out.append(current) }
+    return out
+}
+
+@available(macOS 26, *)
+func notesText(_ n: MeetingNotes) -> String {
+    var lines = ["Overview: \(n.overview)"]
+    lines += n.decisions.map { "Decision: \($0)" }
+    lines += n.actionItems.map { "Action (\($0.owner)): \($0.text)" }
+    return lines.joined(separator: "\n")
+}
+
+@available(macOS 26, *)
+func generate(_ prompt: String) async throws -> MeetingNotes {
+    // Summarising your own content: the permissive guardrails stop ordinary meeting talk being refused.
+    let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+    let session = LanguageModelSession(model: model, instructions: summaryInstructions)
+    return try await session.respond(to: prompt, generating: MeetingNotes.self).content
+}
+
+/// The on-device model has a small context, so long meetings are summarised in parts, then the parts' notes
+/// are combined (in rounds, if there are many).
+@available(macOS 26, *)
+func summarise(path: String) async {
+    if let reason = summaryUnavailableReason() { fail(reason) }
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { fail("Couldn't read the transcript") }
+    let lines = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    guard !lines.isEmpty else { fail("The transcript is empty") }
+    var limit = 6000
+    for attempt in 0..<3 {
+        do {
+            let parts = chunks(lines, limit: limit)
+            var notes: [MeetingNotes] = []
+            for (i, part) in parts.enumerated() {
+                let header = parts.count == 1 ? "Transcript:" : "Part \(i + 1) of \(parts.count) of the transcript:"
+                notes.append(try await generate("\(header)\n\n\(part)"))
+            }
+            while notes.count > 1 {
+                let groups = chunks(notes.map(notesText), limit: limit)
+                var merged: [MeetingNotes] = []
+                for group in groups {
+                    merged.append(try await generate(
+                        "These are notes on consecutive parts of one meeting. Combine them into notes for the whole meeting, keeping every decision and action item once:\n\n\(group)"))
+                }
+                if merged.count >= notes.count { break }
+                notes = merged
+            }
+            let n = notes[0]
+            emit([
+                "event": "summary",
+                "overview": n.overview,
+                "decisions": n.decisions,
+                "actionItems": n.actionItems.map { ["owner": $0.owner, "text": $0.text] },
+            ])
+            return
+        } catch {
+            let message = String(describing: error)
+            // Too long for the model's context: try again with smaller parts.
+            if attempt < 2 && message.localizedCaseInsensitiveContains("context") {
+                limit /= 2
+                continue
+            }
+            fail("Couldn't summarise on this Mac: \(error.localizedDescription)")
+        }
+    }
 }
 
 @main
@@ -315,6 +441,12 @@ struct Main {
                 await transcribe(path: args[2], localeID: args.count >= 4 ? args[3] : locale)
             } else {
                 fail("Transcription needs macOS 26 or later")
+            }
+        case "summarise" where args.count >= 3:
+            if #available(macOS 26, *) {
+                await summarise(path: args[2])
+            } else {
+                fail("Summarising on this Mac needs macOS 26 or later")
             }
         case "check":
             if #available(macOS 26, *) {

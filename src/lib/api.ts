@@ -110,6 +110,8 @@ export interface Settings {
   trackLocal: boolean;
   /** Days to keep meeting audio: 0 forever, -1 delete once transcribed. */
   audioRetentionDays: number;
+  /** Who writes meeting summaries: apple (on this Mac) | claude | off */
+  summaryProvider: string;
 }
 
 export interface RecordingStatus {
@@ -132,6 +134,28 @@ export interface Meeting {
   audioDir?: string | null;
   sources?: string | null;
   preview?: string | null;
+  /** AI notes, once made. */
+  summary?: MeetingSummary | null;
+  /** apple | claude */
+  summaryBy?: string | null;
+  /** summarising | done | failed */
+  summaryStatus?: string | null;
+  summaryError?: string | null;
+}
+
+export interface MeetingSummary {
+  overview: string;
+  decisions: string[];
+  actionItems: { owner: "you" | "others" | "unclear"; text: string }[];
+}
+
+export interface SummaryStatus {
+  /** apple | claude | off */
+  provider: string;
+  appleReady: boolean;
+  appleReason?: string | null;
+  claudeKey: boolean;
+  claudeModel: string;
 }
 
 export interface Segment {
@@ -325,6 +349,10 @@ export const api = {
   updateMeeting: (id: string, title: string, ticket: string | null) => invoke<void>("update_meeting", { id, title, ticket }),
   deleteMeeting: (id: string) => invoke<void>("delete_meeting", { id }),
   retranscribeMeeting: (id: string) => invoke<void>("retranscribe_meeting", { id }),
+  summariseMeeting: (id: string) => invoke<void>("summarise_meeting_now", { id }),
+  summaryStatus: () => invoke<SummaryStatus>("summary_status"),
+  setAnthropicKey: (key: string) => invoke<void>("set_anthropic_key", { key }),
+  clearAnthropicKey: () => invoke<void>("clear_anthropic_key"),
   getFollowing: () => invoke<FollowItem[]>("get_following"),
   setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),

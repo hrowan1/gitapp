@@ -2306,3 +2306,73 @@ a {
 .description-body a {
   color: var(--accent-text);
 }
+
+/* ---------- meeting notes ---------- */
+
+.notes {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.notes .transcript-head {
+  margin-bottom: 4px;
+}
+.notes-overview {
+  margin: 0 0 8px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.notes-label {
+  margin-top: 10px;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--muted);
+}
+.notes-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.notes-list.notes-actions {
+  list-style: none;
+  padding-left: 0;
+}
+.notes-list.notes-actions li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 2px 0;
+}
+.owner {
+  flex-shrink: 0;
+  min-width: 46px;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--muted);
+}
+.owner-you {
+  color: var(--accent);
+}
+.owner-others {
+  color: var(--blue);
+}
+.notes-by {
+  margin: 12px 0 0;
+}
+.notes-by .icon {
+  display: inline-block;
+  vertical-align: -1px;
+  margin-right: 3px;
+}
+.notes-empty {
+  margin-top: 14px;
+}
+.notes-empty .link,
+.notes-by .link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

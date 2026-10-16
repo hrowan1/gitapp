@@ -7,6 +7,7 @@ mod github;
 mod intent;
 mod jira;
 mod meetings;
+mod summary;
 mod sync;
 
 use rusqlite::Connection;
@@ -30,6 +31,8 @@ pub struct AppState {
     token: Mutex<Option<String>>,
     /// Jira API token, read from the keychain once per launch.
     jira_token: Mutex<Option<String>>,
+    /// Anthropic API key for Claude meeting summaries, read from the keychain when first needed.
+    anthropic_key: Mutex<Option<String>>,
     jira_lock: tokio::sync::Mutex<()>,
     /// The meeting being recorded, if any.
     recorder: Mutex<Option<meetings::Recording>>,
@@ -740,6 +743,13 @@ struct Settings {
     /// Days to keep meeting audio: 0 forever, -1 delete once transcribed.
     #[serde(default = "thirty")]
     audio_retention_days: i64,
+    /// Who writes meeting summaries: apple (on this Mac) | claude | off.
+    #[serde(default = "apple")]
+    summary_provider: String,
+}
+
+fn apple() -> String {
+    "apple".into()
 }
 
 fn thirty() -> i64 {
@@ -774,6 +784,7 @@ fn get_settings(state: State<AppState>) -> Settings {
         digest_hour: digest_hour(&state),
         track_local: state.setting("track_local").as_deref() != Some("0"),
         audio_retention_days: audio_retention_days(&state),
+        summary_provider: summary_provider(&state).id().into(),
     }
 }
 
@@ -787,6 +798,8 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "digest_hour", &settings.digest_hour.min(23).to_string()).map_err(err)?;
         db::set_setting(&conn, "track_local", if settings.track_local { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "audio_retention_days", &settings.audio_retention_days.to_string()).map_err(err)?;
+        let provider = summary::Provider::from_setting(Some(&settings.summary_provider));
+        db::set_setting(&conn, "summary_provider", provider.id()).map_err(err)?;
         let ignored = settings.ignored_users.join(",");
         if db::get_setting(&conn, "ignored_users").map_err(err)?.unwrap_or_default() != ignored {
             db::set_setting(&conn, "ignored_users", &ignored).map_err(err)?;
@@ -1154,6 +1167,7 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
         // re-entrant, so calling it while holding `conn` deadlocks (and freezes the UI on its next query).
         let delete_audio = audio_retention_days(&state) < 0;
         let conn = state.db.lock().unwrap();
+        let transcribed = result.is_ok();
         match result {
             Ok(segments) => {
                 let _ = meetings::save_transcript(&conn, &id, &segments);
@@ -1168,7 +1182,134 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
         }
         drop(conn);
         let _ = app.emit("meetings-updated", ());
+        if transcribed {
+            summarise_meeting(app, id);
+        }
     });
+}
+
+const ANTHROPIC_KEYRING_USER: &str = "anthropic-api-key";
+
+fn summary_provider(state: &AppState) -> summary::Provider {
+    summary::Provider::from_setting(state.setting("summary_provider").as_deref())
+}
+
+fn anthropic_key(state: &AppState) -> Option<String> {
+    let mut cached = state.anthropic_key.lock().unwrap();
+    if cached.is_none() {
+        *cached = keyring::Entry::new(KEYRING_SERVICE, ANTHROPIC_KEYRING_USER).ok().and_then(|e| e.get_password().ok());
+    }
+    cached.clone()
+}
+
+/// Write AI notes for a meeting with whichever summariser Settings chose (none if off).
+fn summarise_meeting(app: AppHandle, id: String) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let provider = summary_provider(&state);
+        // Settings first: setting() locks the database itself.
+        let key = (provider == summary::Provider::Claude).then(|| anthropic_key(&state)).flatten();
+        let found = meetings::get(&state.db.lock().unwrap(), &id).ok().flatten();
+        let Some((meeting, segments)) = found else { return };
+        if provider == summary::Provider::Off || segments.is_empty() {
+            return;
+        }
+        let _ = summary::set_status(&state.db.lock().unwrap(), &id, Some("summarising"), None);
+        let _ = app.emit("meetings-updated", ());
+        let transcript = summary::transcript_text(&segments);
+        let result = match provider {
+            summary::Provider::Claude => match key {
+                Some(key) => summary::with_claude(&key, &meeting.title, &transcript).await,
+                None => Err(anyhow::anyhow!("Add your Anthropic API key in Settings → Meetings to summarise with Claude")),
+            },
+            _ => {
+                let (id, transcript) = (id.clone(), transcript.clone());
+                tauri::async_runtime::spawn_blocking(move || summary::on_device(&id, &transcript))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+            }
+        };
+        {
+            let conn = state.db.lock().unwrap();
+            let _ = match &result {
+                Ok(s) => summary::save(&conn, &id, s, provider),
+                Err(e) => summary::set_status(&conn, &id, Some("failed"), Some(&format!("{e:#}"))),
+            };
+        }
+        let _ = app.emit("meetings-updated", ());
+    });
+}
+
+/// Make (or remake) a meeting's summary now.
+#[tauri::command]
+fn summarise_meeting_now(app: AppHandle, id: String) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    if state.demo {
+        return Err("Summaries aren't made in demo mode".into());
+    }
+    if summary_provider(&state) == summary::Provider::Off {
+        return Err("Meeting summaries are off (Settings → Meetings)".into());
+    }
+    summarise_meeting(app.clone(), id);
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryStatus {
+    provider: String,
+    /// Apple Intelligence can summarise on this Mac now.
+    apple_ready: bool,
+    /// Why not, in words.
+    apple_reason: Option<String>,
+    /// An Anthropic API key is saved.
+    claude_key: bool,
+    claude_model: &'static str,
+}
+
+/// What Settings shows about summaries. Asks the helper whether Apple Intelligence is ready.
+#[tauri::command]
+async fn summary_status(app: AppHandle) -> SummaryStatus {
+    let check = tauri::async_runtime::spawn_blocking(|| {
+        let out = std::process::Command::new(meetings::helper_path().ok()?).arg("check").output().ok()?;
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let state = app.state::<AppState>();
+    SummaryStatus {
+        provider: summary_provider(&state).id().into(),
+        apple_ready: check["summary"].as_bool().unwrap_or(false),
+        apple_reason: check["summaryReason"].as_str().map(String::from).or_else(|| {
+            (!check["summary"].as_bool().unwrap_or(false)).then(|| "On-device summaries need macOS 26 and Apple Intelligence".into())
+        }),
+        claude_key: anthropic_key(&state).is_some(),
+        claude_model: summary::CLAUDE_MODEL,
+    }
+}
+
+/// Save the Anthropic API key (keychain) for Claude summaries. The user types it; it's never shown again.
+#[tauri::command]
+fn set_anthropic_key(state: State<AppState>, key: String) -> CmdResult<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("Paste an API key".into());
+    }
+    keyring::Entry::new(KEYRING_SERVICE, ANTHROPIC_KEYRING_USER)
+        .and_then(|e| e.set_password(key))
+        .map_err(|e| format!("Couldn't save the key to the keychain: {e}"))?;
+    *state.anthropic_key.lock().unwrap() = Some(key.to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_anthropic_key(state: State<AppState>) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, ANTHROPIC_KEYRING_USER) {
+        let _ = entry.delete_credential();
+    }
+    *state.anthropic_key.lock().unwrap() = None;
 }
 
 fn set_recording_tray(app: &AppHandle, on: bool) {
@@ -1451,6 +1592,7 @@ pub fn run() {
                 db: Mutex::new(conn),
                 token: Mutex::new(None),
                 jira_token: Mutex::new(None),
+                anthropic_key: Mutex::new(None),
                 jira_lock: tokio::sync::Mutex::new(()),
                 recorder: Mutex::new(None),
                 sync_lock: tokio::sync::Mutex::new(()),
@@ -1523,6 +1665,10 @@ pub fn run() {
             get_tickets,
             get_ticket,
             get_ticket_attention,
+            summarise_meeting_now,
+            summary_status,
+            set_anthropic_key,
+            clear_anthropic_key,
             mark_ticket_seen,
             recording_status,
             start_recording,

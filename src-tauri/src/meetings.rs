@@ -198,6 +198,13 @@ pub struct Meeting {
     pub sources: Option<String>,
     /// First words of the transcript, for the list.
     pub preview: Option<String>,
+    /// AI notes, once made.
+    pub summary: Option<crate::summary::Summary>,
+    /// apple | claude
+    pub summary_by: Option<String>,
+    /// summarising | done | failed; None when no summary was asked for.
+    pub summary_status: Option<String>,
+    pub summary_error: Option<String>,
 }
 
 fn row_to_meeting(r: &rusqlite::Row) -> rusqlite::Result<Meeting> {
@@ -215,11 +222,16 @@ fn row_to_meeting(r: &rusqlite::Row) -> rusqlite::Result<Meeting> {
         audio_dir: r.get(9)?,
         sources: r.get(10)?,
         preview: r.get(11)?,
+        summary: r.get::<_, Option<String>>(12)?.and_then(|s| serde_json::from_str(&s).ok()),
+        summary_by: r.get(13)?,
+        summary_status: r.get(14)?,
+        summary_error: r.get(15)?,
     })
 }
 
 const MEETING_COLUMNS: &str = "m.id, m.title, m.started_at, m.ended_at, m.seconds, m.status, m.error, m.ticket, m.audio_deleted, m.audio_dir, m.sources,
-    (SELECT group_concat(text, ' ') FROM (SELECT text FROM meeting_segments s WHERE s.meeting_id = m.id ORDER BY start LIMIT 3))";
+    (SELECT group_concat(text, ' ') FROM (SELECT text FROM meeting_segments s WHERE s.meeting_id = m.id ORDER BY start LIMIT 3)),
+    m.summary, m.summary_by, m.summary_status, m.summary_error";
 
 pub fn list(conn: &Connection) -> Result<Vec<Meeting>> {
     let mut stmt = conn.prepare(&format!("SELECT {MEETING_COLUMNS} FROM meetings m ORDER BY m.started_at DESC"))?;

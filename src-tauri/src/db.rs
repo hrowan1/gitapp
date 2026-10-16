@@ -213,6 +213,20 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 8 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- AI meeting notes: JSON {overview, decisions, actionItems}, who made them, and progress.
+            ALTER TABLE meetings ADD COLUMN summary TEXT;
+            ALTER TABLE meetings ADD COLUMN summary_by TEXT;       -- apple | claude
+            ALTER TABLE meetings ADD COLUMN summary_status TEXT;   -- summarising | done | failed
+            ALTER TABLE meetings ADD COLUMN summary_error TEXT;
+            PRAGMA user_version = 8;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 

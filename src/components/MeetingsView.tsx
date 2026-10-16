@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Meeting, type RecordingStatus, type Segment } from "../lib/api";
+import { api, type Meeting, type MeetingSummary, type RecordingStatus, type Segment } from "../lib/api";
 import { dayKey } from "../lib/day";
 import { clock, friendlyDate } from "../lib/time";
 import { toast } from "../lib/toast";
@@ -111,7 +111,7 @@ export function MeetingsView({
         <div className="pane-header">
           <div className="headline compact">
             <h1>Meetings</h1>
-            <p className="muted">Recorded and transcribed on this Mac. Nothing is uploaded.</p>
+            <p className="muted">Recorded and transcribed on this Mac, with AI notes (Settings → Meetings).</p>
           </div>
 
           <div className={`recorder${recording.recording ? " live" : ""}`}>
@@ -196,7 +196,7 @@ export function MeetingsView({
                         ? "Transcribing…"
                         : m.status === "failed"
                           ? m.error ?? "Failed"
-                          : m.preview ?? "No speech found"}
+                          : (m.summary?.overview ?? m.preview ?? "No speech found")}
                   </span>
                 </div>
               </div>
@@ -219,6 +219,96 @@ export function MeetingsView({
         </aside>
       )}
     </div>
+  );
+}
+
+const OWNER: Record<string, string> = { you: "You", others: "Others", unclear: "—" };
+
+function notesText(s: MeetingSummary): string {
+  const parts = [s.overview];
+  if (s.decisions.length) parts.push(`Decisions\n${s.decisions.map((d) => `• ${d}`).join("\n")}`);
+  if (s.actionItems.length) parts.push(`Action items\n${s.actionItems.map((a) => `• ${OWNER[a.owner] ?? a.owner}: ${a.text}`).join("\n")}`);
+  return parts.join("\n\n");
+}
+
+/** AI notes for a meeting: overview, decisions, action items — or where they're up to. */
+function MeetingNotes({ meeting, hasTranscript }: { meeting: Meeting; hasTranscript: boolean }) {
+  const summarise = () => api.summariseMeeting(meeting.id).catch((e) => toast(String(e), true));
+  const who = meeting.summaryBy === "claude" ? "Claude" : "Apple Intelligence on this Mac";
+  if (meeting.summaryStatus === "summarising") {
+    return (
+      <div className="callout">
+        <Icon name="loader" size={14} className="spin" />
+        <span>Writing notes…</span>
+      </div>
+    );
+  }
+  if (meeting.summaryStatus === "failed") {
+    return (
+      <div className="callout error-callout">
+        <Icon name="alert" size={14} />
+        <span className="grow">{meeting.summaryError ?? "Couldn't write notes"}</span>
+        <button className="link" onClick={summarise}>
+          Try again
+        </button>
+      </div>
+    );
+  }
+  const s = meeting.summary;
+  if (!s) {
+    if (meeting.status !== "done" || !hasTranscript) return null;
+    return (
+      <div className="notes-empty">
+        <button className="link small" onClick={summarise}>
+          <Icon name="sparkle" size={13} /> Write notes for this meeting
+        </button>
+      </div>
+    );
+  }
+  return (
+    <section className="notes">
+      <div className="transcript-head">
+        <div className="group-label">Notes</div>
+        <span className="grow" />
+        <button
+          className="ghost icon-only"
+          title="Copy notes"
+          onClick={() => navigator.clipboard.writeText(`${meeting.title}\n\n${notesText(s)}\n`).then(() => toast("Notes copied"))}
+        >
+          <Icon name="copy" size={14} />
+        </button>
+      </div>
+      <p className="notes-overview">{s.overview}</p>
+      {s.decisions.length > 0 && (
+        <>
+          <div className="notes-label">Decisions</div>
+          <ul className="notes-list">
+            {s.decisions.map((d, i) => (
+              <li key={i}>{d}</li>
+            ))}
+          </ul>
+        </>
+      )}
+      {s.actionItems.length > 0 && (
+        <>
+          <div className="notes-label">Action items</div>
+          <ul className="notes-list notes-actions">
+            {s.actionItems.map((a, i) => (
+              <li key={i}>
+                <span className={`owner owner-${a.owner}`}>{OWNER[a.owner] ?? a.owner}</span>
+                <span>{a.text}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <p className="muted small notes-by">
+        <Icon name="sparkle" size={12} /> Written by {who}. AI notes can be wrong — check the transcript.{" "}
+        <button className="link small" onClick={summarise}>
+          Rewrite
+        </button>
+      </p>
+    </section>
   );
 }
 
@@ -287,7 +377,8 @@ function MeetingDetail({
   const copyTranscript = async () => {
     if (!segments) return;
     const text = segments.map((s) => `[${mmss(s.start)}] ${s.speaker === "you" ? "You" : "Others"}: ${s.text}`).join("\n");
-    await navigator.clipboard.writeText(`${meeting.title}\n\n${text}\n`).catch(() => {});
+    const notes = meeting.summary ? `${notesText(meeting.summary)}\n\nTranscript\n\n` : "";
+    await navigator.clipboard.writeText(`${meeting.title}\n\n${notes}${text}\n`).catch(() => {});
     toast("Transcript copied");
   };
 
@@ -370,6 +461,8 @@ function MeetingDetail({
         {!meeting.hasAudio && meeting.status === "done" && (
           <p className="muted small">The audio has been deleted (Settings → Meetings); the transcript is kept.</p>
         )}
+
+        <MeetingNotes meeting={meeting} hasTranscript={!!segments?.length} />
 
         <div className="timeline">
           <div className="transcript-head">

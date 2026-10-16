@@ -373,6 +373,18 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
             .collect();
         crate::meetings::save_transcript(conn, id, &segments)?;
     }
+    // One meeting already summarised, so the demo shows notes.
+    let notes = crate::summary::Summary {
+        overview: "Agreed how proration works for BILL-142: plan changes are prorated on the day they happen, not at \
+                   the end of the cycle. Downgrades are the tricky case because of credits."
+            .into(),
+        decisions: vec!["Prorate on the day the plan changes".into(), "Downgrades get a credit note on the next invoice".into()],
+        action_items: vec![
+            crate::summary::ActionItem { owner: "you".into(), text: "Add credit notes for downgrades to BILL-142".into() },
+            crate::summary::ActionItem { owner: "others".into(), text: "Check the rounding on annual plans".into() },
+        ],
+    };
+    crate::summary::save(conn, "demo-proration", &notes, crate::summary::Provider::Claude)?;
 
     db::set_setting(conn, "jira_account", "demo-me")?;
     db::set_setting(conn, "jira_site", site)?;

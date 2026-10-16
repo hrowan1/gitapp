@@ -362,7 +362,7 @@ function DayMeetings({ meetings, onOpen }: { meetings: Meeting[]; onOpen: (id: s
               {m.endedAt ? `${hhmm(m.startedAt)}–${hhmm(m.endedAt)}` : `${hhmm(m.startedAt)} · recording`}
               {m.status === "transcribing" && " · transcribing…"}
               {m.status === "failed" && " · transcription failed"}
-              {m.status === "done" && (m.preview ? ` · ${m.preview}` : " · no speech found")}
+              {m.status === "done" && ((m.summary?.overview ?? m.preview) ? ` · ${m.summary?.overview ?? m.preview}` : " · no speech found")}
             </div>
           </div>
           <Icon name="chevronRight" size={13} />
