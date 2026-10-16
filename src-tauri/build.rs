@@ -11,9 +11,10 @@ fn build_recorder() {
     // Lets the app find the helper in development, before Tauri bundles it next to the binary.
     println!("cargo:rustc-env=RECORDER_TRIPLE={target}");
     let out = format!("binaries/dev-inbox-recorder-{target}");
+    // Gitignored, so a fresh checkout doesn't have it.
+    std::fs::create_dir_all("binaries").ok();
     if !target.contains("apple-darwin") {
         // Other platforms: no recorder yet. Tauri still expects the sidecar file to exist.
-        std::fs::create_dir_all("binaries").ok();
         if !std::path::Path::new(&out).exists() {
             std::fs::write(&out, "").ok();
         }
