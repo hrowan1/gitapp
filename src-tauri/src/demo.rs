@@ -272,6 +272,40 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
         db::record_activity(conn, &db::ActivityRow { key: "comment:demo-y".into(), at: &at("16:12"), kind: "commented", pr: Some(&r), detail: "Commented".into() })?;
     }
     db::record_push(conn, "demo-main", &at("16:41"), "acme/infrastructure", "main", "https://github.com/acme/infrastructure")?;
+
+    // Jira: the two coded tickets, one moved with no code (QA), one handed to someone else.
+    let site = "https://acme.atlassian.net";
+    for (key, summary, status, cat, mine) in [
+        ("BILL-142", "Prorate plan changes mid-cycle", "In Review", "indeterminate", true),
+        ("MOB-77", "Offline mode for the order list", "In Progress", "indeterminate", true),
+        ("ES-310", "QA: checkout on Safari 17", "Done", "done", true),
+        ("ES-298", "Spike: payments provider fees", "In Progress", "indeterminate", false),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO jira_issues (key, id, summary, status, category, issue_type, priority, project, assignee, assigned_to_me, url, updated)
+             VALUES (?1, ?1, ?2, ?3, ?4, 'Story', 'Medium', ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![key, summary, status, cat, key.split('-').next().unwrap(), if mine { "You" } else { "Sam" }, mine, format!("{site}/browse/{key}"), at("16:30")],
+        )?;
+    }
+    for (id, key, t, kind, detail, me) in [
+        ("j1", "BILL-142", "08:50", "status", "To Do → In Progress", true),
+        ("j2", "BILL-142", "11:10", "status", "In Progress → In Review", true),
+        ("j3", "MOB-77", "13:20", "assignee", "Assigned to You", false),
+        ("j4", "MOB-77", "13:26", "status", "To Do → In Progress", true),
+        ("j5", "ES-310", "16:18", "status", "In QA → Done", true),
+        ("j6", "ES-310", "16:24", "comment", "Commented: Verified on Safari 17.4 and 17.6, no regressions", true),
+        ("j7", "ES-298", "17:05", "assignee", "Assigned to Sam", true),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO jira_events (id, issue_key, at, kind, from_value, to_value, actor, actor_is_me, detail)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
+            rusqlite::params![id, key, at(t), kind, if kind == "assignee" && !me { Some("demo-me") } else { None }, if me { "You" } else { "Sam" }, me, detail],
+        )?;
+    }
+    db::set_setting(conn, "jira_account", "demo-me")?;
+    db::set_setting(conn, "jira_site", site)?;
+    db::set_setting(conn, "jira_name", "You")?;
+    db::set_setting(conn, "jira_last_sync", &fmt_ts(Utc::now()))?;
     Ok(())
 }
 
@@ -288,11 +322,22 @@ mod tests {
         let start = Local.from_local_datetime(&y.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().with_timezone(&chrono::Utc);
         let end = start + chrono::Duration::days(1);
         let (s, e) = (crate::derive::fmt_ts(start), crate::derive::fmt_ts(end));
-        let events = crate::day::gather(&conn, &s, &e).unwrap();
-        let r = crate::day::build(&y.to_string(), events, None, start, end);
+        let titles = crate::jira::titles(&conn).unwrap();
+        let mut events = crate::day::gather(&conn, &s, &e).unwrap();
+        events.extend(crate::day::jira_events(&conn, &s, &e, &titles).unwrap());
+        let r = crate::day::build(&y.to_string(), events, None, start, end, &titles);
         if std::env::var("DAY_JSON").is_ok() {
             println!("DAYJSON {}", serde_json::to_string(&r).unwrap());
+            println!("TICKETSJSON {}", serde_json::to_string(&crate::jira::list_tickets(&conn).unwrap()).unwrap());
+            let detail: std::collections::HashMap<String, Vec<crate::jira::TicketEvent>> = ["BILL-142", "MOB-77", "ES-310", "ES-298"]
+                .iter()
+                .map(|k| (k.to_string(), crate::jira::ticket_events(&conn, k, "demo-me").unwrap()))
+                .collect();
+            println!("TICKETEVENTSJSON {}", serde_json::to_string(&detail).unwrap());
         }
+        let es = r.groups.iter().find(|g| g.key == "T:ES-310").expect("a Jira-only ticket appears on the day");
+        assert_eq!(es.status.as_deref(), Some("Done"));
+        assert!(es.minutes > 0, "your own Jira moves count a little");
         let keys: Vec<&str> = r.groups.iter().map(|g| g.key.as_str()).collect();
         assert!(keys.contains(&"T:BILL-142"), "{keys:?}");
         assert!(keys.contains(&"T:MOB-77"), "{keys:?}");

@@ -168,6 +168,12 @@ const PATHS = {
       <circle cx="19" cy="12" r="1" fill="currentColor" />
     </>
   ),
+  ticket: (
+    <>
+      <path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z" />
+      <path d="M13 5v2M13 11v2M13 17v2" />
+    </>
+  ),
   sparkle: <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />,
   layers: (
     <>

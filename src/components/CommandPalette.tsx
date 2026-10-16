@@ -8,7 +8,7 @@ import { Icon } from "./Icon";
 import { StateIcon } from "./StateIcon";
 import { SNOOZE_PRESETS, age } from "../lib/time";
 
-export type View = "today" | "all" | "day" | "history" | "following" | "settings";
+export type View = "today" | "all" | "day" | "tickets" | "history" | "following" | "settings";
 
 interface Command {
   id: string;
@@ -100,9 +100,10 @@ export function CommandPalette({
     { id: "today", label: "Go to Today", hint: "1", run: () => onNavigate("today") },
     { id: "all", label: "Go to All pull requests", hint: "2", run: () => onNavigate("all") },
     { id: "day", label: "Open Day view: what I worked on, and for how long", hint: "3", run: () => onNavigate("day") },
-    { id: "history", label: "Go to History", hint: "4", run: () => onNavigate("history") },
-    { id: "following", label: "Choose what to follow", hint: "5", run: () => onNavigate("following") },
-    { id: "settings", label: "Go to Settings", hint: "6", run: () => onNavigate("settings") },
+    { id: "tickets", label: "Go to Tickets: my Jira tickets and how they moved", hint: "4", run: () => onNavigate("tickets") },
+    { id: "history", label: "Go to History", hint: "5", run: () => onNavigate("history") },
+    { id: "following", label: "Choose what to follow", hint: "6", run: () => onNavigate("following") },
+    { id: "settings", label: "Go to Settings", hint: "7", run: () => onNavigate("settings") },
     { id: "sync", label: "Sync with GitHub now", hint: "r", run: onSync },
   ];
 

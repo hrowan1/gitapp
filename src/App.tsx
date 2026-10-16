@@ -13,6 +13,7 @@ import { onToast, type Toast } from "./lib/toast";
 import { onDialog, type DialogRequest } from "./lib/dialog";
 import { ActionDialog } from "./components/ActionDialog";
 import { DayView } from "./components/DayView";
+import { TicketsView } from "./components/TicketsView";
 import "./styles.css";
 
 export default function App() {
@@ -26,6 +27,8 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
   const [shortcuts, setShortcuts] = useState(false);
+  /** A date to show in the Day view (e.g. from a ticket's history). */
+  const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
   const overlay = palette || !!dialog || shortcuts;
 
   useEffect(() => onDialog(setDialog), []);
@@ -63,6 +66,7 @@ export default function App() {
       listen("inbox-updated", reload),
       listen("sync-started", () => setSyncing(true)),
       listen("open-palette", () => setPalette(true)),
+      listen("jira-updated", () => setVersion((v) => v + 1)),
     ];
     const tick = setInterval(() => setNow(Date.now()), 30_000);
     return () => {
@@ -126,7 +130,7 @@ export default function App() {
             </button>
           </div>
         )}
-        {firstLoad && view !== "settings" && view !== "following" && view !== "day" ? (
+        {firstLoad && !["settings", "following", "day", "tickets"].includes(view) ? (
           <div className="empty big">
             <Icon name="refresh" size={22} className="spin" />
             <p>Fetching your pull requests and issues from GitHub…</p>
@@ -136,7 +140,18 @@ export default function App() {
           <>
             {view === "today" && <Today items={items} now={now} active={!overlay} />}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
-            {view === "day" && <DayView version={version} />}
+            {view === "day" && <DayView version={version} target={dayTarget} />}
+            {view === "tickets" && (
+              <TicketsView
+                version={version}
+                now={now}
+                onOpenDay={(day) => {
+                  setDayTarget({ day });
+                  setView("day");
+                }}
+                onSettings={() => setView("settings")}
+              />
+            )}
             {view === "history" && <History version={version} onOpenDay={() => setView("day")} />}
             {view === "following" && <Following version={version} />}
           </>

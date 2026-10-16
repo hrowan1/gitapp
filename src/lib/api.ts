@@ -134,6 +134,8 @@ export interface DayGroup {
   key: string;
   label: string;
   url?: string | null;
+  /** Jira status, for known tickets. */
+  status?: string | null;
   minutes: number;
   events: DayEvent[];
 }
@@ -157,6 +159,50 @@ export interface FollowItem {
   state: StateId;
   updatedAt: string;
   followed: boolean;
+}
+
+export interface JiraStatus {
+  connected: boolean;
+  site?: string | null;
+  email?: string | null;
+  name?: string | null;
+  lastSync?: string | null;
+  error?: string | null;
+  tickets: number;
+}
+
+export interface Ticket {
+  key: string;
+  summary: string;
+  status: string;
+  /** new | indeterminate | done */
+  category: string;
+  issueType: string;
+  priority?: string | null;
+  project: string;
+  assignee?: string | null;
+  assignedToMe: boolean;
+  url: string;
+  updated?: string | null;
+  resolved?: string | null;
+  lastMove?: string | null;
+  lastMoveAt?: string | null;
+}
+
+export interface TicketEvent {
+  at: string;
+  /** status | assignee | resolution | comment | created */
+  kind: string;
+  detail: string;
+  actor?: string | null;
+  actorIsMe: boolean;
+  toMe: boolean;
+  fromMe: boolean;
+}
+
+export interface TicketDetail {
+  events: TicketEvent[];
+  prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
 }
 
 export interface Session {
@@ -191,6 +237,13 @@ export const api = {
   getDay: (day: string, start: string, end: string) => invoke<DayReport>("get_day", { day, start, end }),
   saveDay: (day: string, blocks: TimeBlock[]) => invoke<void>("save_day", { day, blocks }),
   resetDay: (day: string) => invoke<void>("reset_day", { day }),
+  jiraStatus: () => invoke<JiraStatus>("jira_status"),
+  jiraConnect: (site: string, email: string, token: string) =>
+    invoke<JiraStatus>("jira_connect", { site, email, token }),
+  jiraDisconnect: () => invoke<void>("jira_disconnect"),
+  jiraSyncNow: () => invoke<void>("jira_sync_now"),
+  getTickets: () => invoke<Ticket[]>("get_tickets"),
+  getTicket: (key: string) => invoke<TicketDetail>("get_ticket", { key }),
   getFollowing: () => invoke<FollowItem[]>("get_following"),
   setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),

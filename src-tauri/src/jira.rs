@@ -1,0 +1,538 @@
+//! Jira Cloud, read-only: tickets that are (or were) assigned to the user, and how they moved —
+//! status changes, assignment changes, resolutions and the user's comments. Feeds the Tickets
+//! page and the Day view. Authenticates with the user's email + API token (token in the keychain).
+
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use crate::derive::{fmt_ts, Ts};
+
+/// How far back the first sync looks.
+pub const FIRST_SYNC_DAYS: i64 = 30;
+
+pub struct Client {
+    http: reqwest::Client,
+    base: String,
+    email: String,
+    token: String,
+}
+
+/// "fullfatthings.atlassian.net", "https://x.atlassian.net/jira/software/…" → "https://x.atlassian.net"
+pub fn normalise_site(site: &str) -> Result<String> {
+    let s = site.trim().trim_start_matches("https://").trim_start_matches("http://");
+    let host = s.split('/').next().unwrap_or_default().to_ascii_lowercase();
+    if host.is_empty() || !host.contains('.') {
+        bail!("Enter your Jira site, e.g. yourcompany.atlassian.net");
+    }
+    Ok(format!("https://{host}"))
+}
+
+/// Jira timestamps look like "2026-10-14T10:12:33.123+0100".
+pub fn parse_jira_ts(s: &str) -> Option<Ts> {
+    DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z")
+        .or_else(|_| DateTime::parse_from_rfc3339(s))
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// Plain text from an Atlassian Document Format body.
+pub fn adf_text(v: &Value) -> String {
+    fn walk(v: &Value, out: &mut String) {
+        if let Some(t) = v.get("text").and_then(Value::as_str) {
+            out.push_str(t);
+        }
+        if let Some(children) = v.get("content").and_then(Value::as_array) {
+            for c in children {
+                walk(c, out);
+            }
+            if matches!(v.get("type").and_then(Value::as_str), Some("paragraph" | "heading" | "listItem")) {
+                out.push(' ');
+            }
+        }
+    }
+    let mut out = String::new();
+    match v {
+        Value::String(s) => out.push_str(s),
+        _ => walk(v, &mut out),
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Debug, Clone)]
+pub struct Me {
+    pub account_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Issue {
+    pub id: String,
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    /// new | indeterminate | done
+    pub category: String,
+    pub issue_type: String,
+    pub priority: Option<String>,
+    pub project: String,
+    pub assignee: Option<(String, String)>,
+    pub reporter: Option<String>,
+    pub created: Option<Ts>,
+    pub updated: Option<Ts>,
+    pub resolved: Option<Ts>,
+    /// (comment id, author account id, author name, created, text)
+    pub comments: Vec<(String, String, String, Ts, String)>,
+}
+
+/// One movement on a ticket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    pub id: String,
+    pub issue_key: String,
+    pub at: Ts,
+    /// status | assignee | resolution | comment | created
+    pub kind: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub actor_id: Option<String>,
+    pub actor: Option<String>,
+    pub detail: String,
+}
+
+impl Client {
+    pub fn new(site: &str, email: &str, token: &str) -> Result<Self> {
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .user_agent("dev-inbox")
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?,
+            base: normalise_site(site)?,
+            email: email.trim().to_string(),
+            token: token.trim().to_string(),
+        })
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+        let res = req
+            .basic_auth(&self.email, Some(&self.token))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Couldn't reach Jira")?;
+        let status = res.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            bail!("Jira rejected the email or API token ({status})");
+        }
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            let msg = body["errorMessages"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            bail!("Jira returned {status} {msg}");
+        }
+        Ok(body)
+    }
+
+    pub async fn myself(&self) -> Result<Me> {
+        let v = self.send(self.http.get(format!("{}/rest/api/3/myself", self.base))).await?;
+        Ok(Me {
+            account_id: v["accountId"].as_str().ok_or_else(|| anyhow!("Jira didn't return an account"))?.to_string(),
+            name: v["displayName"].as_str().unwrap_or("you").to_string(),
+        })
+    }
+
+    /// Tickets assigned to the user now or at any point, updated since `since`.
+    pub async fn assigned_issues(&self, since: Ts) -> Result<Vec<Issue>> {
+        let jql = format!(
+            "assignee WAS currentUser() AND updated >= \"{}\" ORDER BY updated DESC",
+            since.format("%Y-%m-%d %H:%M")
+        );
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..20 {
+            let body = json!({
+                "jql": jql,
+                "fields": ["summary", "status", "issuetype", "priority", "project", "assignee", "reporter",
+                           "created", "updated", "resolutiondate", "comment"],
+                "maxResults": 100,
+                "nextPageToken": token,
+            });
+            let v = self.send(self.http.post(format!("{}/rest/api/3/search/jql", self.base)).json(&body)).await?;
+            for i in v["issues"].as_array().into_iter().flatten() {
+                out.push(parse_issue(i));
+            }
+            if v["isLast"].as_bool() != Some(false) {
+                break;
+            }
+            token = v["nextPageToken"].as_str().map(String::from);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Status / assignee / resolution history for the given tickets.
+    pub async fn changelogs(&self, issues: &[Issue]) -> Result<Vec<Change>> {
+        let key_of: std::collections::HashMap<&str, &str> = issues.iter().map(|i| (i.id.as_str(), i.key.as_str())).collect();
+        let mut out = Vec::new();
+        for chunk in issues.chunks(1000) {
+            let ids: Vec<&str> = chunk.iter().map(|i| i.id.as_str()).collect();
+            let mut token: Option<String> = None;
+            for _ in 0..50 {
+                let body = json!({
+                    "issueIdsOrKeys": ids,
+                    "fieldIds": ["status", "assignee", "resolution"],
+                    "maxResults": 1000,
+                    "nextPageToken": token,
+                });
+                let v = self
+                    .send(self.http.post(format!("{}/rest/api/3/changelog/bulkfetch", self.base)).json(&body))
+                    .await?;
+                for log in v["issueChangeLogs"].as_array().into_iter().flatten() {
+                    let Some(key) = log["issueId"].as_str().and_then(|id| key_of.get(id)) else { continue };
+                    for h in log["changeHistories"].as_array().into_iter().flatten() {
+                        out.extend(parse_history(key, h));
+                    }
+                }
+                token = v["nextPageToken"].as_str().map(String::from);
+                if token.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn browse_url(&self, key: &str) -> String {
+        format!("{}/browse/{key}", self.base)
+    }
+}
+
+fn parse_issue(i: &Value) -> Issue {
+    let f = &i["fields"];
+    let s = |v: &Value| v.as_str().map(String::from);
+    let comments = f["comment"]["comments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            Some((
+                c["id"].as_str()?.to_string(),
+                c["author"]["accountId"].as_str().unwrap_or_default().to_string(),
+                c["author"]["displayName"].as_str().unwrap_or_default().to_string(),
+                parse_jira_ts(c["created"].as_str()?)?,
+                adf_text(&c["body"]),
+            ))
+        })
+        .collect();
+    Issue {
+        id: i["id"].as_str().unwrap_or_default().to_string(),
+        key: i["key"].as_str().unwrap_or_default().to_string(),
+        summary: s(&f["summary"]).unwrap_or_default(),
+        status: s(&f["status"]["name"]).unwrap_or_default(),
+        category: s(&f["status"]["statusCategory"]["key"]).unwrap_or_else(|| "new".into()),
+        issue_type: s(&f["issuetype"]["name"]).unwrap_or_default(),
+        priority: s(&f["priority"]["name"]),
+        project: s(&f["project"]["key"]).unwrap_or_default(),
+        assignee: f["assignee"]["accountId"]
+            .as_str()
+            .map(|id| (id.to_string(), f["assignee"]["displayName"].as_str().unwrap_or_default().to_string())),
+        reporter: s(&f["reporter"]["accountId"]),
+        created: f["created"].as_str().and_then(parse_jira_ts),
+        updated: f["updated"].as_str().and_then(parse_jira_ts),
+        resolved: f["resolutiondate"].as_str().and_then(parse_jira_ts),
+        comments,
+    }
+}
+
+fn parse_history(key: &str, h: &Value) -> Vec<Change> {
+    let Some(at) = h["created"].as_str().and_then(parse_jira_ts) else { return Vec::new() };
+    let actor_id = h["author"]["accountId"].as_str().map(String::from);
+    let actor = h["author"]["displayName"].as_str().map(String::from);
+    let hid = h["id"].as_str().unwrap_or_default();
+    h["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(n, item)| {
+            let kind = match item["fieldId"].as_str().or(item["field"].as_str())? {
+                "status" => "status",
+                "assignee" => "assignee",
+                "resolution" => "resolution",
+                _ => return None,
+            };
+            let from = item["fromString"].as_str().map(String::from);
+            let to = item["toString"].as_str().map(String::from);
+            let detail = match kind {
+                "status" => format!("{} → {}", from.as_deref().unwrap_or("?"), to.as_deref().unwrap_or("?")),
+                "assignee" => match &to {
+                    Some(t) => format!("Assigned to {t}"),
+                    None => "Unassigned".into(),
+                },
+                _ => match &to {
+                    Some(t) => format!("Resolved as {t}"),
+                    None => "Reopened".into(),
+                },
+            };
+            Some(Change {
+                id: format!("{hid}:{n}"),
+                issue_key: key.to_string(),
+                at,
+                kind: kind.into(),
+                // Assignee changes keep account ids so "assigned to you" can be recognised.
+                from: if kind == "assignee" { item["from"].as_str().map(String::from).or(from) } else { from },
+                to: if kind == "assignee" { item["to"].as_str().map(String::from).or(to) } else { to },
+                actor_id: actor_id.clone(),
+                actor: actor.clone(),
+                detail,
+            })
+        })
+        .collect()
+}
+
+/// Comments by the user, and ticket creation, as changes too.
+pub fn issue_changes(i: &Issue, me: &str) -> Vec<Change> {
+    let mut out = Vec::new();
+    if let (Some(created), Some(reporter)) = (i.created, &i.reporter) {
+        out.push(Change {
+            id: format!("created:{}", i.key),
+            issue_key: i.key.clone(),
+            at: created,
+            kind: "created".into(),
+            from: None,
+            to: None,
+            actor_id: Some(reporter.clone()),
+            actor: None,
+            detail: "Created".into(),
+        });
+    }
+    for (id, author_id, author, at, text) in &i.comments {
+        if author_id != me {
+            continue;
+        }
+        let snippet: String = text.chars().take(140).collect();
+        out.push(Change {
+            id: format!("comment:{id}"),
+            issue_key: i.key.clone(),
+            at: *at,
+            kind: "comment".into(),
+            from: None,
+            to: None,
+            actor_id: Some(author_id.clone()),
+            actor: Some(author.clone()),
+            detail: if snippet.is_empty() { "Commented".into() } else { format!("Commented: {snippet}") },
+        });
+    }
+    out
+}
+
+// ---------- storage ----------
+
+pub fn store(conn: &Connection, client: &Client, me: &str, issues: &[Issue], changes: &[Change]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for i in issues {
+        tx.execute(
+            "INSERT INTO jira_issues (key, id, summary, status, category, issue_type, priority, project, assignee,
+                                      assigned_to_me, url, created, updated, resolved)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(key) DO UPDATE SET summary = excluded.summary, status = excluded.status,
+                category = excluded.category, issue_type = excluded.issue_type, priority = excluded.priority,
+                assignee = excluded.assignee, assigned_to_me = excluded.assigned_to_me, updated = excluded.updated,
+                resolved = excluded.resolved",
+            params![
+                i.key,
+                i.id,
+                i.summary,
+                i.status,
+                i.category,
+                i.issue_type,
+                i.priority,
+                i.project,
+                i.assignee.as_ref().map(|a| a.1.clone()),
+                i.assignee.as_ref().is_some_and(|a| a.0 == me),
+                client.browse_url(&i.key),
+                i.created.map(fmt_ts),
+                i.updated.map(fmt_ts),
+                i.resolved.map(fmt_ts),
+            ],
+        )?;
+    }
+    for c in changes {
+        tx.execute(
+            "INSERT OR IGNORE INTO jira_events (id, issue_key, at, kind, from_value, to_value, actor, actor_is_me, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                c.id,
+                c.issue_key,
+                fmt_ts(c.at),
+                c.kind,
+                c.from,
+                c.to,
+                c.actor,
+                c.actor_id.as_deref() == Some(me),
+                c.detail,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ticket {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    pub category: String,
+    pub issue_type: String,
+    pub priority: Option<String>,
+    pub project: String,
+    pub assignee: Option<String>,
+    pub assigned_to_me: bool,
+    pub url: String,
+    pub updated: Option<String>,
+    pub resolved: Option<String>,
+    /// The latest movement, for the list ("You moved it to In Review").
+    pub last_move: Option<String>,
+    pub last_move_at: Option<String>,
+}
+
+pub fn list_tickets(conn: &Connection) -> Result<Vec<Ticket>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.key, t.summary, t.status, t.category, t.issue_type, t.priority, t.project, t.assignee,
+                t.assigned_to_me, t.url, t.updated, t.resolved,
+                (SELECT detail FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1),
+                (SELECT at FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1)
+         FROM jira_issues t ORDER BY COALESCE(t.updated, '') DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Ticket {
+                key: r.get(0)?,
+                summary: r.get(1)?,
+                status: r.get(2)?,
+                category: r.get(3)?,
+                issue_type: r.get(4)?,
+                priority: r.get(5)?,
+                project: r.get(6)?,
+                assignee: r.get(7)?,
+                assigned_to_me: r.get(8)?,
+                url: r.get(9)?,
+                updated: r.get(10)?,
+                resolved: r.get(11)?,
+                last_move: r.get(12)?,
+                last_move_at: r.get(13)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketEvent {
+    pub at: String,
+    pub kind: String,
+    pub detail: String,
+    pub actor: Option<String>,
+    pub actor_is_me: bool,
+    /// For assignee changes: this assigned the ticket to / away from the user.
+    pub to_me: bool,
+    pub from_me: bool,
+}
+
+pub fn ticket_events(conn: &Connection, key: &str, me: &str) -> Result<Vec<TicketEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT at, kind, detail, actor, actor_is_me, from_value, to_value FROM jira_events WHERE issue_key = ?1 ORDER BY at DESC",
+    )?;
+    let rows = stmt
+        .query_map([key], |r| {
+            let kind: String = r.get(1)?;
+            let from: Option<String> = r.get(5)?;
+            let to: Option<String> = r.get(6)?;
+            let assignee = kind == "assignee";
+            Ok(TicketEvent {
+                at: r.get(0)?,
+                detail: r.get(2)?,
+                actor: r.get(3)?,
+                actor_is_me: r.get(4)?,
+                to_me: assignee && to.as_deref() == Some(me),
+                from_me: assignee && from.as_deref() == Some(me),
+                kind,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// (summary, url, status) by ticket key, for labelling the Day view.
+pub fn titles(conn: &Connection) -> Result<std::collections::HashMap<String, (String, String, String)>> {
+    let mut stmt = conn.prepare("SELECT key, summary, url, status FROM jira_issues")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Jira movements in [start, end) for the Day view: (key, at, detail, by_me).
+pub fn events_between(conn: &Connection, start: &str, end: &str) -> Result<Vec<(String, String, String, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT issue_key, at, detail, actor_is_me FROM jira_events WHERE at >= ?1 AND at < ?2 AND kind != 'created' ORDER BY at",
+    )?;
+    let rows = stmt
+        .query_map(params![start, end], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn forget(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM jira_issues; DELETE FROM jira_events;
+         DELETE FROM settings WHERE key IN ('jira_site', 'jira_email', 'jira_account', 'jira_name', 'jira_last_sync', 'jira_error');",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sites_and_dates() {
+        assert_eq!(normalise_site("fullfatthings.atlassian.net").unwrap(), "https://fullfatthings.atlassian.net");
+        assert_eq!(
+            normalise_site("https://fullfatthings.atlassian.net/jira/software/c/projects/ES/boards/153").unwrap(),
+            "https://fullfatthings.atlassian.net"
+        );
+        assert!(normalise_site("nope").is_err());
+        let t = parse_jira_ts("2026-10-14T10:12:33.123+0100").unwrap();
+        assert_eq!(fmt_ts(t), "2026-10-14T09:12:33Z");
+    }
+
+    #[test]
+    fn parses_history_and_comments() {
+        let h = json!({"id": "1001", "created": "2026-10-14T10:12:33.123+0100",
+            "author": {"accountId": "me", "displayName": "Harry"},
+            "items": [
+                {"field": "status", "fieldId": "status", "fromString": "In Progress", "toString": "In Review"},
+                {"field": "assignee", "fieldId": "assignee", "from": "other", "fromString": "Sam", "to": "me", "toString": "Harry"},
+                {"field": "labels", "fieldId": "labels", "fromString": "", "toString": "x"}
+            ]});
+        let c = parse_history("ES-12", &h);
+        assert_eq!(c.len(), 2, "unrelated fields are ignored");
+        assert_eq!(c[0].detail, "In Progress → In Review");
+        assert_eq!(c[1].to.as_deref(), Some("me"));
+        assert_eq!(c[1].detail, "Assigned to Harry");
+
+        let body = json!({"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Looks"}, {"type": "text", "text": " good"}]}]});
+        assert_eq!(adf_text(&body), "Looks good");
+    }
+}

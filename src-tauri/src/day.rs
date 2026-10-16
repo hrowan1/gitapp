@@ -30,6 +30,7 @@ fn lead_minutes(kind: &str) -> i64 {
         "commented" => 5,
         "edit" => 5, // local samples arrive every 5 minutes
         "merged" => 3,
+        "jira" => 5,
         _ => 5,
     }
 }
@@ -47,6 +48,10 @@ pub struct WorkEvent {
     pub url: Option<String>,
     /// Dedupe key (e.g. commit sha) so a commit seen locally and on GitHub counts once.
     pub dedupe: Option<String>,
+    /// An explicit ticket (Jira events), instead of finding one in the branch or title.
+    pub ticket: Option<String>,
+    /// Whether it implies time spent. Others moving your ticket is shown but adds no time.
+    pub counts: bool,
 }
 
 static BRANCH_TICKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:^|[/_\-.])([a-z]{2,}[a-z0-9]*-\d{1,6})(?:$|[/_\-.])").unwrap());
@@ -78,6 +83,9 @@ fn short_repo(repo: &str) -> &str {
 
 /// What an event counts towards: (key, label, url). Ticket > PR > branch > repo.
 pub fn work_key(e: &WorkEvent) -> (String, String, Option<String>) {
+    if let Some(t) = &e.ticket {
+        return (format!("T:{t}"), t.clone(), e.url.clone());
+    }
     let title = e.pr.as_ref().map(|p| p.1.as_str());
     let ticket = e
         .branch
@@ -133,6 +141,8 @@ pub struct Group {
     pub key: String,
     pub label: String,
     pub url: Option<String>,
+    /// Jira status, when the group is a known ticket.
+    pub status: Option<String>,
     pub minutes: i64,
     pub events: Vec<EventOut>,
 }
@@ -168,8 +178,18 @@ fn union_minutes(mut spans: Vec<(Ts, Ts)>) -> i64 {
     total.num_minutes()
 }
 
+/// Ticket key → (Jira summary, url, status), to label ticket groups with their real titles.
+pub type Titles = HashMap<String, (String, String, String)>;
+
 /// Group events into sessions per key. `manual` (a frozen day) replaces the generated blocks.
-pub fn build(day: &str, mut events: Vec<WorkEvent>, manual: Option<Vec<Block>>, day_start: Ts, day_end: Ts) -> DayReport {
+pub fn build(
+    day: &str,
+    mut events: Vec<WorkEvent>,
+    manual: Option<Vec<Block>>,
+    day_start: Ts,
+    day_end: Ts,
+    titles: &Titles,
+) -> DayReport {
     // A commit seen both locally and on GitHub counts once.
     let mut seen = std::collections::HashSet::new();
     events.retain(|e| e.dedupe.as_ref().map_or(true, |d| seen.insert(d.clone())));
@@ -185,6 +205,13 @@ pub fn build(day: &str, mut events: Vec<WorkEvent>, manual: Option<Vec<Block>>, 
             entry.1 = url;
         }
         entry.2.push(e);
+    }
+    // Known Jira tickets get their real title and link.
+    for (key, entry) in by_key.iter_mut() {
+        if let Some((summary, url, _)) = key.strip_prefix("T:").and_then(|t| titles.get(t)) {
+            entry.0 = format!("{} · {summary}", &key[2..]);
+            entry.1 = Some(url.clone());
+        }
     }
 
     let mut blocks: Vec<Block> = Vec::new();
@@ -206,7 +233,7 @@ pub fn build(day: &str, mut events: Vec<WorkEvent>, manual: Option<Vec<Block>>, 
                 note: None,
             });
         };
-        for e in evs {
+        for e in evs.iter().filter(|e| e.counts) {
             let s = e.at - Duration::minutes(lead_minutes(&e.kind));
             let end = e.at + Duration::minutes(TAIL_MIN);
             cur = match cur {
@@ -240,6 +267,7 @@ pub fn build(day: &str, mut events: Vec<WorkEvent>, manual: Option<Vec<Block>>, 
             key: key.clone(),
             label: label.clone(),
             url: url.clone(),
+            status: key.strip_prefix("T:").and_then(|t| titles.get(t)).map(|t| t.2.clone()),
             minutes: minutes_by_key.get(key.as_str()).map_or(0, |s| union_minutes(s.clone())),
             events: evs
                 .iter()
@@ -261,6 +289,7 @@ pub fn build(day: &str, mut events: Vec<WorkEvent>, manual: Option<Vec<Block>>, 
                 key: b.key.clone(),
                 label: b.label.clone(),
                 url: None,
+                status: None,
                 minutes: minutes_by_key.get(b.key.as_str()).map_or(0, |s| union_minutes(s.clone())),
                 events: Vec::new(),
             });
@@ -346,6 +375,8 @@ pub fn gather(conn: &Connection, start: &str, end: &str) -> Result<Vec<WorkEvent
             text,
             url,
             dedupe: key.strip_prefix("commit:").map(String::from),
+            ticket: None,
+            counts: true,
         });
     }
 
@@ -366,6 +397,8 @@ pub fn gather(conn: &Connection, start: &str, end: &str) -> Result<Vec<WorkEvent
             pr: pr.map(|p| (p.0.clone(), p.1.clone(), p.2.clone())),
             url: None,
             dedupe: None,
+            ticket: None,
+            counts: true,
         });
     }
     Ok(out)
@@ -389,9 +422,32 @@ pub fn local_events(conn: &Connection, commits: Vec<(String, crate::editor::Loca
             text: c.message,
             url: Some(format!("https://github.com/{repo}/commit/{}", c.oid)),
             dedupe: Some(c.oid),
+            ticket: None,
+            counts: true,
         });
     }
     Ok(out)
+}
+
+/// Jira movements as day events: yours count as a little time, others' are context only.
+pub fn jira_events(conn: &Connection, start: &str, end: &str, titles: &Titles) -> Result<Vec<WorkEvent>> {
+    Ok(crate::jira::events_between(conn, start, end)?
+        .into_iter()
+        .filter_map(|(key, at, detail, by_me)| {
+            Some(WorkEvent {
+                at: parse_ts(&at)?,
+                kind: "jira".into(),
+                repo: String::new(),
+                branch: None,
+                pr: None,
+                text: if by_me { detail } else { format!("{detail} (by someone else)") },
+                url: titles.get(&key).map(|t| t.1.clone()),
+                dedupe: None,
+                ticket: Some(key),
+                counts: by_me,
+            })
+        })
+        .collect())
 }
 
 pub fn manual_blocks(conn: &Connection, day: &str) -> Result<Option<Vec<Block>>> {
@@ -454,6 +510,8 @@ mod tests {
             text: text.into(),
             url: None,
             dedupe: None,
+            ticket: None,
+            counts: true,
         }
     }
 
@@ -477,7 +535,7 @@ mod tests {
             ev("13:00", "committed", Some("io-2641-search"), "Fix tests"),  // new session
             ev("10:30", "reviewed", None, "Approved the PR"),
         ];
-        let r = build("2026-10-14", events, None, t("00:00"), t("23:59"));
+        let r = build("2026-10-14", events, None, t("00:00"), t("23:59"), &Titles::new());
         let io: Vec<&Block> = r.blocks.iter().filter(|b| b.key == "T:IO-2641").collect();
         assert_eq!(io.len(), 2, "{:?}", r.blocks);
         assert_eq!(io[0].start, "2026-10-14T08:55:00Z");
@@ -495,10 +553,30 @@ mod tests {
         let mut b = ev("09:30", "local_commit", Some("abc-1-x"), "one");
         b.dedupe = Some("sha1".into());
         let c = ev("09:20", "reviewed", None, "Approved");
-        let r = build("d", vec![a, b, c], None, t("00:00"), t("23:59"));
+        let r = build("d", vec![a, b, c], None, t("00:00"), t("23:59"), &Titles::new());
         assert_eq!(r.groups.iter().map(|g| g.events.len()).sum::<usize>(), 2, "duplicate commit dropped");
         // 09:05–09:35 (commit) and 09:05–09:25 (review) overlap: 30 minutes total.
         assert_eq!(r.total_minutes, 30);
+    }
+
+    #[test]
+    fn jira_events_join_tickets() {
+        let mut moved = ev("11:00", "jira", None, "In Progress → In Review");
+        moved.ticket = Some("ABC-1".into());
+        let mut others = ev("15:00", "jira", None, "In Review → Done (by someone else)");
+        others.ticket = Some("ABC-1".into());
+        others.counts = false;
+        let commit = ev("10:50", "committed", Some("abc-1-thing"), "Fix it");
+        let mut titles = Titles::new();
+        titles.insert("ABC-1".into(), ("Make it work".into(), "https://x.atlassian.net/browse/ABC-1".into(), "Done".into()));
+        let r = build("d", vec![moved, others, commit], None, t("00:00"), t("23:59"), &titles);
+        assert_eq!(r.groups.len(), 1, "commit and Jira moves are the same ticket");
+        let g = &r.groups[0];
+        assert_eq!(g.label, "ABC-1 · Make it work");
+        assert_eq!(g.status.as_deref(), Some("Done"));
+        assert_eq!(g.events.len(), 3);
+        // 10:25–11:05 from the commit + your 11:00 move; the 15:00 move by someone else adds nothing.
+        assert_eq!(r.total_minutes, 40);
     }
 
     #[test]
@@ -539,7 +617,7 @@ mod tests {
             minutes: 120,
             note: None,
         }];
-        let r = build("d", vec![ev("15:00", "committed", Some("abc-1-x"), "late")], Some(manual), t("00:00"), t("23:59"));
+        let r = build("d", vec![ev("15:00", "committed", Some("abc-1-x"), "late")], Some(manual), t("00:00"), t("23:59"), &Titles::new());
         assert!(r.frozen);
         assert_eq!(r.total_minutes, 120);
         assert_eq!(r.blocks.len(), 1);

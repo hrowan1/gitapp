@@ -7,6 +7,7 @@ import {
   type Item,
   type RepoInfo,
   type Session,
+  type JiraStatus,
   type Settings,
   type StateId,
 } from "../lib/api";
@@ -406,6 +407,8 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
         </section>
       )}
 
+      <JiraCard />
+
       {settings && <IgnoredUsers settings={settings} onSave={save} />}
 
       <CodeAndEditor repos={repos.filter((r) => !r.hidden && r.openPrs > 0).map((r) => r.repo)} />
@@ -642,6 +645,124 @@ function CodeAndEditor({ repos }: { repos: string[] }) {
           })}
         </div>
       )}
+    </section>
+  );
+}
+
+/** Connect Jira (read-only): site, Atlassian email and an API token the user creates. */
+function JiraCard() {
+  const [status, setStatus] = useState<JiraStatus | null>(null);
+  const [site, setSite] = useState("");
+  const [email, setEmail] = useState("");
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api.jiraStatus().then((s) => {
+      setStatus(s);
+      setSite(s.site?.replace("https://", "") ?? "");
+      setEmail(s.email ?? "");
+    });
+  }, []);
+  if (!status) return null;
+
+  if (status.connected) {
+    return (
+      <section className="card">
+        <h2>Jira</h2>
+        <div className="account">
+          <span className="state-icon tone-blue">
+            <Icon name="ticket" size={14} />
+          </span>
+          <div>
+            <div className="strong">
+              {status.name} · {status.site?.replace("https://", "")}
+            </div>
+            <div className="muted small">
+              {status.tickets} tickets · {status.lastSync ? `synced ${friendlyDate(status.lastSync)} ${clock(status.lastSync)}` : "first sync running…"}
+              {status.error && <span className="error"> · {status.error}</span>}
+            </div>
+          </div>
+        </div>
+        <div className="actions">
+          <button
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await api.jiraSyncNow();
+                setStatus(await api.jiraStatus());
+                toast("Jira synced");
+              } catch (e) {
+                toast(String(e), true);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Syncing…" : "Sync now"}
+          </button>
+          <button
+            className="danger-outline"
+            onClick={async () => {
+              await api.jiraDisconnect();
+              setStatus(await api.jiraStatus());
+              setToken("");
+            }}
+          >
+            Disconnect and forget Jira data
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="card">
+      <h2>Jira</h2>
+      <p className="muted">
+        Read-only. Shows tickets that are or were assigned to you, and how they moved, in Tickets and the Day view.
+        Nothing is written to Jira. The token is stored in your system keychain.
+      </p>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          try {
+            setStatus(await api.jiraConnect(site, email, token));
+            setToken("");
+            toast("Jira connected — fetching the last 30 days");
+          } catch (err) {
+            toast(String(err), true);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <label className="field">
+          <span>Jira site</span>
+          <input className="grow" placeholder="yourcompany.atlassian.net" value={site} onChange={(e) => setSite(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Atlassian email</span>
+          <input className="grow" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>API token</span>
+          <input className="grow" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+        </label>
+        <div className="actions">
+          <button className="primary" disabled={busy || !site || !email || !token}>
+            {busy ? "Connecting…" : "Connect"}
+          </button>
+          <button
+            type="button"
+            className="link small"
+            onClick={() => openUrl("https://id.atlassian.com/manage-profile/security/api-tokens")}
+          >
+            Create an API token
+          </button>
+        </div>
+      </form>
     </section>
   );
 }

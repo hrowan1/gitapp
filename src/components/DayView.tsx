@@ -30,12 +30,17 @@ const EVENT_ICON: Record<string, IconName> = {
   opened: "pr",
   merged: "merge",
   edit: "pencil",
+  jira: "ticket",
 };
 
 /** What you worked on, for how long, on any day; editable, and shaped for Jira worklogs. */
-export function DayView({ version }: { version: number }) {
+export function DayView({ version, target }: { version: number; target?: { day: string } | null }) {
   const today = dayKey(new Date());
-  const [day, setDay] = useState(today);
+  const [day, setDay] = useState(target?.day ?? today);
+  // Jump to a requested date (e.g. clicked in a ticket's history).
+  useEffect(() => {
+    if (target) setDay(target.day);
+  }, [target]);
   const [reports, setReports] = useState<Record<string, DayReport>>({});
   const [editing, setEditing] = useState<{ block: TimeBlock; index: number | null } | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -212,6 +217,7 @@ export function DayView({ version }: { version: number }) {
                         <div className="dg-title">
                           {ticket && <span className="ticket">{ticket}</span>}
                           <span className="ellipsis">{ticket ? g.label.replace(`${ticket} · `, "") : g.label}</span>
+                          {g.status && <span className="dg-status">{g.status}</span>}
                         </div>
                         <div className="muted small">
                           {blocks.map((b) => `${hhmm(b.start)}–${hhmm(b.end)}`).join(", ") || "No time recorded"}

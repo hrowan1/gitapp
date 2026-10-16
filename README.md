@@ -50,14 +50,15 @@ Build a release `.app`/`.dmg`: `npm run tauri build`.
   - **Approve / request changes / comment**, and **merge** using a method your repo allows.
   - **Open in editor**: finds your clones by scanning your home folder (or folders you choose) for GitHub remotes and opens the repo in your editor (VS Code, Cursor, Zed, JetBrains, Xcode… whatever's installed). **Check out & open** switches to the PR branch first, **only if the working tree is clean**. Not cloned? It offers to clone it (via `gh`) into `~/code`.
   - Re-run failed GitHub Actions workflows; copy `gh pr checkout`.
-- **Day view** (`3` or `s`): pick any date to see what you worked on and for how long — a timeline of blocks grouped by **ticket** (Jira keys from branch names, PR titles or commit messages; otherwise PR, branch or repo), a week strip with daily totals, and per-ticket breakdowns. Time is estimated from your PR commits (authored time), pushes (captured every sync), reviews, comments, local `git log`, and — optionally — local editing activity sampled every 5 minutes from your clones (repo, branch and time only; never leaves your Mac). Edit, add or delete blocks (a day you edit stops auto-updating; reset any time), and copy a readable summary. Blocks are shaped like Jira worklogs, ready for a Jira integration.
+- **Tickets** (`4`, Jira Cloud, read-only): every ticket that is or was assigned to you (last 30 days on first connect), its current status, how it moved (status, assignment, resolution, your comments — who and when), and the PRs that mention its key. Click a movement to open that day. Connect in Settings with your site, Atlassian email and an API token (stored in the keychain). Nothing is written to Jira.
+- **Day view** (`3` or `s`): pick any date to see what you worked on and for how long — a timeline of blocks grouped by **ticket** (Jira keys from branch names, PR titles or commit messages; otherwise PR, branch or repo), a week strip with daily totals, and per-ticket breakdowns. Time is estimated from your PR commits (authored time), pushes (captured every sync), reviews, comments, your own Jira moves and comments (tickets moved by others are shown but add no time), local `git log`, and — optionally — local editing activity sampled every 5 minutes from your clones (repo, branch and time only; never leaves your Mac). Edit, add or delete blocks (a day you edit stops auto-updating; reset any time), and copy a readable summary. Blocks are shaped like Jira worklogs, ready for a Jira integration.
 - **Menu bar / tray** with a monochrome icon and needs-you count; closing the window keeps it running. Global shortcut **⌥⌘K** (Ctrl+Alt+K elsewhere).
 - **Desktop notifications** when something new needs you (bursts are collapsed); on macOS, clicking one opens the PR/issue. Optional **morning summary** on weekdays.
 - **Filters** (All tab) by repo/org, author, state, CI, mine/others; hide repos in Settings.
 
 Mouse: click a row for its actions menu (open, reply, approve, merge, editor, come back later, mark as…) · double-click opens it on GitHub · right-click also opens the menu.
 
-Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `R` reply · `a` approve · `m` merge · `c` check out & open in editor · `s` Day view · `r` sync · `1`–`6` switch views · `?` all shortcuts · `⌘K` or `/` command bar.
+Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `R` reply · `a` approve · `m` merge · `c` check out & open in editor · `s` Day view · `r` sync · `1`–`7` switch views · `?` all shortcuts · `⌘K` or `/` command bar.
 
 ## How syncing works
 
@@ -78,6 +79,7 @@ src-tauri/src/
   intent.rs   references, time phrases, "come back to this" in comments (unit tested)
   editor.rs   finding local clones, safe branch checkout, launching the editor, local activity (unit tested)
   day.rs      Day view: events → ticket-grouped time blocks, corrections (unit tested)
+  jira.rs     Jira Cloud (read-only): assigned-ever tickets, bulk changelogs, storage (unit tested)
   sync.rs     sync pass, memory updates, notifications
   db.rs       SQLite schema & queries
   demo.rs     fictional seed data for DEV_INBOX_DEMO=1

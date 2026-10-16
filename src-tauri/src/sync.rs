@@ -579,7 +579,7 @@ mod live_tests {
         let day = std::env::var("DAY").unwrap_or_else(|_| "2026-10-14".into());
         let (start, end) = (format!("{day}T00:00:00Z"), format!("{day}T23:59:59Z"));
         let events = crate::day::gather(&conn, &start, &end).unwrap();
-        let r = crate::day::build(&day, events, None, crate::derive::parse_ts(&start).unwrap(), crate::derive::parse_ts(&end).unwrap());
+        let r = crate::day::build(&day, events, None, crate::derive::parse_ts(&start).unwrap(), crate::derive::parse_ts(&end).unwrap(), &Default::default());
         println!("day {day}: total {}m in {} blocks", r.total_minutes, r.blocks.len());
         for g in &r.groups {
             println!("  {:>4}m  {}  ({} events: {})", g.minutes, g.label, g.events.len(),

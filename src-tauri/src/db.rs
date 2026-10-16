@@ -117,6 +117,46 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 4 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Jira tickets that are or were assigned to the user (read-only mirror).
+            CREATE TABLE IF NOT EXISTS jira_issues (
+                key TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                category TEXT NOT NULL,      -- new | indeterminate | done
+                issue_type TEXT NOT NULL,
+                priority TEXT,
+                project TEXT NOT NULL,
+                assignee TEXT,
+                assigned_to_me INTEGER NOT NULL DEFAULT 0,
+                url TEXT NOT NULL,
+                created TEXT,
+                updated TEXT,
+                resolved TEXT
+            );
+            -- How they moved: status / assignee / resolution changes, the user's comments, creation.
+            CREATE TABLE IF NOT EXISTS jira_events (
+                id TEXT PRIMARY KEY,
+                issue_key TEXT NOT NULL,
+                at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                from_value TEXT,
+                to_value TEXT,
+                actor TEXT,
+                actor_is_me INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS jira_events_at ON jira_events(at);
+            CREATE INDEX IF NOT EXISTS jira_events_issue ON jira_events(issue_key);
+            PRAGMA user_version = 4;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -728,7 +768,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events;",
     )?;
     Ok(())
 }

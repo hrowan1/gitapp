@@ -5,6 +5,7 @@ mod derive;
 mod editor;
 mod github;
 mod intent;
+mod jira;
 mod sync;
 
 use rusqlite::Connection;
@@ -26,6 +27,9 @@ const DEFAULT_POLL_SECS: u64 = 120;
 pub struct AppState {
     db: Mutex<Connection>,
     token: Mutex<Option<String>>,
+    /// Jira API token, read from the keychain once per launch.
+    jira_token: Mutex<Option<String>>,
+    jira_lock: tokio::sync::Mutex<()>,
     sync_lock: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
     /// `DEV_INBOX_DEMO=1`: fictional data in a separate database, never synced.
@@ -172,6 +176,7 @@ fn start_poller(app: AppHandle) {
             if run_sync(&app).await.is_ok() {
                 maybe_digest(&app);
             }
+            let _ = run_jira_sync(&app).await;
             let state = app.state::<AppState>();
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(poll_secs(&state))) => {}
@@ -799,6 +804,200 @@ fn maybe_digest(app: &AppHandle) {
     }
 }
 
+// ---------- Jira (read-only) ----------
+
+const JIRA_KEYRING_USER: &str = "jira-token";
+
+fn jira_client(state: &AppState) -> Option<jira::Client> {
+    let site = state.setting("jira_site")?;
+    let email = state.setting("jira_email")?;
+    let token = {
+        let mut cached = state.jira_token.lock().unwrap();
+        if cached.is_none() {
+            *cached = keyring::Entry::new(KEYRING_SERVICE, JIRA_KEYRING_USER).ok().and_then(|e| e.get_password().ok());
+        }
+        cached.clone()?
+    };
+    jira::Client::new(&site, &email, &token).ok()
+}
+
+/// Fetch tickets assigned to the user (now or before) that changed since the last sync,
+/// with their movement history.
+async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    if state.demo {
+        return Ok(());
+    }
+    let Some(client) = jira_client(&state) else { return Ok(()) };
+    let Some(me) = state.setting("jira_account") else { return Ok(()) };
+    let _guard = state.jira_lock.lock().await;
+    let now = chrono::Utc::now();
+    // Overlap a day so nothing slips between syncs; first sync looks back 30 days.
+    let since = state
+        .setting("jira_last_sync")
+        .and_then(|s| derive::parse_ts(&s))
+        .map(|t| t - chrono::Duration::days(1))
+        .unwrap_or(now - chrono::Duration::days(jira::FIRST_SYNC_DAYS));
+    let result = async {
+        let issues = client.assigned_issues(since).await?;
+        let mut changes = client.changelogs(&issues).await?;
+        for i in &issues {
+            changes.extend(jira::issue_changes(i, &me));
+        }
+        jira::store(&state.db.lock().unwrap(), &client, &me, &issues, &changes)?;
+        anyhow::Ok(issues.len())
+    }
+    .await;
+    let conn = state.db.lock().unwrap();
+    match result {
+        Ok(_) => {
+            let _ = db::set_setting(&conn, "jira_last_sync", &derive::fmt_ts(now));
+            let _ = db::delete_setting(&conn, "jira_error");
+            drop(conn);
+            let _ = app.emit("jira-updated", ());
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = db::set_setting(&conn, "jira_error", &msg);
+            Err(msg)
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraStatus {
+    connected: bool,
+    site: Option<String>,
+    email: Option<String>,
+    name: Option<String>,
+    last_sync: Option<String>,
+    error: Option<String>,
+    tickets: usize,
+}
+
+fn jira_status_of(state: &AppState) -> JiraStatus {
+    let tickets = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM jira_issues", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0) as usize;
+    JiraStatus {
+        connected: state.setting("jira_account").is_some(),
+        site: state.setting("jira_site"),
+        email: state.setting("jira_email"),
+        name: state.setting("jira_name"),
+        last_sync: state.setting("jira_last_sync"),
+        error: state.setting("jira_error"),
+        tickets,
+    }
+}
+
+#[tauri::command]
+fn jira_status(state: State<AppState>) -> JiraStatus {
+    jira_status_of(&state)
+}
+
+/// Check the credentials against Jira, store them (token in the keychain), and start a first sync.
+#[tauri::command]
+async fn jira_connect(app: AppHandle, site: String, email: String, token: String) -> CmdResult<JiraStatus> {
+    let client = jira::Client::new(&site, &email, &token).map_err(|e| format!("{e:#}"))?;
+    let me = client.myself().await.map_err(|e| format!("{e:#}"))?;
+    keyring::Entry::new(KEYRING_SERVICE, JIRA_KEYRING_USER)
+        .and_then(|e| e.set_password(token.trim()))
+        .map_err(|e| format!("Couldn't save the token to the keychain: {e}"))?;
+    let state = app.state::<AppState>();
+    {
+        let conn = state.db.lock().unwrap();
+        // A different Jira account's history must not mix with this one.
+        if db::get_setting(&conn, "jira_account").map_err(err)?.is_some_and(|a| a != me.account_id) {
+            jira::forget(&conn).map_err(err)?;
+        }
+        db::set_setting(&conn, "jira_site", &jira::normalise_site(&site).map_err(err)?).map_err(err)?;
+        db::set_setting(&conn, "jira_email", email.trim()).map_err(err)?;
+        db::set_setting(&conn, "jira_account", &me.account_id).map_err(err)?;
+        db::set_setting(&conn, "jira_name", &me.name).map_err(err)?;
+    }
+    *state.jira_token.lock().unwrap() = Some(token.trim().to_string());
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = run_jira_sync(&handle).await;
+    });
+    Ok(jira_status_of(&state))
+}
+
+#[tauri::command]
+fn jira_disconnect(state: State<AppState>) -> CmdResult<()> {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, JIRA_KEYRING_USER) {
+        let _ = entry.delete_credential();
+    }
+    *state.jira_token.lock().unwrap() = None;
+    jira::forget(&state.db.lock().unwrap()).map_err(err)
+}
+
+#[tauri::command]
+async fn jira_sync_now(app: AppHandle) -> CmdResult<()> {
+    run_jira_sync(&app).await
+}
+
+#[tauri::command]
+fn get_tickets(state: State<AppState>) -> CmdResult<Vec<jira::Ticket>> {
+    jira::list_tickets(&state.db.lock().unwrap()).map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrLink {
+    id: String,
+    repo: String,
+    number: i64,
+    title: String,
+    url: String,
+    open: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TicketDetail {
+    events: Vec<jira::TicketEvent>,
+    prs: Vec<PrLink>,
+}
+
+/// A ticket's movement history, and the PRs that mention it (by branch or title).
+#[tauri::command]
+fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
+    let me = state.setting("jira_account").unwrap_or_default();
+    let conn = state.db.lock().unwrap();
+    let events = jira::ticket_events(&conn, &key, &me).map_err(err)?;
+    let like = format!("%{}%", key.to_lowercase());
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, repo, number, title, url, is_open, branch FROM prs
+             WHERE kind = 'pr' AND (lower(COALESCE(branch, '')) LIKE ?1 OR lower(title) LIKE ?1)
+             ORDER BY updated_at DESC",
+        )
+        .map_err(err)?;
+    let prs = stmt
+        .query_map([like], |r| {
+            Ok((
+                PrLink { id: r.get(0)?, repo: r.get(1)?, number: r.get(2)?, title: r.get(3)?, url: r.get(4)?, open: r.get(5)? },
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(err)?
+        .filter_map(Result::ok)
+        // "IO-26" must not match "IO-2641": require the exact key.
+        .filter(|(p, branch)| {
+            branch.as_deref().and_then(day::ticket_in_branch).as_deref() == Some(key.as_str())
+                || day::ticket_in_text(&p.title).as_deref() == Some(key.as_str())
+        })
+        .map(|(p, _)| p)
+        .collect();
+    Ok(TicketDetail { events, prs })
+}
+
 // ---------- Day view ----------
 
 /// Every few minutes, note which local clones changed (branch, dirty files, mtimes).
@@ -842,10 +1041,12 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
     .await
     .map_err(err)?;
     let conn = state.db.lock().unwrap();
+    let titles = jira::titles(&conn).map_err(err)?;
     let mut events = day::gather(&conn, &start, &end).map_err(err)?;
     events.extend(day::local_events(&conn, local).map_err(err)?);
+    events.extend(day::jira_events(&conn, &start, &end, &titles).map_err(err)?);
     let manual = day::manual_blocks(&conn, &day).map_err(err)?;
-    Ok(day::build(&day, events, manual, s, e))
+    Ok(day::build(&day, events, manual, s, e, &titles))
 }
 
 /// Save corrected blocks for a day (freezes it).
@@ -928,6 +1129,8 @@ pub fn run() {
             app.manage(AppState {
                 db: Mutex::new(conn),
                 token: Mutex::new(None),
+                jira_token: Mutex::new(None),
+                jira_lock: tokio::sync::Mutex::new(()),
                 sync_lock: tokio::sync::Mutex::new(()),
                 wake: tokio::sync::Notify::new(),
                 demo,
@@ -991,6 +1194,12 @@ pub fn run() {
             get_day,
             save_day,
             reset_day,
+            jira_status,
+            jira_connect,
+            jira_disconnect,
+            jira_sync_now,
+            get_tickets,
+            get_ticket,
             submit_review,
             send_comment,
             merge_options,
