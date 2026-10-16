@@ -17,10 +17,12 @@ import Speech
 
 // MARK: - Output
 
+/// One JSON line to the app. If the app has gone away the write fails quietly (no SIGPIPE, no exception),
+/// so a recording still finishes and closes its files.
 func emit(_ object: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: object),
           let line = String(data: data, encoding: .utf8) else { return }
-    FileHandle.standardOutput.write((line + "\n").data(using: .utf8)!)
+    try? FileHandle.standardOutput.write(contentsOf: Data((line + "\n").utf8))
 }
 
 func fail(_ message: String) -> Never {
@@ -430,6 +432,7 @@ func summarise(path: String) async {
 @main
 struct Main {
     static func main() async {
+        signal(SIGPIPE, SIG_IGN)
         let args = CommandLine.arguments
         guard args.count >= 2 else { fail("usage: dev-inbox-recorder record <dir> | transcribe <file> [locale] | check [locale]") }
         let locale = Locale.current.identifier

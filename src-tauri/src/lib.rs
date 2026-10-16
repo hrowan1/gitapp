@@ -26,6 +26,18 @@ const KEYRING_SERVICE: &str = "dev-inbox";
 const KEYRING_USER: &str = "github-token";
 const DEFAULT_POLL_SECS: u64 = 120;
 
+/// Locks that survive a panic elsewhere: a job that crashed while holding one mustn't take every
+/// later database call (and so the whole app) down with it.
+pub(crate) trait Relock<T> {
+    fn relock(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> Relock<T> for Mutex<T> {
+    fn relock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 pub struct AppState {
     db: Mutex<Connection>,
     token: Mutex<Option<String>>,
@@ -36,6 +48,10 @@ pub struct AppState {
     jira_lock: tokio::sync::Mutex<()>,
     /// The meeting being recorded, if any.
     recorder: Mutex<Option<meetings::Recording>>,
+    /// Background jobs queued or running ("transcribe:<id>", "summary:<id>"), so none runs twice.
+    jobs: Mutex<std::collections::HashSet<String>>,
+    /// Held while a heavy job runs: one at a time.
+    heavy_job: Mutex<()>,
     sync_lock: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
     /// `DEV_INBOX_DEMO=1`: fictional data in a separate database, never synced.
@@ -45,7 +61,7 @@ pub struct AppState {
 impl AppState {
     /// The GitHub token, read from the OS keychain once per launch.
     fn token(&self) -> Option<String> {
-        let mut cached = self.token.lock().unwrap();
+        let mut cached = self.token.relock();
         if cached.is_none() {
             *cached = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok().and_then(|e| e.get_password().ok());
         }
@@ -53,7 +69,7 @@ impl AppState {
     }
 
     fn setting(&self, key: &str) -> Option<String> {
-        db::get_setting(&self.db.lock().unwrap(), key).ok().flatten()
+        db::get_setting(&self.db.relock(), key).ok().flatten()
     }
 }
 
@@ -80,7 +96,7 @@ fn update_tray(app: &AppHandle, needs_you: usize) {
 fn refresh_count(app: &AppHandle) {
     let state = app.state::<AppState>();
     let tickets = ticket_attention(&state).len();
-    let n = db::list_items(&state.db.lock().unwrap())
+    let n = db::list_items(&state.db.relock())
         .map(|items| items.iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).count())
         .unwrap_or(0);
     update_tray(app, n + tickets);
@@ -114,7 +130,7 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            let _ = db::set_setting(&state.db.lock().unwrap(), "last_error", &msg);
+            let _ = db::set_setting(&state.db.relock(), "last_error", &msg);
             let _ = app.emit("inbox-updated", ());
             Err(msg)
         }
@@ -157,7 +173,7 @@ fn notify(app: &AppHandle, n: sync::Notice) {
                     seen_ticket(&app, key);
                 } else if let Some(id) = &n.item_id {
                     let state = app.state::<AppState>();
-                    let _ = db::mark_seen(&state.db.lock().unwrap(), id, &now());
+                    let _ = db::mark_seen(&state.db.relock(), id, &now());
                     let _ = app.emit("inbox-updated", ());
                 }
                 match &n.url {
@@ -204,7 +220,7 @@ struct Session {
     avatar_url: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_session(state: State<AppState>) -> Option<Session> {
     Some(Session { login: state.setting("login")?, avatar_url: state.setting("avatar").unwrap_or_default() })
 }
@@ -220,7 +236,7 @@ async fn sign_in_inner(app: &AppHandle, token: String) -> CmdResult<Session> {
         .map_err(|e| format!("Couldn't save token to the keychain: {e}"))?;
     let state = app.state::<AppState>();
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.relock();
         // A different account's memory must never bleed into this one.
         if db::get_setting(&conn, "login").map_err(err)?.is_some_and(|l| l != viewer.login) {
             db::reset(&conn).map_err(err)?;
@@ -228,7 +244,7 @@ async fn sign_in_inner(app: &AppHandle, token: String) -> CmdResult<Session> {
         db::set_setting(&conn, "login", &viewer.login).map_err(err)?;
         db::set_setting(&conn, "avatar", &viewer.avatar_url).map_err(err)?;
     }
-    *state.token.lock().unwrap() = Some(token);
+    *state.token.relock() = Some(token);
     state.wake.notify_one();
     Ok(Session { login: viewer.login, avatar_url: viewer.avatar_url })
 }
@@ -264,13 +280,13 @@ async fn import_gh_token(app: AppHandle) -> CmdResult<Session> {
     Err(last_err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sign_out(state: State<AppState>, delete_data: bool) -> CmdResult<()> {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
         let _ = entry.delete_credential();
     }
-    *state.token.lock().unwrap() = None;
-    let conn = state.db.lock().unwrap();
+    *state.token.relock() = None;
+    let conn = state.db.relock();
     if delete_data {
         db::reset(&conn).map_err(err)?;
     } else {
@@ -290,10 +306,10 @@ struct Inbox {
     syncing: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_inbox(state: State<AppState>) -> CmdResult<Inbox> {
     let syncing = state.sync_lock.try_lock().is_err();
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.relock();
     Ok(Inbox {
         items: db::list_items(&conn).map_err(err)?,
         last_sync: db::get_setting(&conn, "last_sync").map_err(err)?,
@@ -314,7 +330,7 @@ fn local_time(iso: &str) -> String {
 }
 
 /// Set (or clear, with `state: None`) the user's personal state for one or more PRs.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_state(
     app: AppHandle,
     pr_ids: Vec<String>,
@@ -324,7 +340,7 @@ fn set_state(
 ) -> CmdResult<()> {
     {
         let st = app.state::<AppState>();
-        let conn = st.db.lock().unwrap();
+        let conn = st.db.relock();
         let at = now();
         let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
         // Normalise so snooze times compare correctly against our own timestamps.
@@ -387,7 +403,7 @@ fn set_state(
 }
 
 /// Sends a sample notification; clicking it opens GitHub notifications (checks permissions work).
-#[tauri::command]
+#[tauri::command(async)]
 fn test_notification(app: AppHandle) {
     notify(
         &app,
@@ -400,17 +416,17 @@ fn test_notification(app: AppHandle) {
     );
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_following(state: State<AppState>) -> CmdResult<Vec<db::FollowItem>> {
-    db::list_following(&state.db.lock().unwrap()).map_err(err)
+    db::list_following(&state.db.relock()).map_err(err)
 }
 
 /// Follow or stop following items. Unfollowed items vanish from Today, counts and notifications.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_followed(app: AppHandle, ids: Vec<String>, followed: bool) -> CmdResult<()> {
     {
         let st = app.state::<AppState>();
-        let conn = st.db.lock().unwrap();
+        let conn = st.db.relock();
         let at = now();
         let tx = conn.unchecked_transaction().map_err(err)?;
         for id in &ids {
@@ -434,11 +450,11 @@ fn set_followed(app: AppHandle, ids: Vec<String>, followed: bool) -> CmdResult<(
 }
 
 /// Record that the user has looked at these PRs (clears their "new" dot).
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_seen(app: AppHandle, pr_ids: Vec<String>) -> CmdResult<()> {
     {
         let st = app.state::<AppState>();
-        let conn = st.db.lock().unwrap();
+        let conn = st.db.relock();
         let at = now();
         for id in &pr_ids {
             db::mark_seen(&conn, id, &at).map_err(err)?;
@@ -490,7 +506,7 @@ async fn send_comment(app: AppHandle, item_id: String, body: String, thread_id: 
     }
     .map_err(|e| format!("{e:#}"))?;
     let state = app.state::<AppState>();
-    let _ = db::mark_seen(&state.db.lock().unwrap(), &item_id, &now());
+    let _ = db::mark_seen(&state.db.relock(), &item_id, &now());
     state.wake.notify_one();
     Ok("Reply posted".into())
 }
@@ -547,7 +563,7 @@ async fn scan(app: &AppHandle) -> CmdResult<usize> {
     let found = tauri::async_runtime::spawn_blocking(move || editor::discover(&roots)).await.map_err(err)?;
     let n = found.len();
     let state = app.state::<AppState>();
-    db::set_setting(&state.db.lock().unwrap(), "clones", &serde_json::to_string(&found).map_err(err)?).map_err(err)?;
+    db::set_setting(&state.db.relock(), "clones", &serde_json::to_string(&found).map_err(err)?).map_err(err)?;
     Ok(n)
 }
 
@@ -577,7 +593,7 @@ async fn update_editor_settings(
 ) -> CmdResult<usize> {
     {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.relock();
         if let Some(dir) = clone_dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
             db::set_setting(&conn, "clone_dir", &dir).map_err(err)?;
         }
@@ -592,7 +608,7 @@ async fn update_editor_settings(
 }
 
 /// Point a repo at a specific local folder (or clear the override with `None`).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_repo_path(state: State<AppState>, repo: String, path: Option<String>) -> CmdResult<()> {
     let mut overrides: std::collections::BTreeMap<String, String> = json_setting(&state, "repo_paths").unwrap_or_default();
     match path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
@@ -606,7 +622,7 @@ fn set_repo_path(state: State<AppState>, repo: String, path: Option<String>) -> 
             overrides.remove(&repo.to_lowercase());
         }
     }
-    db::set_setting(&state.db.lock().unwrap(), "repo_paths", &serde_json::to_string(&overrides).map_err(err)?).map_err(err)
+    db::set_setting(&state.db.relock(), "repo_paths", &serde_json::to_string(&overrides).map_err(err)?).map_err(err)
 }
 
 /// Open an item's repo in the editor, optionally switching to the PR's branch first.
@@ -617,7 +633,7 @@ async fn open_locally(app: AppHandle, item_id: String, checkout: bool) -> CmdRes
     }
     let state = app.state::<AppState>();
     let (kind, repo, number, branch, cross_repo) =
-        db::checkout_info(&state.db.lock().unwrap(), &item_id).map_err(err)?.ok_or("Unknown item")?;
+        db::checkout_info(&state.db.relock(), &item_id).map_err(err)?.ok_or("Unknown item")?;
     let path = clones(&state)
         .get(&repo.to_lowercase())
         .cloned()
@@ -640,7 +656,7 @@ async fn open_locally(app: AppHandle, item_id: String, checkout: bool) -> CmdRes
         }
     }
     editor::open_in(&editor, &path).map_err(|e| format!("{e:#}"))?;
-    let _ = db::mark_seen(&state.db.lock().unwrap(), &item_id, &now());
+    let _ = db::mark_seen(&state.db.relock(), &item_id, &now());
     Ok(msg)
 }
 
@@ -649,7 +665,7 @@ async fn open_locally(app: AppHandle, item_id: String, checkout: bool) -> CmdRes
 async fn clone_and_open(app: AppHandle, item_id: String, checkout: bool) -> CmdResult<String> {
     let (repo, parent) = {
         let state = app.state::<AppState>();
-        let repo = db::checkout_info(&state.db.lock().unwrap(), &item_id).map_err(err)?.ok_or("Unknown item")?.1;
+        let repo = db::checkout_info(&state.db.relock(), &item_id).map_err(err)?.ok_or("Unknown item")?.1;
         (repo, state.setting("clone_dir").unwrap_or_else(editor::default_clone_dir))
     };
     let r = repo.clone();
@@ -661,7 +677,7 @@ async fn clone_and_open(app: AppHandle, item_id: String, checkout: bool) -> CmdR
         let state = app.state::<AppState>();
         let mut found: std::collections::BTreeMap<String, String> = json_setting(&state, "clones").unwrap_or_default();
         found.insert(repo.to_lowercase(), path.clone());
-        db::set_setting(&state.db.lock().unwrap(), "clones", &serde_json::to_string(&found).map_err(err)?).map_err(err)?;
+        db::set_setting(&state.db.relock(), "clones", &serde_json::to_string(&found).map_err(err)?).map_err(err)?;
     }
     let msg = open_locally(app, item_id, checkout).await?;
     Ok(format!("Cloned to {path} · {msg}"))
@@ -678,11 +694,11 @@ async fn rerun_checks(app: AppHandle, pr_id: String) -> CmdResult<String> {
     let result = github::Client::new(&token).rerun_failed_checks(&pr_id).await.map_err(|e| format!("{e:#}"))?;
     // Load first so the lock is released before record_activity takes it again: a guard
     // created in an `if let` condition lives for the whole block, and re-locking deadlocks.
-    let pr = db::PrRef::load(&state.db.lock().unwrap(), &pr_id).map_err(err)?;
+    let pr = db::PrRef::load(&state.db.relock(), &pr_id).map_err(err)?;
     if let Some(pr) = pr {
         let at = now();
         let _ = db::record_activity(
-            &state.db.lock().unwrap(),
+            &state.db.relock(),
             &db::ActivityRow {
                 key: format!("rerun:{pr_id}:{at}"),
                 at: &at,
@@ -704,25 +720,25 @@ async fn rerun_checks(app: AppHandle, pr_id: String) -> CmdResult<String> {
     Ok(msg)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_activity(state: State<AppState>, days: i64) -> CmdResult<Vec<db::Activity>> {
     let since = derive::fmt_ts(chrono::Utc::now() - chrono::Duration::days(days));
-    db::list_activity(&state.db.lock().unwrap(), &since).map_err(err)
+    db::list_activity(&state.db.relock(), &since).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_item_activity(state: State<AppState>, item_id: String) -> CmdResult<Vec<db::Activity>> {
-    db::item_activity(&state.db.lock().unwrap(), &item_id, 30).map_err(err)
+    db::item_activity(&state.db.relock(), &item_id, 30).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_repos(state: State<AppState>) -> CmdResult<Vec<db::RepoInfo>> {
-    db::list_repos(&state.db.lock().unwrap()).map_err(err)
+    db::list_repos(&state.db.relock()).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_repo_hidden(app: AppHandle, repo: String, hidden: bool) -> CmdResult<()> {
-    db::set_repo_hidden(&app.state::<AppState>().db.lock().unwrap(), &repo, hidden).map_err(err)?;
+    db::set_repo_hidden(&app.state::<AppState>().db.relock(), &repo, hidden).map_err(err)?;
     refresh_count(&app);
     Ok(())
 }
@@ -774,7 +790,7 @@ fn digest_hour(state: &AppState) -> u32 {
     state.setting("digest_hour").and_then(|h| h.parse().ok()).unwrap_or(9).min(23)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_settings(state: State<AppState>) -> Settings {
     Settings {
         poll_seconds: poll_secs(&state),
@@ -788,10 +804,10 @@ fn get_settings(state: State<AppState>) -> Settings {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> {
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.relock();
         db::set_setting(&conn, "poll_seconds", &settings.poll_seconds.max(30).to_string()).map_err(err)?;
         db::set_setting(&conn, "notifications", if settings.notifications { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "digest", if settings.digest { "1" } else { "0" }).map_err(err)?;
@@ -824,7 +840,7 @@ fn maybe_digest(app: &AppHandle) {
     if weekend || now.hour() < digest_hour(&state) || state.setting("last_digest").as_deref() == Some(today.as_str()) {
         return;
     }
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.relock();
     let _ = db::set_setting(&conn, "last_digest", &today);
     if let Ok(Some(summary)) = sync::digest(&conn) {
         drop(conn);
@@ -840,7 +856,7 @@ fn jira_client(state: &AppState) -> Option<jira::Client> {
     let site = state.setting("jira_site")?;
     let email = state.setting("jira_email")?;
     let token = {
-        let mut cached = state.jira_token.lock().unwrap();
+        let mut cached = state.jira_token.relock();
         if cached.is_none() {
             *cached = keyring::Entry::new(KEYRING_SERVICE, JIRA_KEYRING_USER).ok().and_then(|e| e.get_password().ok());
         }
@@ -879,11 +895,11 @@ async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
         for i in &issues {
             changes.extend(jira::issue_changes(i, &me));
         }
-        jira::store(&state.db.lock().unwrap(), &client, &me, &issues, &changes)?;
+        jira::store(&state.db.relock(), &client, &me, &issues, &changes)?;
         anyhow::Ok(issues.len())
     }
     .await;
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.relock();
     match result {
         Ok(_) => {
             let _ = db::set_setting(&conn, "jira_last_sync", &derive::fmt_ts(now));
@@ -922,7 +938,7 @@ fn ticket_attention(state: &AppState) -> Vec<jira::Attention> {
     let (Some(me), Some(since)) = (state.setting("jira_account"), state.setting("jira_attention_since")) else {
         return Vec::new();
     };
-    jira::attention(&state.db.lock().unwrap(), &me, &since).unwrap_or_default()
+    jira::attention(&state.db.relock(), &me, &since).unwrap_or_default()
 }
 
 /// Desktop notifications for tickets that newly need you; a burst becomes one summary.
@@ -962,7 +978,7 @@ fn notify_tickets(app: &AppHandle, fresh: Vec<jira::Attention>) {
 fn seen_ticket(app: &AppHandle, key: &str) {
     let state = app.state::<AppState>();
     let (Some(me), Some(since)) = (state.setting("jira_account"), state.setting("jira_attention_since")) else { return };
-    let needed = jira::mark_seen(&state.db.lock().unwrap(), key, &me, &since, &now()).unwrap_or(false);
+    let needed = jira::mark_seen(&state.db.relock(), key, &me, &since, &now()).unwrap_or(false);
     if needed {
         refresh_count(app);
         let _ = app.emit("jira-updated", ());
@@ -970,12 +986,12 @@ fn seen_ticket(app: &AppHandle, key: &str) {
 }
 
 /// Tickets that need you, for Today.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_ticket_attention(state: State<AppState>) -> Vec<jira::Attention> {
     ticket_attention(&state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_ticket_seen(app: AppHandle, key: String) {
     seen_ticket(&app, &key);
 }
@@ -1010,7 +1026,7 @@ fn jira_status_of(state: &AppState) -> JiraStatus {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn jira_status(state: State<AppState>) -> JiraStatus {
     jira_status_of(&state)
 }
@@ -1025,7 +1041,7 @@ async fn jira_connect(app: AppHandle, site: String, email: String, token: String
         .map_err(|e| format!("Couldn't save the token to the keychain: {e}"))?;
     let state = app.state::<AppState>();
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.relock();
         // A different Jira account's history must not mix with this one.
         if db::get_setting(&conn, "jira_account").map_err(err)?.is_some_and(|a| a != me.account_id) {
             jira::forget(&conn).map_err(err)?;
@@ -1035,7 +1051,7 @@ async fn jira_connect(app: AppHandle, site: String, email: String, token: String
         db::set_setting(&conn, "jira_account", &me.account_id).map_err(err)?;
         db::set_setting(&conn, "jira_name", &me.name).map_err(err)?;
     }
-    *state.jira_token.lock().unwrap() = Some(token.trim().to_string());
+    *state.jira_token.relock() = Some(token.trim().to_string());
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = run_jira_sync(&handle).await;
@@ -1043,13 +1059,13 @@ async fn jira_connect(app: AppHandle, site: String, email: String, token: String
     Ok(jira_status_of(&state))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn jira_disconnect(state: State<AppState>) -> CmdResult<()> {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, JIRA_KEYRING_USER) {
         let _ = entry.delete_credential();
     }
-    *state.jira_token.lock().unwrap() = None;
-    jira::forget(&state.db.lock().unwrap()).map_err(err)
+    *state.jira_token.relock() = None;
+    jira::forget(&state.db.relock()).map_err(err)
 }
 
 #[tauri::command]
@@ -1057,10 +1073,10 @@ async fn jira_sync_now(app: AppHandle) -> CmdResult<()> {
     run_jira_sync(&app).await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_tickets(state: State<AppState>) -> CmdResult<Vec<jira::Ticket>> {
     let me = state.setting("jira_account").unwrap_or_default();
-    jira::list_tickets(&state.db.lock().unwrap(), &me).map_err(err)
+    jira::list_tickets(&state.db.relock(), &me).map_err(err)
 }
 
 #[derive(Serialize)]
@@ -1083,10 +1099,10 @@ struct TicketDetail {
 }
 
 /// A ticket's movement history, and the PRs that mention it (by branch or title).
-#[tauri::command]
+#[tauri::command(async)]
 fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
     let me = state.setting("jira_account").unwrap_or_default();
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.relock();
     let events = jira::ticket_events(&conn, &key, &me).map_err(err)?;
     let description = jira::description(&conn, &key).map_err(err)?;
     let like = format!("%{}%", key.to_lowercase());
@@ -1132,7 +1148,7 @@ struct RecordingStatus {
 }
 
 fn recording_status_of(state: &AppState) -> RecordingStatus {
-    let id = state.recorder.lock().unwrap().as_ref().map(|r| r.meeting_id.clone());
+    let id = state.recorder.relock().as_ref().map(|r| r.meeting_id.clone());
     let started_at = id.as_ref().and_then(|id| {
         state
             .db
@@ -1144,48 +1160,115 @@ fn recording_status_of(state: &AppState) -> RecordingStatus {
     RecordingStatus { recording: id.is_some(), meeting_id: id, started_at }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn recording_status(state: State<AppState>) -> RecordingStatus {
     recording_status_of(&state)
 }
 
-/// Transcribe both tracks on-device, merge them, store; then apply "delete audio after transcript".
-fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
+// ---------- background jobs ----------
+
+/// Run background work on meetings (transcribing, summarising) safely: on its own thread, never the UI
+/// thread; heavy jobs one at a time (they share the CPU, the speech model and Apple Intelligence); a
+/// job that's already queued or running isn't started twice; and one that panics marks its meeting
+/// failed (via `on_panic`) instead of leaving it spinning or taking the app down.
+fn spawn_job(
+    app: &AppHandle,
+    key: String,
+    on_panic: impl FnOnce(&AppHandle) + Send + 'static,
+    job: impl FnOnce(&AppHandle) + Send + 'static,
+) {
+    let state = app.state::<AppState>();
+    if !state.jobs.relock().insert(key.clone()) {
+        return;
+    }
+    let app = app.clone();
     std::thread::spawn(move || {
-        let locale = app.state::<AppState>().setting("transcribe_locale").unwrap_or_default();
+        let state = app.state::<AppState>();
+        let outcome = {
+            let _one_at_a_time = state.heavy_job.relock();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&app)))
+        };
+        state.jobs.relock().remove(&key);
+        if outcome.is_err() {
+            on_panic(&app);
+            let _ = app.emit("meetings-updated", ());
+        }
+    });
+}
+
+/// Transcribe both tracks on-device, merge them, store; apply "delete audio after transcript"; then
+/// write notes. Runs as a background job.
+fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
+    let failed_id = id.clone();
+    let on_panic = move |app: &AppHandle| {
+        let state = app.state::<AppState>();
+        let conn = state.db.relock();
+        let _ = meetings::set_status(&conn, &failed_id, "failed", Some("Transcription stopped unexpectedly. Try again."));
+    };
+    spawn_job(&app, format!("transcribe:{id}"), on_panic, move |app| {
+        let state = app.state::<AppState>();
+        // Settings before taking the lock: `setting()` locks the database itself, and std's Mutex isn't
+        // re-entrant, so calling it while holding `conn` deadlocks.
+        let locale = state.setting("transcribe_locale").unwrap_or_default();
+        let delete_audio = audio_retention_days(&state) < 0;
+        let seconds = meetings::get(&state.db.relock(), &id).ok().flatten().and_then(|(m, _)| m.seconds).unwrap_or(0);
+        // Generous, but never forever: a first run may download the speech model.
+        let timeout = std::time::Duration::from_secs((seconds.max(0) as u64 * 3).max(10 * 60));
         let track = |name: &str, speaker: &str| -> anyhow::Result<Vec<meetings::Segment>> {
             let path = dir.join(name);
             if path.exists() && std::fs::metadata(&path).map(|m| m.len() > 1024).unwrap_or(false) {
-                meetings::transcribe_file(&path, speaker, &locale)
+                meetings::transcribe_file(&path, speaker, &locale, timeout)
             } else {
                 Ok(Vec::new())
             }
         };
         let result = track("mic.m4a", "you").and_then(|you| Ok(meetings::merge(you, track("system.m4a", "others")?)));
-        let state = app.state::<AppState>();
-        // Read settings before taking the lock: `setting()` locks the database itself, and std's Mutex isn't
-        // re-entrant, so calling it while holding `conn` deadlocks (and freezes the UI on its next query).
-        let delete_audio = audio_retention_days(&state) < 0;
-        let conn = state.db.lock().unwrap();
         let transcribed = result.is_ok();
-        match result {
-            Ok(segments) => {
-                let _ = meetings::save_transcript(&conn, &id, &segments);
-                if delete_audio {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    let _ = conn.execute("UPDATE meetings SET audio_deleted = 1 WHERE id = ?1", [&id]);
+        {
+            let conn = state.db.relock();
+            match result {
+                Ok(segments) => {
+                    let _ = meetings::save_transcript(&conn, &id, &segments);
+                    if delete_audio {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        let _ = conn.execute("UPDATE meetings SET audio_deleted = 1 WHERE id = ?1", [&id]);
+                    }
+                }
+                Err(e) => {
+                    let _ = meetings::set_status(&conn, &id, "failed", Some(&format!("{e:#}")));
                 }
             }
-            Err(e) => {
-                let _ = meetings::set_status(&conn, &id, "failed", Some(&format!("{e:#}")));
-            }
         }
-        drop(conn);
         let _ = app.emit("meetings-updated", ());
         if transcribed {
-            summarise_meeting(app, id);
+            summarise_meeting(app.clone(), id);
         }
     });
+}
+
+/// Pick up work an earlier run didn't finish (the app quit or crashed mid-way), so nothing is left
+/// spinning forever.
+fn resume_meeting_jobs(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let stuck = meetings::unfinished(&state.db.relock()).unwrap_or_default();
+    for (id, status, summary_status, dir) in stuck {
+        match status.as_str() {
+            "recording" => {
+                let conn = state.db.relock();
+                let _ = meetings::interrupted_recording(&conn, &id, dir.as_deref().map(std::path::Path::new));
+            }
+            "transcribing" => {
+                if let Some(dir) = dir {
+                    transcribe_meeting(app.clone(), id.clone(), dir.into());
+                }
+            }
+            _ => {}
+        }
+        if summary_status.as_deref() == Some("summarising") && status == "done" {
+            summarise_meeting(app.clone(), id);
+        }
+    }
+    let _ = app.emit("meetings-updated", ());
 }
 
 const ANTHROPIC_KEYRING_USER: &str = "anthropic-api-key";
@@ -1195,42 +1278,58 @@ fn summary_provider(state: &AppState) -> summary::Provider {
 }
 
 fn anthropic_key(state: &AppState) -> Option<String> {
-    let mut cached = state.anthropic_key.lock().unwrap();
+    let mut cached = state.anthropic_key.relock();
     if cached.is_none() {
         *cached = keyring::Entry::new(KEYRING_SERVICE, ANTHROPIC_KEYRING_USER).ok().and_then(|e| e.get_password().ok());
     }
     cached.clone()
 }
 
-/// Write AI notes for a meeting with whichever summariser Settings chose (none if off).
+/// Write AI notes for a meeting with whichever summariser Settings chose (none if off), as a
+/// background job. Claude's request has its own timeout; the on-device helper is killed if it hangs.
 fn summarise_meeting(app: AppHandle, id: String) {
-    tauri::async_runtime::spawn(async move {
+    let state = app.state::<AppState>();
+    if summary_provider(&state) == summary::Provider::Off {
+        return;
+    }
+    let has_transcript = meetings::get(&state.db.relock(), &id).ok().flatten().is_some_and(|(_, segments)| !segments.is_empty());
+    if !has_transcript {
+        return;
+    }
+    let _ = summary::set_status(&state.db.relock(), &id, Some("summarising"), None);
+    let _ = app.emit("meetings-updated", ());
+    let failed_id = id.clone();
+    let on_panic = move |app: &AppHandle| {
         let state = app.state::<AppState>();
+        let conn = state.db.relock();
+        let _ = summary::set_status(&conn, &failed_id, Some("failed"), Some("Writing notes stopped unexpectedly. Try again."));
+    };
+    spawn_job(&app, format!("summary:{id}"), on_panic, move |app| {
+        let state = app.state::<AppState>();
+        // Settings first: setting() locks the database itself. Read again here: they may have changed
+        // while this job waited its turn.
         let provider = summary_provider(&state);
-        // Settings first: setting() locks the database itself.
         let key = (provider == summary::Provider::Claude).then(|| anthropic_key(&state)).flatten();
-        let found = meetings::get(&state.db.lock().unwrap(), &id).ok().flatten();
-        let Some((meeting, segments)) = found else { return };
-        if provider == summary::Provider::Off || segments.is_empty() {
+        let found = meetings::get(&state.db.relock(), &id).ok().flatten();
+        let Some((meeting, segments)) = found.filter(|(_, s)| !s.is_empty()) else {
+            let _ = summary::set_status(&state.db.relock(), &id, None, None);
             return;
-        }
-        let _ = summary::set_status(&state.db.lock().unwrap(), &id, Some("summarising"), None);
-        let _ = app.emit("meetings-updated", ());
+        };
         let transcript = summary::transcript_text(&segments);
         let result = match provider {
+            summary::Provider::Off => {
+                let _ = summary::set_status(&state.db.relock(), &id, None, None);
+                let _ = app.emit("meetings-updated", ());
+                return;
+            }
             summary::Provider::Claude => match key {
-                Some(key) => summary::with_claude(&key, &meeting.title, &transcript).await,
+                Some(key) => tauri::async_runtime::block_on(summary::with_claude(&key, &meeting.title, &transcript)),
                 None => Err(anyhow::anyhow!("Add your Anthropic API key in Settings → Meetings to summarise with Claude")),
             },
-            _ => {
-                let (id, transcript) = (id.clone(), transcript.clone());
-                tauri::async_runtime::spawn_blocking(move || summary::on_device(&id, &transcript))
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
-            }
+            summary::Provider::Apple => summary::on_device(&id, &transcript),
         };
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.relock();
             let _ = match &result {
                 Ok(s) => summary::save(&conn, &id, s, provider),
                 Err(e) => summary::set_status(&conn, &id, Some("failed"), Some(&format!("{e:#}"))),
@@ -1241,7 +1340,7 @@ fn summarise_meeting(app: AppHandle, id: String) {
 }
 
 /// Make (or remake) a meeting's summary now.
-#[tauri::command]
+#[tauri::command(async)]
 fn summarise_meeting_now(app: AppHandle, id: String) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if state.demo {
@@ -1271,8 +1370,8 @@ struct SummaryStatus {
 #[tauri::command]
 async fn summary_status(app: AppHandle) -> SummaryStatus {
     let check = tauri::async_runtime::spawn_blocking(|| {
-        let out = std::process::Command::new(meetings::helper_path().ok()?).arg("check").output().ok()?;
-        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        let out = meetings::run_helper(&[std::ffi::OsStr::new("check")], std::time::Duration::from_secs(20)).ok()?;
+        out.lines().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
     })
     .await
     .ok()
@@ -1291,7 +1390,7 @@ async fn summary_status(app: AppHandle) -> SummaryStatus {
 }
 
 /// Save the Anthropic API key (keychain) for Claude summaries. The user types it; it's never shown again.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_anthropic_key(state: State<AppState>, key: String) -> CmdResult<()> {
     let key = key.trim();
     if key.is_empty() {
@@ -1300,16 +1399,16 @@ fn set_anthropic_key(state: State<AppState>, key: String) -> CmdResult<()> {
     keyring::Entry::new(KEYRING_SERVICE, ANTHROPIC_KEYRING_USER)
         .and_then(|e| e.set_password(key))
         .map_err(|e| format!("Couldn't save the key to the keychain: {e}"))?;
-    *state.anthropic_key.lock().unwrap() = Some(key.to_string());
+    *state.anthropic_key.relock() = Some(key.to_string());
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_anthropic_key(state: State<AppState>) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, ANTHROPIC_KEYRING_USER) {
         let _ = entry.delete_credential();
     }
-    *state.anthropic_key.lock().unwrap() = None;
+    *state.anthropic_key.relock() = None;
 }
 
 fn set_recording_tray(app: &AppHandle, on: bool) {
@@ -1323,13 +1422,13 @@ fn set_recording_tray(app: &AppHandle, on: bool) {
 }
 
 /// Start recording a meeting (mic + meeting audio). Only ever started by the user.
-#[tauri::command]
+#[tauri::command(async)]
 fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<RecordingStatus> {
     let state = app.state::<AppState>();
     if state.demo {
         return Err("Recording isn't available in demo mode".into());
     }
-    if state.recorder.lock().unwrap().is_some() {
+    if state.recorder.relock().is_some() {
         return Err("Already recording".into());
     }
     let started = chrono::Utc::now();
@@ -1339,7 +1438,7 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| format!("Meeting {}", started.with_timezone(&chrono::Local).format("%H:%M")));
-    meetings::create(&state.db.lock().unwrap(), &id, &title, &derive::fmt_ts(started), &dir).map_err(err)?;
+    meetings::create(&state.db.relock(), &id, &title, &derive::fmt_ts(started), &dir).map_err(err)?;
 
     let handle = app.clone();
     let meeting_id = id.clone();
@@ -1355,11 +1454,26 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
             }
             Some("error") => {
                 let msg = ev["message"].as_str().unwrap_or("Recording failed").to_string();
-                let _ = meetings::set_status(&state.db.lock().unwrap(), &meeting_id, "failed", Some(&msg));
-                state.recorder.lock().unwrap().take();
+                let _ = meetings::set_status(&state.db.relock(), &meeting_id, "failed", Some(&msg));
+                state.recorder.relock().take();
                 set_recording_tray(&handle, false);
                 let _ = handle.emit("recording-event", &ev);
                 let _ = handle.emit("meetings-updated", ());
+            }
+            Some("exited") => {
+                // Normal after "stopped". Otherwise the helper died mid-recording: don't stay "recording".
+                let still_recording =
+                    meetings::get(&state.db.relock(), &meeting_id).ok().flatten().is_some_and(|(m, _)| m.status == "recording");
+                if still_recording {
+                    let mine = state.recorder.relock().take_if(|r| r.meeting_id == meeting_id);
+                    if let Some(mut r) = mine {
+                        let _ = r.child.wait();
+                    }
+                    let _ = meetings::interrupted_recording(&state.db.relock(), &meeting_id, Some(&rec_dir));
+                    set_recording_tray(&handle, false);
+                    let _ = handle.emit("recording-event", serde_json::json!({"event": "error", "message": "The recorder stopped unexpectedly"}));
+                    let _ = handle.emit("meetings-updated", ());
+                }
             }
             Some("stopped") => {
                 let ended = derive::fmt_ts(chrono::Utc::now());
@@ -1368,7 +1482,7 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
                 });
                 let seconds = ev["seconds"].as_i64().unwrap_or(0);
                 let _ = meetings::finish_recording(
-                    &state.db.lock().unwrap(),
+                    &state.db.relock(),
                     &meeting_id,
                     &ended,
                     seconds,
@@ -1382,10 +1496,10 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
         }
     })
     .map_err(|e| {
-        let _ = meetings::set_status(&state.db.lock().unwrap(), &id, "failed", Some(&format!("{e:#}")));
+        let _ = meetings::set_status(&state.db.relock(), &id, "failed", Some(&format!("{e:#}")));
         format!("{e:#}")
     })?;
-    *state.recorder.lock().unwrap() = Some(recording);
+    *state.recorder.relock() = Some(recording);
     set_recording_tray(&app, true);
     let _ = app.emit("meetings-updated", ());
     Ok(recording_status_of(&state))
@@ -1393,15 +1507,15 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
 
 #[tauri::command]
 async fn stop_recording(app: AppHandle) -> CmdResult<()> {
-    let recording = app.state::<AppState>().recorder.lock().unwrap().take().ok_or("Not recording")?;
+    let recording = app.state::<AppState>().recorder.relock().take().ok_or("Not recording")?;
     tauri::async_runtime::spawn_blocking(move || meetings::stop(recording)).await.map_err(err)?.map_err(err)?;
     set_recording_tray(&app, false);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_meetings(state: State<AppState>) -> CmdResult<Vec<meetings::Meeting>> {
-    meetings::list(&state.db.lock().unwrap()).map_err(err)
+    meetings::list(&state.db.relock()).map_err(err)
 }
 
 #[derive(Serialize)]
@@ -1411,32 +1525,32 @@ struct MeetingDetail {
     segments: Vec<meetings::Segment>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_meeting(state: State<AppState>, id: String) -> CmdResult<MeetingDetail> {
-    let (meeting, segments) = meetings::get(&state.db.lock().unwrap(), &id).map_err(err)?.ok_or("Unknown meeting")?;
+    let (meeting, segments) = meetings::get(&state.db.relock(), &id).map_err(err)?.ok_or("Unknown meeting")?;
     Ok(MeetingDetail { meeting, segments })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_meeting(app: AppHandle, id: String, title: String, ticket: Option<String>) -> CmdResult<()> {
-    meetings::update(&app.state::<AppState>().db.lock().unwrap(), &id, &title, ticket.as_deref()).map_err(err)?;
+    meetings::update(&app.state::<AppState>().db.relock(), &id, &title, ticket.as_deref()).map_err(err)?;
     let _ = app.emit("meetings-updated", ());
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_meeting(app: AppHandle, id: String) -> CmdResult<()> {
-    meetings::delete(&app.state::<AppState>().db.lock().unwrap(), &id).map_err(err)?;
+    meetings::delete(&app.state::<AppState>().db.relock(), &id).map_err(err)?;
     let _ = app.emit("meetings-updated", ());
     Ok(())
 }
 
 /// Retry transcription (e.g. after it failed, or to pick up a language change).
-#[tauri::command]
+#[tauri::command(async)]
 fn retranscribe_meeting(app: AppHandle, id: String) -> CmdResult<()> {
     let dir = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.relock();
         meetings::set_status(&conn, &id, "transcribing", None).map_err(err)?;
         let (m, _) = meetings::get(&conn, &id).map_err(err)?.ok_or("Unknown meeting")?;
         if !m.has_audio {
@@ -1462,7 +1576,7 @@ fn start_local_tracker(app: AppHandle) {
             let state = app.state::<AppState>();
             if ticks % 12 == 0 {
                 let days = audio_retention_days(&state);
-                let _ = meetings::apply_retention(&state.db.lock().unwrap(), days);
+                let _ = meetings::apply_retention(&state.db.relock(), days);
             }
             ticks += 1;
             if !state.demo && state.setting("track_local").as_deref() != Some("0") && state.setting("login").is_some() {
@@ -1470,7 +1584,7 @@ fn start_local_tracker(app: AppHandle) {
                     let Some(s) = editor::sample(&path) else { continue };
                     let changed = last.insert(repo.clone(), s.signature).is_some_and(|prev| prev != s.signature);
                     if changed {
-                        let _ = db::record_sample(&state.db.lock().unwrap(), &now(), &repo, s.branch.as_deref());
+                        let _ = db::record_sample(&state.db.relock(), &now(), &repo, s.branch.as_deref());
                     }
                 }
             }
@@ -1498,7 +1612,7 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
     })
     .await
     .map_err(err)?;
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.relock();
     let titles = jira::titles(&conn).map_err(err)?;
     let mut events = day::gather(&conn, &start, &end).map_err(err)?;
     events.extend(day::local_events(&conn, local).map_err(err)?);
@@ -1512,7 +1626,7 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
 }
 
 /// Save corrected blocks for a day (freezes it).
-#[tauri::command]
+#[tauri::command(async)]
 fn save_day(state: State<AppState>, day: String, blocks: Vec<day::Block>) -> CmdResult<()> {
     for b in &blocks {
         match (derive::parse_ts(&b.start), derive::parse_ts(&b.end)) {
@@ -1520,13 +1634,13 @@ fn save_day(state: State<AppState>, day: String, blocks: Vec<day::Block>) -> Cmd
             _ => return Err(format!("“{}” ends before it starts", b.label)),
         }
     }
-    day::save_blocks(&state.db.lock().unwrap(), &day, &blocks).map_err(err)
+    day::save_blocks(&state.db.relock(), &day, &blocks).map_err(err)
 }
 
 /// Throw away corrections and go back to automatic for a day.
-#[tauri::command]
+#[tauri::command(async)]
 fn reset_day(state: State<AppState>, day: String) -> CmdResult<()> {
-    day::unfreeze(&state.db.lock().unwrap(), &day).map_err(err)
+    day::unfreeze(&state.db.relock(), &day).map_err(err)
 }
 
 // ---------- window / tray ----------
@@ -1595,10 +1709,15 @@ pub fn run() {
                 anthropic_key: Mutex::new(None),
                 jira_lock: tokio::sync::Mutex::new(()),
                 recorder: Mutex::new(None),
+                jobs: Mutex::new(Default::default()),
+                heavy_job: Mutex::new(()),
                 sync_lock: tokio::sync::Mutex::new(()),
                 wake: tokio::sync::Notify::new(),
                 demo,
             });
+            if !demo {
+                resume_meeting_jobs(app.handle());
+            }
 
             let open = MenuItem::with_id(app, "open", "Open Dev Inbox", true, None::<&str>)?;
             let sync = MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?;

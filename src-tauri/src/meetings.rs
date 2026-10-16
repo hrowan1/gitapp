@@ -2,7 +2,7 @@
 //! audio capture and Apple on-device transcription; this module drives it, merges the two tracks
 //! (your mic = "you", the call = "others") into one transcript, and stores everything locally.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
@@ -24,6 +24,49 @@ pub fn helper_path() -> Result<PathBuf> {
         return Ok(dev);
     }
     Err(anyhow!("The meeting recorder isn't available on this platform"))
+}
+
+/// Run the helper to completion and return what it printed. Never waits longer than `timeout`: a
+/// stuck helper (speech model download, Apple Intelligence) is killed rather than hanging a job.
+pub fn run_helper(args: &[&std::ffi::OsStr], timeout: std::time::Duration) -> Result<String> {
+    let mut cmd = Command::new(helper_path()?);
+    cmd.args(args);
+    run_with_timeout(cmd, timeout)
+}
+
+/// Run a command, collect its stdout, and kill it if it runs past `timeout`.
+pub fn run_with_timeout(mut cmd: Command, timeout: std::time::Duration) -> Result<String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Couldn't start the meeting helper")?;
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("no helper stdout"))?;
+    // Read on another thread so a full pipe can't block the helper while we wait for it.
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
+        out
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            bail!("took longer than {} minutes and was stopped", timeout.as_secs().div_ceil(60));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let out = reader.join().unwrap_or_default();
+    if out.trim().is_empty() && !status.success() {
+        bail!("the meeting helper stopped unexpectedly ({status})");
+    }
+    Ok(out)
 }
 
 /// A running recording: the helper process and the pipe used to tell it to stop.
@@ -52,6 +95,8 @@ pub fn start(meeting_id: &str, dir: &Path, on_event: impl Fn(Value) + Send + 'st
                 on_event(v);
             }
         }
+        // The helper is gone — after "stopped" normally, but also if it crashed mid-recording.
+        on_event(serde_json::json!({"event": "exited"}));
     });
     Ok(Recording { meeting_id: meeting_id.to_string(), child, stdin })
 }
@@ -82,16 +127,15 @@ pub struct Segment {
 }
 
 /// Transcribe one audio file with the helper (on-device).
-pub fn transcribe_file(path: &Path, speaker: &str, locale: &str) -> Result<Vec<Segment>> {
-    let mut cmd = Command::new(helper_path()?);
-    cmd.arg("transcribe").arg(path);
+pub fn transcribe_file(path: &Path, speaker: &str, locale: &str, timeout: std::time::Duration) -> Result<Vec<Segment>> {
+    let mut args = vec![std::ffi::OsStr::new("transcribe"), path.as_os_str()];
     if !locale.is_empty() {
-        cmd.arg(locale);
+        args.push(std::ffi::OsStr::new(locale));
     }
-    let out = cmd.output()?;
+    let out = run_helper(&args, timeout).context("Transcription")?;
     let mut segments = Vec::new();
     let mut error = None;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in out.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         if v["event"] == "error" {
             error = v["message"].as_str().map(String::from);
@@ -248,6 +292,43 @@ pub fn started_between(conn: &Connection, start: &str, end: &str) -> Result<Vec<
     Ok(rows)
 }
 
+/// Meetings whose recording, transcription or notes never finished: (id, status, summary status, audio dir).
+pub fn unfinished(conn: &Connection) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, status, summary_status, CASE WHEN audio_deleted THEN NULL ELSE audio_dir END FROM meetings
+         WHERE status IN ('recording', 'transcribing') OR summary_status = 'summarising'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// A recording that ended without the helper saying "stopped" (it crashed, or the app quit): keep
+/// what was saved, end it when the audio files were last written, and offer to transcribe it.
+pub fn interrupted_recording(conn: &Connection, id: &str, dir: Option<&Path>) -> Result<()> {
+    let saved: Vec<(&str, std::fs::Metadata)> = ["mic", "system"]
+        .into_iter()
+        .filter_map(|name| {
+            let meta = std::fs::metadata(dir?.join(format!("{name}.m4a"))).ok()?;
+            (meta.len() > 1024).then_some((name, meta))
+        })
+        .collect();
+    let last_write = saved.iter().filter_map(|(_, m)| m.modified().ok()).max().map(|t| fmt_ts(t.into()));
+    let sources = saved.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(",");
+    let message = if saved.is_empty() {
+        "Recording was interrupted before anything was saved."
+    } else {
+        "Recording was interrupted. Try again to transcribe what was saved."
+    };
+    conn.execute(
+        "UPDATE meetings SET status = 'failed', error = ?2, sources = ?3,
+             ended_at = COALESCE(ended_at, ?4, started_at),
+             seconds = COALESCE(seconds, CAST(strftime('%s', COALESCE(?4, started_at)) - strftime('%s', started_at) AS INTEGER))
+         WHERE id = ?1 AND status = 'recording'",
+        params![id, message, sources, last_write],
+    )?;
+    Ok(())
+}
+
 pub fn get(conn: &Connection, id: &str) -> Result<Option<(Meeting, Vec<Segment>)>> {
     let Some(m) = conn
         .query_row(&format!("SELECT {MEETING_COLUMNS} FROM meetings m WHERE m.id = ?1"), [id], row_to_meeting)
@@ -337,6 +418,48 @@ mod tests {
     }
 
     #[test]
+    fn helper_runs_are_bounded() {
+        let mut echo = Command::new("sh");
+        echo.args(["-c", "echo '{\"event\":\"done\"}'"]);
+        assert_eq!(run_with_timeout(echo, std::time::Duration::from_secs(5)).unwrap().trim(), r#"{"event":"done"}"#);
+
+        let started = std::time::Instant::now();
+        let mut stuck = Command::new("sleep");
+        stuck.arg("30");
+        let err = run_with_timeout(stuck, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("was stopped"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "a stuck helper is killed, not waited for");
+
+        let mut crash = Command::new("sh");
+        crash.args(["-c", "kill -9 $$"]);
+        assert!(run_with_timeout(crash, std::time::Duration::from_secs(5)).unwrap_err().to_string().contains("unexpectedly"));
+    }
+
+    #[test]
+    fn interrupted_work_is_found_and_settled() {
+        let base = std::env::temp_dir().join(format!("dev-inbox-interrupted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let conn = crate::db::open(&base.join("db.sqlite3")).unwrap();
+        let dir = base.join("m1");
+        create(&conn, "m1", "Standup", "2026-10-16T09:00:00Z", &dir).unwrap();
+        create(&conn, "m2", "Planning", "2026-10-16T10:00:00Z", &base.join("m2")).unwrap();
+        finish_recording(&conn, "m2", "2026-10-16T10:30:00Z", 1800, "mic").unwrap();
+        let ids: Vec<(String, String)> = unfinished(&conn).unwrap().into_iter().map(|(id, status, ..)| (id, status)).collect();
+        assert_eq!(ids, [("m1".to_string(), "recording".to_string()), ("m2".to_string(), "transcribing".to_string())]);
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mic.m4a"), vec![0u8; 4096]).unwrap();
+        interrupted_recording(&conn, "m1", Some(&dir)).unwrap();
+        let (m, _) = get(&conn, "m1").unwrap().unwrap();
+        assert_eq!(m.status, "failed");
+        assert_eq!(m.sources.as_deref(), Some("mic"));
+        assert!(m.error.unwrap().contains("Try again"));
+        assert!(m.ended_at.is_some() && m.seconds.is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn merges_and_drops_echo() {
         let you = vec![
             seg(0.0, 3.0, "you", "Morning, shall we start with the release?"),
@@ -360,8 +483,8 @@ mod live_tests {
     #[ignore]
     fn meeting_pipeline() {
         let dir = std::path::PathBuf::from(std::env::var("MEETING_DIR").expect("MEETING_DIR"));
-        let you = super::transcribe_file(&dir.join("mic.m4a"), "you", "en_GB").unwrap();
-        let others = super::transcribe_file(&dir.join("system.m4a"), "others", "en_GB").unwrap();
+        let you = super::transcribe_file(&dir.join("mic.m4a"), "you", "en_GB", std::time::Duration::from_secs(600)).unwrap();
+        let others = super::transcribe_file(&dir.join("system.m4a"), "others", "en_GB", std::time::Duration::from_secs(600)).unwrap();
         let merged = super::merge(you, others);
         for s in &merged {
             println!("{:>5.1}s  {:<6}  {}", s.start, s.speaker, s.text);

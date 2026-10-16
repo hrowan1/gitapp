@@ -69,9 +69,12 @@ pub fn transcript_text(segments: &[Segment]) -> String {
 pub fn on_device(meeting_id: &str, transcript: &str) -> Result<Summary> {
     let path = std::env::temp_dir().join(format!("dev-inbox-transcript-{meeting_id}.txt"));
     std::fs::write(&path, transcript)?;
-    let out = std::process::Command::new(crate::meetings::helper_path()?).arg("summarise").arg(&path).output();
+    let out = crate::meetings::run_helper(
+        &[std::ffi::OsStr::new("summarise"), path.as_os_str()],
+        std::time::Duration::from_secs(15 * 60),
+    );
     let _ = std::fs::remove_file(&path);
-    parse_helper_output(&String::from_utf8_lossy(&out?.stdout))
+    parse_helper_output(&out.context("Summarising on this Mac")?)
 }
 
 fn parse_helper_output(stdout: &str) -> Result<Summary> {

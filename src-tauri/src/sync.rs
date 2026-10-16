@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::db::{self, ActivityRow, Personal, PrRef, Tracked};
+use crate::Relock;
 use crate::derive::{self, fmt_ts, is_actionable, parse_ts, Ci, Derived};
 use crate::github::{Client, Issue, PullRequest};
 use crate::intent;
@@ -300,7 +301,7 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
     // Pushes age out of GitHub's event feed quickly, so capture them every sync. Not fatal if it fails.
     let pushes = client.recent_pushes(me).await.unwrap_or_default();
     let (to_fetch, full, check_branches, first_branch_check, active) = {
-        let conn = db_lock.lock().unwrap();
+        let conn = db_lock.relock();
         let older_than = |key: &str, minutes: i64| -> Result<bool> {
             Ok(db::get_setting(&conn, key)?.and_then(|s| parse_ts(&s)).map_or(true, |t| now - t > chrono::Duration::minutes(minutes)))
         };
@@ -324,7 +325,7 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
     let branches = if check_branches && !active.is_empty() { Some(client.default_branches(&active).await?) } else { None };
 
     let stale = {
-        let conn = db_lock.lock().unwrap();
+        let conn = db_lock.relock();
         let mut pass = Pass {
             sync_id,
             now,
@@ -436,11 +437,11 @@ pub async fn run(client: &Client, db_lock: &Mutex<Connection>, ctx: &derive::Ctx
     let refreshed = if stale.is_empty() { Default::default() } else { client.items_by_id(&stale).await? };
 
     // Snoozes waiting on another PR/issue ("come back after #392 merges").
-    let waits = db::waiting_on_refs(&db_lock.lock().unwrap())?;
+    let waits = db::waiting_on_refs(&db_lock.relock())?;
     let keys: Vec<String> = waits.iter().map(|(_, k, _)| k.clone()).collect::<HashSet<_>>().into_iter().collect();
     let ref_states = if keys.is_empty() { HashMap::new() } else { client.ref_states(&keys).await? };
 
-    let conn = db_lock.lock().unwrap();
+    let conn = db_lock.relock();
     let mut pass = Pass { sync_id, now, first_sync: false, baseline: None, titles: Vec::new(), notices: &mut notices };
     for id in &stale {
         db::mark_gone(&conn, id)?;
@@ -547,6 +548,7 @@ pub fn digest(conn: &Connection) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod live_tests {
+    use crate::Relock;
     /// End-to-end sync into a throwaway database (read-only against GitHub):
     /// `GITHUB_TOKEN=$(gh auth token) cargo test live_sync -- --ignored --nocapture`
     #[tokio::test]
@@ -564,7 +566,7 @@ mod live_tests {
         let t = std::time::Instant::now();
         let second = super::run(&client, &db, &ctx).await.unwrap();
         println!("second sync: needs_you={} notices={} in {:?}", second.needs_you, second.notices.len(), t.elapsed());
-        let conn = db.lock().unwrap();
+        let conn = db.relock();
         let items = crate::db::list_items(&conn).unwrap();
         let mut counts = std::collections::BTreeMap::new();
         for i in &items {
