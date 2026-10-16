@@ -79,6 +79,7 @@ const KIND_WORDS: Record<string, [string, string]> = {
   opened: ["PR opened", "PRs opened"],
   merged: ["merge", "merges"],
   jira: ["Jira update", "Jira updates"],
+  meeting: ["recorded meeting", "recorded meetings"],
 };
 
 export function eventSummary(kinds: string[]): string {

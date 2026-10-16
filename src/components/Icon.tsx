@@ -174,6 +174,15 @@ const PATHS = {
       <path d="M13 5v2M13 11v2M13 17v2" />
     </>
   ),
+  mic: (
+    <>
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8" />
+    </>
+  ),
+  stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
+  play: <path d="M7 4v16l13-8z" />,
+  pause: <path d="M8 4v16M16 4v16" />,
   sparkle: <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />,
   layers: (
     <>

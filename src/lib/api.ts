@@ -108,6 +108,37 @@ export interface Settings {
   digest: boolean;
   digestHour: number;
   trackLocal: boolean;
+  /** Days to keep meeting audio: 0 forever, -1 delete once transcribed. */
+  audioRetentionDays: number;
+}
+
+export interface RecordingStatus {
+  recording: boolean;
+  meetingId?: string | null;
+  startedAt?: string | null;
+}
+
+export interface Meeting {
+  id: string;
+  title: string;
+  startedAt: string;
+  endedAt?: string | null;
+  seconds?: number | null;
+  /** recording | transcribing | done | failed */
+  status: string;
+  error?: string | null;
+  ticket?: string | null;
+  hasAudio: boolean;
+  audioDir?: string | null;
+  sources?: string | null;
+  preview?: string | null;
+}
+
+export interface Segment {
+  start: number;
+  end: number;
+  speaker: "you" | "others";
+  text: string;
 }
 
 export interface TimeBlock {
@@ -244,6 +275,14 @@ export const api = {
   jiraSyncNow: () => invoke<void>("jira_sync_now"),
   getTickets: () => invoke<Ticket[]>("get_tickets"),
   getTicket: (key: string) => invoke<TicketDetail>("get_ticket", { key }),
+  recordingStatus: () => invoke<RecordingStatus>("recording_status"),
+  startRecording: (title?: string) => invoke<RecordingStatus>("start_recording", { title: title ?? null }),
+  stopRecording: () => invoke<void>("stop_recording"),
+  listMeetings: () => invoke<Meeting[]>("list_meetings"),
+  getMeeting: (id: string) => invoke<{ meeting: Meeting; segments: Segment[] }>("get_meeting", { id }),
+  updateMeeting: (id: string, title: string, ticket: string | null) => invoke<void>("update_meeting", { id, title, ticket }),
+  deleteMeeting: (id: string) => invoke<void>("delete_meeting", { id }),
+  retranscribeMeeting: (id: string) => invoke<void>("retranscribe_meeting", { id }),
   getFollowing: () => invoke<FollowItem[]>("get_following"),
   setFollowed: (ids: string[], followed: boolean) => invoke<void>("set_followed", { ids, followed }),
   getActivity: (days: number) => invoke<Activity[]>("get_activity", { days }),

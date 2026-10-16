@@ -51,6 +51,7 @@ Build a release `.app`/`.dmg`: `npm run tauri build`.
   - **Open in editor**: finds your clones by scanning your home folder (or folders you choose) for GitHub remotes and opens the repo in your editor (VS Code, Cursor, Zed, JetBrains, Xcode… whatever's installed). **Check out & open** switches to the PR branch first, **only if the working tree is clean**. Not cloned? It offers to clone it (via `gh`) into `~/code`.
   - Re-run failed GitHub Actions workflows; copy `gh pr checkout`.
 - **Tickets** (`4`, Jira Cloud, read-only): every ticket that is or was assigned to you (last 30 days on first connect), its current status, how it moved (status, assignment, resolution, your comments — who and when), and the PRs that mention its key. Click a movement to open that day. Connect in Settings with your site, Atlassian email and an API token (stored in the keychain). Nothing is written to Jira.
+- **Meetings** (`5`, macOS 14.2+): press **Record** to capture your microphone *and* the meeting's audio (Zoom, Meet, Teams — anything playing on the Mac) as two tracks, then **Stop** for an on-device transcript (macOS 26 Speech framework; nothing is uploaded). Lines are labelled *You* / *Others* by track, and echoes of the call in your mic are dropped. Find in the transcript, click a line to play from there, copy it, and link the meeting to a ticket (guessed from the title) so it shows as an exact block in the Day view. Recording only ever starts when you press Record (or "Start recording" in ⌘K); the sidebar shows **● REC** throughout. Audio is kept 30 days by default (Settings: 7/30/90 days, forever, or delete once transcribed); transcripts are kept. *You're responsible for telling people you're recording* — there's a one-click notice to paste into the chat.
 - **Day view** (`3` or `s`): pick any date to see what you worked on and for how long — a timeline of blocks grouped by **ticket** (Jira keys from branch names, PR titles or commit messages; otherwise PR, branch or repo), a week strip with daily totals, and per-ticket breakdowns. Time is estimated from your PR commits (authored time), pushes (captured every sync), reviews, comments, your own Jira moves and comments (tickets moved by others are shown but add no time), local `git log`, and — optionally — local editing activity sampled every 5 minutes from your clones (repo, branch and time only; never leaves your Mac). Edit, add or delete blocks (a day you edit stops auto-updating; reset any time), and copy a readable summary. Blocks are shaped like Jira worklogs, ready for a Jira integration.
 - **Menu bar / tray** with a monochrome icon and needs-you count; closing the window keeps it running. Global shortcut **⌥⌘K** (Ctrl+Alt+K elsewhere).
 - **Desktop notifications** when something new needs you (bursts are collapsed); on macOS, clicking one opens the PR/issue. Optional **morning summary** on weekdays.
@@ -58,7 +59,7 @@ Build a release `.app`/`.dmg`: `npm run tauri build`.
 
 Mouse: click a row for its actions menu (open, reply, approve, merge, editor, come back later, mark as…) · double-click opens it on GitHub · right-click also opens the menu.
 
-Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `R` reply · `a` approve · `m` merge · `c` check out & open in editor · `s` Day view · `r` sync · `1`–`7` switch views · `?` all shortcuts · `⌘K` or `/` command bar.
+Keyboard: `j`/`k` move · `↵`/`o` open (or expand a group) · `e` done · `l` come back later / more · `x` reset to automatic · `R` reply · `a` approve · `m` merge · `c` check out & open in editor · `s` Day view · `r` sync · `1`–`8` switch views · `?` all shortcuts · `⌘K` or `/` command bar.
 
 ## How syncing works
 
@@ -80,12 +81,16 @@ src-tauri/src/
   editor.rs   finding local clones, safe branch checkout, launching the editor, local activity (unit tested)
   day.rs      Day view: events → ticket-grouped time blocks, corrections (unit tested)
   jira.rs     Jira Cloud (read-only): assigned-ever tickets, bulk changelogs, storage (unit tested)
+  meetings.rs recorder sidecar control, transcript merge/echo removal, storage, retention (unit tested)
+src-tauri/recorder/Recorder.swift   the dev-inbox-recorder sidecar: mic (AVAudioEngine) + system audio
+                                    (Core Audio process tap) to AAC, and SpeechAnalyzer transcription;
+                                    compiled by build.rs with `xcrun swiftc`
   sync.rs     sync pass, memory updates, notifications
   db.rs       SQLite schema & queries
   demo.rs     fictional seed data for DEV_INBOX_DEMO=1
   lib.rs      Tauri commands, tray, poller, global shortcut
 src/
-  App.tsx, components/   sidebar shell, Today / Inbox (list + detail pane), Day, History, Following, Settings, ⌘K
+  App.tsx, components/   sidebar shell, Today / Inbox (list + detail pane), Day, Tickets, Meetings, History, Following, Settings, ⌘K
   lib/query.ts           command-bar intent parsing
   lib/day.ts             day boundaries, durations, colours, summary text
   lib/states.ts          state metadata & Today sections
@@ -102,6 +107,8 @@ GITHUB_TOKEN=$(gh auth token) cargo test live -- --ignored --nocapture    # read
 ## Known limitations / next steps
 
 - Notifications in `tauri dev` are attributed to Terminal on macOS (so Terminal's notification settings apply); a built `.app` uses its own identity. Settings → "send a test" checks they arrive.
+- In `tauri dev`, the Microphone and **Screen & System Audio Recording** prompts are attributed to Terminal (or your editor's terminal). If meeting audio stays silent, allow it in System Settings → Privacy & Security and restart the app. Transcription needs macOS 26+; on first use it downloads the speech model for your language.
+- Speaker labels are per track, not per person: everyone on the call is "Others". Spoken ticket keys rarely transcribe cleanly, so set the ticket from the title or by hand.
 - Each `cargo` rebuild changes the binary signature, so macOS may ask again for keychain access in development.
 - Re-running checks only works for GitHub Actions; other CI providers are named so you can re-run them from their own dashboards.
 - Reminders from comments only read comments written after you first installed the app, so old history doesn't flood in.

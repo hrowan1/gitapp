@@ -407,6 +407,33 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
         </section>
       )}
 
+      {settings && (
+        <section className="card">
+          <h2>Meetings</h2>
+          <p className="muted">
+            Recordings and transcripts stay on this Mac; transcription uses macOS's on-device speech recognition.
+            Transcripts are always kept.
+          </p>
+          <label className="field">
+            <span>Keep meeting audio</span>
+            <select
+              value={settings.audioRetentionDays}
+              onChange={(e) => save({ ...settings, audioRetentionDays: Number(e.target.value) })}
+            >
+              <option value={-1}>Delete once transcribed</option>
+              <option value={7}>7 days</option>
+              <option value={30}>30 days</option>
+              <option value={90}>90 days</option>
+              <option value={0}>Forever</option>
+            </select>
+          </label>
+          <p className="muted small">
+            The first recording asks for Microphone and Screen &amp; System Audio Recording permission (System Settings →
+            Privacy &amp; Security).
+          </p>
+        </section>
+      )}
+
       <JiraCard />
 
       {settings && <IgnoredUsers settings={settings} onSave={save} />}

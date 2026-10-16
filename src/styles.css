@@ -2024,3 +2024,159 @@ a {
   padding: 0 7px;
   flex-shrink: 0;
 }
+
+/* ---------- meetings ---------- */
+
+.recorder {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.recorder.live {
+  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+  background: color-mix(in srgb, var(--red-bg) 55%, var(--surface));
+}
+.rec-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.rec-btn,
+.recorder button.danger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--red);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.rec-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.consent {
+  margin: 0;
+}
+.meter {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.meter-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.meter-bar span {
+  display: block;
+  height: 100%;
+  background: var(--green);
+  transition: width 0.25s;
+}
+.rec-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--red);
+  letter-spacing: 0.04em;
+}
+.title-input {
+  width: 100%;
+  font-size: 18px;
+  font-weight: 650;
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 4px 6px;
+  margin: 6px 0 4px -6px;
+}
+.title-input:hover {
+  border-color: var(--border);
+}
+.meeting-fields {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.meeting-fields .field {
+  flex: 1;
+  margin: 0;
+}
+.meeting-fields .field > span:first-child {
+  min-width: 110px;
+}
+.error-callout {
+  background: var(--red-bg);
+}
+.error-callout .icon {
+  color: var(--red);
+}
+.player {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+.transcript-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.transcript-head .group-label {
+  margin-bottom: 0;
+}
+.small-search {
+  flex: 0 1 160px;
+  min-width: 100px;
+}
+.small-search input {
+  padding: 3px 0;
+  font-size: 12px;
+}
+.line {
+  display: grid;
+  grid-template-columns: 44px 52px 1fr;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: default;
+}
+.line:hover {
+  background: var(--hover);
+}
+.line-time {
+  color: var(--faint);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  padding-top: 1px;
+}
+.line-who {
+  font-size: 11.5px;
+  font-weight: 650;
+  padding-top: 1px;
+}
+.speaker-you .line-who {
+  color: var(--accent);
+}
+.speaker-others .line-who {
+  color: var(--blue);
+}
+.line-text {
+  overflow-wrap: anywhere;
+}

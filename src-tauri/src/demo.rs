@@ -325,7 +325,7 @@ mod tests {
         let titles = crate::jira::titles(&conn).unwrap();
         let mut events = crate::day::gather(&conn, &s, &e).unwrap();
         events.extend(crate::day::jira_events(&conn, &s, &e, &titles).unwrap());
-        let r = crate::day::build(&y.to_string(), events, None, start, end, &titles);
+        let r = crate::day::build(&y.to_string(), events, None, start, end, &titles, &[]);
         if std::env::var("DAY_JSON").is_ok() {
             println!("DAYJSON {}", serde_json::to_string(&r).unwrap());
             println!("TICKETSJSON {}", serde_json::to_string(&crate::jira::list_tickets(&conn).unwrap()).unwrap());

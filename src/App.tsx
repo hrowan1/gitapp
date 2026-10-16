@@ -14,6 +14,8 @@ import { onDialog, type DialogRequest } from "./lib/dialog";
 import { ActionDialog } from "./components/ActionDialog";
 import { DayView } from "./components/DayView";
 import { TicketsView } from "./components/TicketsView";
+import { MeetingsView } from "./components/MeetingsView";
+import type { RecordingStatus } from "./lib/api";
 import "./styles.css";
 
 export default function App() {
@@ -29,6 +31,10 @@ export default function App() {
   const [shortcuts, setShortcuts] = useState(false);
   /** A date to show in the Day view (e.g. from a ticket's history). */
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
+  const [recording, setRecording] = useState<RecordingStatus>({ recording: false });
+  const refreshRecording = useCallback(() => {
+    api.recordingStatus().then(setRecording).catch(() => {});
+  }, []);
   const overlay = palette || !!dialog || shortcuts;
 
   useEffect(() => onDialog(setDialog), []);
@@ -67,13 +73,22 @@ export default function App() {
       listen("sync-started", () => setSyncing(true)),
       listen("open-palette", () => setPalette(true)),
       listen("jira-updated", () => setVersion((v) => v + 1)),
+      listen("meetings-updated", () => {
+        refreshRecording();
+        setVersion((v) => v + 1);
+      }),
+      listen("recording-event", refreshRecording),
     ];
     const tick = setInterval(() => setNow(Date.now()), 30_000);
     return () => {
       unlisten.forEach((p) => p.then((f) => f()));
       clearInterval(tick);
     };
-  }, [session, reload]);
+  }, [session, reload, refreshRecording]);
+
+  useEffect(() => {
+    if (session) refreshRecording();
+  }, [session, refreshRecording]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -118,6 +133,7 @@ export default function App() {
         onSync={sync}
         onAsk={() => setPalette(true)}
         onShortcuts={() => setShortcuts(true)}
+        recording={recording.recording}
       />
 
       <main className="main">
@@ -130,7 +146,7 @@ export default function App() {
             </button>
           </div>
         )}
-        {firstLoad && !["settings", "following", "day", "tickets"].includes(view) ? (
+        {firstLoad && !["settings", "following", "day", "tickets", "meetings"].includes(view) ? (
           <div className="empty big">
             <Icon name="refresh" size={22} className="spin" />
             <p>Fetching your pull requests and issues from GitHub…</p>
@@ -141,6 +157,16 @@ export default function App() {
             {view === "today" && <Today items={items} now={now} active={!overlay} />}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
             {view === "day" && <DayView version={version} target={dayTarget} />}
+            {view === "meetings" && (
+              <MeetingsView
+                version={version}
+                recording={recording}
+                onOpenDay={(day) => {
+                  setDayTarget({ day });
+                  setView("day");
+                }}
+              />
+            )}
             {view === "tickets" && (
               <TicketsView
                 version={version}

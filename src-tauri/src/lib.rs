@@ -6,6 +6,7 @@ mod editor;
 mod github;
 mod intent;
 mod jira;
+mod meetings;
 mod sync;
 
 use rusqlite::Connection;
@@ -30,6 +31,8 @@ pub struct AppState {
     /// Jira API token, read from the keychain once per launch.
     jira_token: Mutex<Option<String>>,
     jira_lock: tokio::sync::Mutex<()>,
+    /// The meeting being recorded, if any.
+    recorder: Mutex<Option<meetings::Recording>>,
     sync_lock: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
     /// `DEV_INBOX_DEMO=1`: fictional data in a separate database, never synced.
@@ -731,6 +734,13 @@ struct Settings {
     /// Sample local clones for editing activity (feeds the Day view). Stays on this machine.
     #[serde(default = "yes")]
     track_local: bool,
+    /// Days to keep meeting audio: 0 forever, -1 delete once transcribed.
+    #[serde(default = "thirty")]
+    audio_retention_days: i64,
+}
+
+fn thirty() -> i64 {
+    30
 }
 
 fn yes() -> bool {
@@ -760,6 +770,7 @@ fn get_settings(state: State<AppState>) -> Settings {
         digest: state.setting("digest").as_deref() != Some("0"),
         digest_hour: digest_hour(&state),
         track_local: state.setting("track_local").as_deref() != Some("0"),
+        audio_retention_days: audio_retention_days(&state),
     }
 }
 
@@ -772,6 +783,7 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "digest", if settings.digest { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "digest_hour", &settings.digest_hour.min(23).to_string()).map_err(err)?;
         db::set_setting(&conn, "track_local", if settings.track_local { "1" } else { "0" }).map_err(err)?;
+        db::set_setting(&conn, "audio_retention_days", &settings.audio_retention_days.to_string()).map_err(err)?;
         let ignored = settings.ignored_users.join(",");
         if db::get_setting(&conn, "ignored_users").map_err(err)?.unwrap_or_default() != ignored {
             db::set_setting(&conn, "ignored_users", &ignored).map_err(err)?;
@@ -998,6 +1010,208 @@ fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
     Ok(TicketDetail { events, prs })
 }
 
+// ---------- Meetings ----------
+
+/// Days to keep meeting audio (transcripts are always kept). 0 = forever, -1 = delete once transcribed.
+fn audio_retention_days(state: &AppState) -> i64 {
+    state.setting("audio_retention_days").and_then(|v| v.parse().ok()).unwrap_or(30)
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordingStatus {
+    recording: bool,
+    meeting_id: Option<String>,
+    started_at: Option<String>,
+}
+
+fn recording_status_of(state: &AppState) -> RecordingStatus {
+    let id = state.recorder.lock().unwrap().as_ref().map(|r| r.meeting_id.clone());
+    let started_at = id.as_ref().and_then(|id| {
+        state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT started_at FROM meetings WHERE id = ?1", [id], |r| r.get(0))
+            .ok()
+    });
+    RecordingStatus { recording: id.is_some(), meeting_id: id, started_at }
+}
+
+#[tauri::command]
+fn recording_status(state: State<AppState>) -> RecordingStatus {
+    recording_status_of(&state)
+}
+
+/// Transcribe both tracks on-device, merge them, store; then apply "delete audio after transcript".
+fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let locale = app.state::<AppState>().setting("transcribe_locale").unwrap_or_default();
+        let track = |name: &str, speaker: &str| -> anyhow::Result<Vec<meetings::Segment>> {
+            let path = dir.join(name);
+            if path.exists() && std::fs::metadata(&path).map(|m| m.len() > 1024).unwrap_or(false) {
+                meetings::transcribe_file(&path, speaker, &locale)
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let result = track("mic.m4a", "you").and_then(|you| Ok(meetings::merge(you, track("system.m4a", "others")?)));
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        match result {
+            Ok(segments) => {
+                let _ = meetings::save_transcript(&conn, &id, &segments);
+                if audio_retention_days(&state) < 0 {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    let _ = conn.execute("UPDATE meetings SET audio_deleted = 1 WHERE id = ?1", [&id]);
+                }
+            }
+            Err(e) => {
+                let _ = meetings::set_status(&conn, &id, "failed", Some(&format!("{e:#}")));
+            }
+        }
+        drop(conn);
+        let _ = app.emit("meetings-updated", ());
+    });
+}
+
+fn set_recording_tray(app: &AppHandle, on: bool) {
+    if let Some(tray) = app.tray_by_id("main") {
+        if on {
+            let _ = tray.set_title(Some("● REC"));
+        } else {
+            refresh_count(app);
+        }
+    }
+}
+
+/// Start recording a meeting (mic + meeting audio). Only ever started by the user.
+#[tauri::command]
+fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<RecordingStatus> {
+    let state = app.state::<AppState>();
+    if state.demo {
+        return Err("Recording isn't available in demo mode".into());
+    }
+    if state.recorder.lock().unwrap().is_some() {
+        return Err("Already recording".into());
+    }
+    let started = chrono::Utc::now();
+    let id = format!("m{}", started.timestamp_millis());
+    let dir = app.path().app_data_dir().map_err(err)?.join("meetings").join(&id);
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| format!("Meeting {}", started.with_timezone(&chrono::Local).format("%H:%M")));
+    meetings::create(&state.db.lock().unwrap(), &id, &title, &derive::fmt_ts(started), &dir).map_err(err)?;
+
+    let handle = app.clone();
+    let meeting_id = id.clone();
+    let rec_dir = dir.clone();
+    let recording = meetings::start(&id, &dir, move |ev| {
+        let state = handle.state::<AppState>();
+        match ev["event"].as_str() {
+            Some("level") => {
+                let _ = handle.emit("recording-level", &ev);
+            }
+            Some("started") | Some("warning") => {
+                let _ = handle.emit("recording-event", &ev);
+            }
+            Some("error") => {
+                let msg = ev["message"].as_str().unwrap_or("Recording failed").to_string();
+                let _ = meetings::set_status(&state.db.lock().unwrap(), &meeting_id, "failed", Some(&msg));
+                state.recorder.lock().unwrap().take();
+                set_recording_tray(&handle, false);
+                let _ = handle.emit("recording-event", &ev);
+                let _ = handle.emit("meetings-updated", ());
+            }
+            Some("stopped") => {
+                let ended = derive::fmt_ts(chrono::Utc::now());
+                let sources = ev["sources"].as_array().map(|a| {
+                    a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+                });
+                let seconds = ev["seconds"].as_i64().unwrap_or(0);
+                let _ = meetings::finish_recording(
+                    &state.db.lock().unwrap(),
+                    &meeting_id,
+                    &ended,
+                    seconds,
+                    &sources.unwrap_or_default(),
+                );
+                let _ = handle.emit("recording-event", &ev);
+                let _ = handle.emit("meetings-updated", ());
+                transcribe_meeting(handle.clone(), meeting_id.clone(), rec_dir.clone());
+            }
+            _ => {}
+        }
+    })
+    .map_err(|e| {
+        let _ = meetings::set_status(&state.db.lock().unwrap(), &id, "failed", Some(&format!("{e:#}")));
+        format!("{e:#}")
+    })?;
+    *state.recorder.lock().unwrap() = Some(recording);
+    set_recording_tray(&app, true);
+    let _ = app.emit("meetings-updated", ());
+    Ok(recording_status_of(&state))
+}
+
+#[tauri::command]
+async fn stop_recording(app: AppHandle) -> CmdResult<()> {
+    let recording = app.state::<AppState>().recorder.lock().unwrap().take().ok_or("Not recording")?;
+    tauri::async_runtime::spawn_blocking(move || meetings::stop(recording)).await.map_err(err)?.map_err(err)?;
+    set_recording_tray(&app, false);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_meetings(state: State<AppState>) -> CmdResult<Vec<meetings::Meeting>> {
+    meetings::list(&state.db.lock().unwrap()).map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingDetail {
+    meeting: meetings::Meeting,
+    segments: Vec<meetings::Segment>,
+}
+
+#[tauri::command]
+fn get_meeting(state: State<AppState>, id: String) -> CmdResult<MeetingDetail> {
+    let (meeting, segments) = meetings::get(&state.db.lock().unwrap(), &id).map_err(err)?.ok_or("Unknown meeting")?;
+    Ok(MeetingDetail { meeting, segments })
+}
+
+#[tauri::command]
+fn update_meeting(app: AppHandle, id: String, title: String, ticket: Option<String>) -> CmdResult<()> {
+    meetings::update(&app.state::<AppState>().db.lock().unwrap(), &id, &title, ticket.as_deref()).map_err(err)?;
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_meeting(app: AppHandle, id: String) -> CmdResult<()> {
+    meetings::delete(&app.state::<AppState>().db.lock().unwrap(), &id).map_err(err)?;
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
+}
+
+/// Retry transcription (e.g. after it failed, or to pick up a language change).
+#[tauri::command]
+fn retranscribe_meeting(app: AppHandle, id: String) -> CmdResult<()> {
+    let dir = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        meetings::set_status(&conn, &id, "transcribing", None).map_err(err)?;
+        let (m, _) = meetings::get(&conn, &id).map_err(err)?.ok_or("Unknown meeting")?;
+        if !m.has_audio {
+            return Err("The audio for this meeting has been deleted".into());
+        }
+        std::path::PathBuf::from(m.audio_dir.ok_or("No audio")?)
+    };
+    let _ = app.emit("meetings-updated", ());
+    transcribe_meeting(app, id, dir);
+    Ok(())
+}
+
 // ---------- Day view ----------
 
 /// Every few minutes, note which local clones changed (branch, dirty files, mtimes).
@@ -1006,8 +1220,14 @@ fn start_local_tracker(app: AppHandle) {
     const EVERY: Duration = Duration::from_secs(300);
     std::thread::spawn(move || {
         let mut last: std::collections::HashMap<String, u64> = Default::default();
+        let mut ticks: u64 = 0;
         loop {
             let state = app.state::<AppState>();
+            if ticks % 12 == 0 {
+                let days = audio_retention_days(&state);
+                let _ = meetings::apply_retention(&state.db.lock().unwrap(), days);
+            }
+            ticks += 1;
             if !state.demo && state.setting("track_local").as_deref() != Some("0") && state.setting("login").is_some() {
                 for (repo, path) in clones(&state) {
                     let Some(s) = editor::sample(&path) else { continue };
@@ -1045,8 +1265,9 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
     let mut events = day::gather(&conn, &start, &end).map_err(err)?;
     events.extend(day::local_events(&conn, local).map_err(err)?);
     events.extend(day::jira_events(&conn, &start, &end, &titles).map_err(err)?);
+    let meeting_spans = meetings::day_spans(&conn, &start, &end).map_err(err)?;
     let manual = day::manual_blocks(&conn, &day).map_err(err)?;
-    Ok(day::build(&day, events, manual, s, e, &titles))
+    Ok(day::build(&day, events, manual, s, e, &titles, &meeting_spans))
 }
 
 /// Save corrected blocks for a day (freezes it).
@@ -1131,6 +1352,7 @@ pub fn run() {
                 token: Mutex::new(None),
                 jira_token: Mutex::new(None),
                 jira_lock: tokio::sync::Mutex::new(()),
+                recorder: Mutex::new(None),
                 sync_lock: tokio::sync::Mutex::new(()),
                 wake: tokio::sync::Notify::new(),
                 demo,
@@ -1200,6 +1422,14 @@ pub fn run() {
             jira_sync_now,
             get_tickets,
             get_ticket,
+            recording_status,
+            start_recording,
+            stop_recording,
+            list_meetings,
+            get_meeting,
+            update_meeting,
+            delete_meeting,
+            retranscribe_meeting,
             submit_review,
             send_comment,
             merge_options,

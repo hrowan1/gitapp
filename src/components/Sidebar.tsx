@@ -8,9 +8,10 @@ export const NAV: { id: View; label: string; icon: IconName; key: string }[] = [
   { id: "all", label: "Inbox", icon: "inbox", key: "2" },
   { id: "day", label: "Day", icon: "calendar", key: "3" },
   { id: "tickets", label: "Tickets", icon: "ticket", key: "4" },
-  { id: "history", label: "History", icon: "history", key: "5" },
-  { id: "following", label: "Following", icon: "eye", key: "6" },
-  { id: "settings", label: "Settings", icon: "settings", key: "7" },
+  { id: "meetings", label: "Meetings", icon: "mic", key: "5" },
+  { id: "history", label: "History", icon: "history", key: "6" },
+  { id: "following", label: "Following", icon: "eye", key: "7" },
+  { id: "settings", label: "Settings", icon: "settings", key: "8" },
 ];
 
 export function Sidebar({
@@ -24,6 +25,7 @@ export function Sidebar({
   onSync,
   onAsk,
   onShortcuts,
+  recording,
 }: {
   view: View;
   onView: (v: View) => void;
@@ -35,6 +37,8 @@ export function Sidebar({
   onSync: () => void;
   onAsk: () => void;
   onShortcuts: () => void;
+  /** A meeting is being recorded: show it everywhere. */
+  recording: boolean;
 }) {
   return (
     <nav className="sidebar">
@@ -61,6 +65,7 @@ export function Sidebar({
           >
             <Icon name={n.icon} size={16} />
             <span className="nav-label">{n.label}</span>
+            {n.id === "meetings" && recording && <span className="rec-badge">● REC</span>}
             {!!counts[n.id] && <span className={`nav-count${n.id === "today" ? " hot" : ""}`}>{counts[n.id]}</span>}
           </button>
         ))}

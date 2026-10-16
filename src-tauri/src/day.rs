@@ -52,6 +52,8 @@ pub struct WorkEvent {
     pub ticket: Option<String>,
     /// Whether it implies time spent. Others moving your ticket is shown but adds no time.
     pub counts: bool,
+    /// An explicit (key, label) group, e.g. a recorded meeting with no ticket.
+    pub group: Option<(String, String)>,
 }
 
 static BRANCH_TICKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:^|[/_\-.])([a-z]{2,}[a-z0-9]*-\d{1,6})(?:$|[/_\-.])").unwrap());
@@ -83,6 +85,9 @@ fn short_repo(repo: &str) -> &str {
 
 /// What an event counts towards: (key, label, url). Ticket > PR > branch > repo.
 pub fn work_key(e: &WorkEvent) -> (String, String, Option<String>) {
+    if let Some((key, label)) = &e.group {
+        return (key.clone(), label.clone(), e.url.clone());
+    }
     if let Some(t) = &e.ticket {
         return (format!("T:{t}"), t.clone(), e.url.clone());
     }
@@ -189,7 +194,26 @@ pub fn build(
     day_start: Ts,
     day_end: Ts,
     titles: &Titles,
+    meetings: &[(String, String, String, String)],
 ) -> DayReport {
+    // Recorded meetings are exact: listed as events and added as fixed blocks below.
+    for (key, label, start, end) in meetings {
+        let (Some(s), Some(e)) = (parse_ts(start), parse_ts(end)) else { continue };
+        let ticket = key.strip_prefix("T:").map(String::from);
+        events.push(WorkEvent {
+            at: s,
+            kind: "meeting".into(),
+            repo: String::new(),
+            branch: None,
+            pr: None,
+            text: format!("Recorded meeting ({}m)", (e - s).num_minutes().max(1)),
+            url: None,
+            dedupe: None,
+            group: if ticket.is_some() { None } else { Some((key.clone(), label.clone())) },
+            ticket,
+            counts: false,
+        });
+    }
     // A commit seen both locally and on GitHub counts once.
     let mut seen = std::collections::HashSet::new();
     events.retain(|e| e.dedupe.as_ref().map_or(true, |d| seen.insert(d.clone())));
@@ -247,6 +271,15 @@ pub fn build(
         }
         if let Some(span) = cur {
             flush(span, &mut blocks);
+        }
+    }
+
+    for (key, _, start, end) in meetings {
+        let (Some(s), Some(e)) = (parse_ts(start), parse_ts(end)) else { continue };
+        let (s, e) = (s.max(day_start), e.min(day_end));
+        if e > s {
+            let label = by_key.get(key).map(|g| g.0.clone()).unwrap_or_default();
+            blocks.push(Block { id: None, key: key.clone(), label, start: fmt_ts(s), end: fmt_ts(e), minutes: (e - s).num_minutes(), note: None });
         }
     }
 
@@ -377,6 +410,7 @@ pub fn gather(conn: &Connection, start: &str, end: &str) -> Result<Vec<WorkEvent
             dedupe: key.strip_prefix("commit:").map(String::from),
             ticket: None,
             counts: true,
+            group: None,
         });
     }
 
@@ -399,6 +433,7 @@ pub fn gather(conn: &Connection, start: &str, end: &str) -> Result<Vec<WorkEvent
             dedupe: None,
             ticket: None,
             counts: true,
+            group: None,
         });
     }
     Ok(out)
@@ -424,6 +459,7 @@ pub fn local_events(conn: &Connection, commits: Vec<(String, crate::editor::Loca
             dedupe: Some(c.oid),
             ticket: None,
             counts: true,
+            group: None,
         });
     }
     Ok(out)
@@ -445,6 +481,7 @@ pub fn jira_events(conn: &Connection, start: &str, end: &str, titles: &Titles) -
                 dedupe: None,
                 ticket: Some(key),
                 counts: by_me,
+                group: None,
             })
         })
         .collect())
@@ -512,6 +549,7 @@ mod tests {
             dedupe: None,
             ticket: None,
             counts: true,
+            group: None,
         }
     }
 
@@ -535,7 +573,7 @@ mod tests {
             ev("13:00", "committed", Some("io-2641-search"), "Fix tests"),  // new session
             ev("10:30", "reviewed", None, "Approved the PR"),
         ];
-        let r = build("2026-10-14", events, None, t("00:00"), t("23:59"), &Titles::new());
+        let r = build("2026-10-14", events, None, t("00:00"), t("23:59"), &Titles::new(), &[]);
         let io: Vec<&Block> = r.blocks.iter().filter(|b| b.key == "T:IO-2641").collect();
         assert_eq!(io.len(), 2, "{:?}", r.blocks);
         assert_eq!(io[0].start, "2026-10-14T08:55:00Z");
@@ -553,7 +591,7 @@ mod tests {
         let mut b = ev("09:30", "local_commit", Some("abc-1-x"), "one");
         b.dedupe = Some("sha1".into());
         let c = ev("09:20", "reviewed", None, "Approved");
-        let r = build("d", vec![a, b, c], None, t("00:00"), t("23:59"), &Titles::new());
+        let r = build("d", vec![a, b, c], None, t("00:00"), t("23:59"), &Titles::new(), &[]);
         assert_eq!(r.groups.iter().map(|g| g.events.len()).sum::<usize>(), 2, "duplicate commit dropped");
         // 09:05–09:35 (commit) and 09:05–09:25 (review) overlap: 30 minutes total.
         assert_eq!(r.total_minutes, 30);
@@ -569,7 +607,7 @@ mod tests {
         let commit = ev("10:50", "committed", Some("abc-1-thing"), "Fix it");
         let mut titles = Titles::new();
         titles.insert("ABC-1".into(), ("Make it work".into(), "https://x.atlassian.net/browse/ABC-1".into(), "Done".into()));
-        let r = build("d", vec![moved, others, commit], None, t("00:00"), t("23:59"), &titles);
+        let r = build("d", vec![moved, others, commit], None, t("00:00"), t("23:59"), &titles, &[]);
         assert_eq!(r.groups.len(), 1, "commit and Jira moves are the same ticket");
         let g = &r.groups[0];
         assert_eq!(g.label, "ABC-1 · Make it work");
@@ -577,6 +615,23 @@ mod tests {
         assert_eq!(g.events.len(), 3);
         // 10:25–11:05 from the commit + your 11:00 move; the 15:00 move by someone else adds nothing.
         assert_eq!(r.total_minutes, 40);
+    }
+
+    #[test]
+    fn meetings_are_exact_blocks() {
+        let meetings = vec![
+            ("T:ABC-1".to_string(), "ABC-1".to_string(), "2026-10-14T10:00:00Z".to_string(), "2026-10-14T10:45:00Z".to_string()),
+            ("MTG:m1".to_string(), "Meeting · Standup".to_string(), "2026-10-14T09:00:00Z".to_string(), "2026-10-14T09:15:00Z".to_string()),
+        ];
+        let commit = ev("10:30", "committed", Some("abc-1-x"), "work");
+        let r = build("d", vec![commit], None, t("00:00"), t("23:59"), &Titles::new(), &meetings);
+        let standup = r.groups.iter().find(|g| g.key == "MTG:m1").expect("meeting without a ticket gets its own group");
+        assert_eq!(standup.minutes, 15);
+        assert_eq!(standup.label, "Meeting · Standup");
+        let abc = r.groups.iter().find(|g| g.key == "T:ABC-1").unwrap();
+        // Commit 10:05–10:35 overlaps the 10:00–10:45 meeting: counted once.
+        assert_eq!(abc.minutes, 45);
+        assert_eq!(r.total_minutes, 60);
     }
 
     #[test]
@@ -617,7 +672,7 @@ mod tests {
             minutes: 120,
             note: None,
         }];
-        let r = build("d", vec![ev("15:00", "committed", Some("abc-1-x"), "late")], Some(manual), t("00:00"), t("23:59"), &Titles::new());
+        let r = build("d", vec![ev("15:00", "committed", Some("abc-1-x"), "late")], Some(manual), t("00:00"), t("23:59"), &Titles::new(), &[]);
         assert!(r.frozen);
         assert_eq!(r.total_minutes, 120);
         assert_eq!(r.blocks.len(), 1);

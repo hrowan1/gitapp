@@ -157,6 +157,37 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 5 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Meetings the user recorded. Audio lives in <app data>/meetings/<id>/ until retention removes it.
+            CREATE TABLE IF NOT EXISTS meetings (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                seconds INTEGER,
+                status TEXT NOT NULL,          -- recording | transcribing | done | failed
+                error TEXT,
+                ticket TEXT,                   -- Jira-style key the meeting counts towards
+                audio_dir TEXT,
+                audio_deleted INTEGER NOT NULL DEFAULT 0,
+                sources TEXT                   -- "mic,system"
+            );
+            CREATE TABLE IF NOT EXISTS meeting_segments (
+                meeting_id TEXT NOT NULL,
+                start REAL NOT NULL,
+                end REAL NOT NULL,
+                speaker TEXT NOT NULL,         -- you | others
+                text TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS meeting_segments_meeting ON meeting_segments(meeting_id);
+            PRAGMA user_version = 5;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -768,7 +799,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments;",
     )?;
     Ok(())
 }

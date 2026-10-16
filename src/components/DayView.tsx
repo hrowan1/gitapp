@@ -31,6 +31,7 @@ const EVENT_ICON: Record<string, IconName> = {
   merged: "merge",
   edit: "pencil",
   jira: "ticket",
+  meeting: "mic",
 };
 
 /** What you worked on, for how long, on any day; editable, and shaped for Jira worklogs. */
