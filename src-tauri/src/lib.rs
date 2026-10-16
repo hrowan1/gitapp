@@ -1057,11 +1057,14 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
         };
         let result = track("mic.m4a", "you").and_then(|you| Ok(meetings::merge(you, track("system.m4a", "others")?)));
         let state = app.state::<AppState>();
+        // Read settings before taking the lock: `setting()` locks the database itself, and std's Mutex isn't
+        // re-entrant, so calling it while holding `conn` deadlocks (and freezes the UI on its next query).
+        let delete_audio = audio_retention_days(&state) < 0;
         let conn = state.db.lock().unwrap();
         match result {
             Ok(segments) => {
                 let _ = meetings::save_transcript(&conn, &id, &segments);
-                if audio_retention_days(&state) < 0 {
+                if delete_audio {
                     let _ = std::fs::remove_dir_all(&dir);
                     let _ = conn.execute("UPDATE meetings SET audio_deleted = 1 WHERE id = ?1", [&id]);
                 }

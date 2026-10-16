@@ -302,6 +302,7 @@ pub fn day_spans(conn: &Connection, start: &str, end: &str) -> Result<Vec<(Strin
             };
             let label = match &ticket {
                 Some(t) => t.clone(),
+                None if title.to_lowercase().starts_with("meeting") => title,
                 None => format!("Meeting · {title}"),
             };
             Ok((key, label, r.get(2)?, r.get(3)?))
