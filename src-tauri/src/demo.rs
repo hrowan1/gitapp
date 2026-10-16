@@ -341,8 +341,10 @@ mod tests {
         let keys: Vec<&str> = r.groups.iter().map(|g| g.key.as_str()).collect();
         assert!(keys.contains(&"T:BILL-142"), "{keys:?}");
         assert!(keys.contains(&"T:MOB-77"), "{keys:?}");
-        let bill = r.groups.iter().find(|g| g.key == "T:BILL-142").unwrap();
-        assert!(bill.minutes >= 120 && bill.minutes <= 150, "{}", bill.minutes);
+        // The morning session only: PR events are seeded relative to *now*, so depending on the time of day
+        // the PR's "opened" can also land on yesterday and add a short block.
+        let morning = r.blocks.iter().filter(|b| b.key == "T:BILL-142").map(|b| b.minutes).max().unwrap();
+        assert!((120..=150).contains(&morning), "{morning}");
         assert!(r.total_minutes > 240, "{}", r.total_minutes);
         let _ = std::fs::remove_file(path);
     }
