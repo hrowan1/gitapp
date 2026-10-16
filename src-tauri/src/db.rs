@@ -227,6 +227,37 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 9 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Action items from meeting notes, with your progress on them (yours show in Today).
+            CREATE TABLE IF NOT EXISTS meeting_actions (
+                id INTEGER PRIMARY KEY,
+                meeting_id TEXT NOT NULL,
+                owner TEXT NOT NULL,           -- you | others | unclear
+                text TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                done_at TEXT,
+                snoozed_until TEXT,
+                UNIQUE (meeting_id, text)
+            );
+            CREATE INDEX IF NOT EXISTS meeting_actions_open ON meeting_actions(owner, done_at);
+            PRAGMA user_version = 9;
+            COMMIT;
+            "#,
+        )?;
+        // Notes written before this existed.
+        let notes: Vec<(String, String)> = conn
+            .prepare("SELECT id, summary FROM meetings WHERE summary IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        for (id, json) in notes {
+            if let Ok(summary) = serde_json::from_str(&json) {
+                crate::summary::sync_actions(conn, &id, &summary)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -838,7 +869,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions;",
     )?;
     Ok(())
 }

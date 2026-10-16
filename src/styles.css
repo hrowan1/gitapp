@@ -2376,3 +2376,41 @@ a {
   align-items: center;
   gap: 4px;
 }
+
+/* ---------- action items ---------- */
+
+.tick {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin: 1px 2px 0 1px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--faint);
+  border-radius: 50%;
+  background: transparent;
+  color: transparent;
+  cursor: pointer;
+}
+.tick:hover {
+  border-color: var(--green);
+  color: var(--green);
+}
+.meeting-actions .row {
+  position: relative;
+}
+.meeting-actions .row-sub .icon {
+  color: var(--faint);
+}
+.notes-list.notes-actions input[type="checkbox"],
+.notes-list.notes-actions .no-check {
+  flex-shrink: 0;
+  width: 14px;
+  margin: 0;
+  transform: translateY(2px);
+}
+.notes-list.notes-actions li.done > span:last-child {
+  text-decoration: line-through;
+  color: var(--muted);
+}

@@ -360,6 +360,7 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
         let _ = std::fs::remove_dir_all(dir);
     }
     conn.execute("DELETE FROM meeting_segments WHERE meeting_id = ?1", [id])?;
+    conn.execute("DELETE FROM meeting_actions WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meetings WHERE id = ?1", [id])?;
     Ok(())
 }

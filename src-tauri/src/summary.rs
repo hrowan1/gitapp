@@ -191,10 +191,108 @@ pub fn set_status(conn: &Connection, meeting_id: &str, status: Option<&str>, err
 }
 
 pub fn save(conn: &Connection, meeting_id: &str, summary: &Summary, by: Provider) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE meetings SET summary = ?2, summary_by = ?3, summary_status = 'done', summary_error = NULL WHERE id = ?1",
         params![meeting_id, serde_json::to_string(summary)?, by.id()],
     )?;
+    sync_actions(&tx, meeting_id, summary)?;
+    tx.commit()?;
+    Ok(())
+}
+
+// ---------- action items ----------
+
+/// Keep a meeting's action items in step with its notes. Rewritten notes keep the progress (done,
+/// snoozed) of items whose wording didn't change; items no longer in the notes go.
+pub fn sync_actions(conn: &Connection, meeting_id: &str, summary: &Summary) -> Result<()> {
+    let texts: Vec<&str> = summary.action_items.iter().map(|a| a.text.trim()).collect();
+    let mut stmt = conn.prepare("SELECT id, text FROM meeting_actions WHERE meeting_id = ?1")?;
+    let existing: Vec<(i64, String)> =
+        stmt.query_map([meeting_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    for (id, text) in existing {
+        if !texts.contains(&text.as_str()) {
+            conn.execute("DELETE FROM meeting_actions WHERE id = ?1", [id])?;
+        }
+    }
+    for (position, a) in summary.action_items.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO meeting_actions (meeting_id, owner, text, position) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(meeting_id, text) DO UPDATE SET owner = excluded.owner, position = excluded.position",
+            params![meeting_id, a.owner, a.text.trim(), position as i64],
+        )?;
+    }
+    Ok(())
+}
+
+/// One action item from a meeting, with your progress on it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Action {
+    pub id: i64,
+    pub meeting_id: String,
+    pub meeting_title: String,
+    /// When the meeting started.
+    pub meeting_at: String,
+    pub ticket: Option<String>,
+    /// you | others | unclear
+    pub owner: String,
+    pub text: String,
+    pub done: bool,
+    pub snoozed_until: Option<String>,
+}
+
+const ACTION_SQL: &str = "SELECT a.id, a.meeting_id, m.title, m.started_at, m.ticket, a.owner, a.text, a.done_at IS NOT NULL, a.snoozed_until
+    FROM meeting_actions a JOIN meetings m ON m.id = a.meeting_id";
+
+fn action_rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<Action>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(args, |r| {
+            Ok(Action {
+                id: r.get(0)?,
+                meeting_id: r.get(1)?,
+                meeting_title: r.get(2)?,
+                meeting_at: r.get(3)?,
+                ticket: r.get(4)?,
+                owner: r.get(5)?,
+                text: r.get(6)?,
+                done: r.get(7)?,
+                snoozed_until: r.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Your open action items for Today: not done, not snoozed past `now`. Newest meeting first.
+pub fn open_actions(conn: &Connection, now: &str) -> Result<Vec<Action>> {
+    action_rows(
+        conn,
+        &format!(
+            "{ACTION_SQL} WHERE a.owner = 'you' AND a.done_at IS NULL AND (a.snoozed_until IS NULL OR a.snoozed_until <= ?1)
+             ORDER BY m.started_at DESC, a.position"
+        ),
+        [now],
+    )
+}
+
+/// All of one meeting's action items, in the notes' order.
+pub fn meeting_actions(conn: &Connection, meeting_id: &str) -> Result<Vec<Action>> {
+    action_rows(conn, &format!("{ACTION_SQL} WHERE a.meeting_id = ?1 ORDER BY a.position"), [meeting_id])
+}
+
+pub fn set_done(conn: &Connection, id: i64, done: bool, now: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE meeting_actions SET done_at = CASE WHEN ?2 THEN ?3 END, snoozed_until = NULL WHERE id = ?1",
+        params![id, done, now],
+    )?;
+    Ok(())
+}
+
+/// Hide until `until` (None: show again now).
+pub fn snooze(conn: &Connection, id: i64, until: Option<&str>) -> Result<()> {
+    conn.execute("UPDATE meeting_actions SET snoozed_until = ?2 WHERE id = ?1", params![id, until])?;
     Ok(())
 }
 
@@ -227,6 +325,34 @@ mod tests {
         assert_eq!(s.decisions, ["Prorate daily"]);
         assert_eq!(s.action_items[0], ActionItem { owner: "you".into(), text: "Add credit notes".into() });
         assert!(parse_claude_response(&json!({"stop_reason": "refusal", "content": []})).is_err());
+    }
+
+    #[test]
+    fn action_items_follow_the_notes() {
+        let path = std::env::temp_dir().join(format!("dev-inbox-actions-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::db::open(&path).unwrap();
+        crate::meetings::create(&conn, "m1", "Proration sync", "2026-10-16T14:00:00Z", std::path::Path::new("/tmp/x")).unwrap();
+        let item = |owner: &str, text: &str| ActionItem { owner: owner.into(), text: text.into() };
+        let notes = |items: Vec<ActionItem>| Summary { overview: "O".into(), decisions: vec![], action_items: items };
+        save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("others", "Check rounding"), item("you", "Email finance")]), Provider::Apple).unwrap();
+
+        let now = "2026-10-16T15:00:00Z";
+        let open: Vec<String> = open_actions(&conn, now).unwrap().into_iter().map(|a| a.text).collect();
+        assert_eq!(open, ["Add credit notes", "Email finance"], "only yours, in order");
+
+        let first = open_actions(&conn, now).unwrap()[0].id;
+        set_done(&conn, first, true, now).unwrap();
+        let second = open_actions(&conn, now).unwrap()[0].id;
+        snooze(&conn, second, Some("2026-10-17T09:00:00Z")).unwrap();
+        assert!(open_actions(&conn, now).unwrap().is_empty());
+        assert_eq!(open_actions(&conn, "2026-10-17T09:30:00Z").unwrap().len(), 1, "back after the snooze");
+
+        // Rewritten notes keep what you ticked off, drop what's gone, add what's new.
+        save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("you", "Book the retro")]), Provider::Claude).unwrap();
+        let all = meeting_actions(&conn, "m1").unwrap();
+        assert_eq!(all.iter().map(|a| (a.text.as_str(), a.done)).collect::<Vec<_>>(), [("Add credit notes", true), ("Book the retro", false)]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

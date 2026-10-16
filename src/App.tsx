@@ -15,7 +15,7 @@ import { ActionDialog } from "./components/ActionDialog";
 import { DayView } from "./components/DayView";
 import { TicketsView } from "./components/TicketsView";
 import { MeetingsView } from "./components/MeetingsView";
-import type { RecordingStatus, TicketAttention } from "./lib/api";
+import type { MeetingAction, RecordingStatus, TicketAttention } from "./lib/api";
 import "./styles.css";
 
 export default function App() {
@@ -35,6 +35,12 @@ export default function App() {
   const [meetingTarget, setMeetingTarget] = useState<{ id: string } | null>(null);
   /** Jira tickets that need you, for Today and its count. */
   const [attention, setAttention] = useState<TicketAttention[]>([]);
+  /** Action items of yours from meeting notes, for Today and its count. */
+  const [actions, setActions] = useState<MeetingAction[]>([]);
+  const openMeeting = useCallback((id: string) => {
+    setMeetingTarget({ id });
+    setView("meetings");
+  }, []);
   const openTicket = useCallback((key: string) => {
     setTicketTarget({ key });
     setView("tickets");
@@ -106,7 +112,9 @@ export default function App() {
   }, [session, refreshRecording]);
 
   useEffect(() => {
-    if (session) api.getTicketAttention().then(setAttention).catch(() => {});
+    if (!session) return;
+    api.getTicketAttention().then(setAttention).catch(() => {});
+    api.getMeetingActions().then(setActions).catch(() => {});
   }, [session, version]);
 
   useEffect(() => {
@@ -144,7 +152,7 @@ export default function App() {
       <Sidebar
         view={view}
         onView={go}
-        counts={{ today: needs + attention.length, all: items.length }}
+        counts={{ today: needs + attention.length + actions.length, all: items.length }}
         session={session}
         syncing={syncing}
         lastSync={inbox?.lastSync}
@@ -174,7 +182,15 @@ export default function App() {
         ) : (
           <>
             {view === "today" && (
-              <Today items={items} tickets={attention} now={now} active={!overlay} onOpenTicket={openTicket} />
+              <Today
+                items={items}
+                tickets={attention}
+                actions={actions}
+                now={now}
+                active={!overlay}
+                onOpenTicket={openTicket}
+                onOpenMeeting={openMeeting}
+              />
             )}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
             {view === "day" && (
@@ -182,10 +198,7 @@ export default function App() {
                 version={version}
                 target={dayTarget}
                 onOpenTicket={openTicket}
-                onOpenMeeting={(id) => {
-                  setMeetingTarget({ id });
-                  setView("meetings");
-                }}
+                onOpenMeeting={openMeeting}
               />
             )}
             {view === "meetings" && (

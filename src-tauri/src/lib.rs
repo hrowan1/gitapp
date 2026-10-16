@@ -95,7 +95,7 @@ fn update_tray(app: &AppHandle, needs_you: usize) {
 
 fn refresh_count(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let tickets = ticket_attention(&state).len();
+    let tickets = ticket_attention(&state).len() + open_actions(&state).len();
     let n = db::list_items(&state.db.relock())
         .map(|items| items.iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).count())
         .unwrap_or(0);
@@ -124,7 +124,7 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
                     notify(app, n);
                 }
             }
-            update_tray(app, out.needs_you + ticket_attention(&state).len());
+            update_tray(app, out.needs_you + ticket_attention(&state).len() + open_actions(&state).len());
             let _ = app.emit("inbox-updated", ());
             Ok(())
         }
@@ -1339,6 +1339,37 @@ fn summarise_meeting(app: AppHandle, id: String) {
     });
 }
 
+/// Your open action items from meeting notes, for Today.
+fn open_actions(state: &AppState) -> Vec<summary::Action> {
+    summary::open_actions(&state.db.relock(), &now()).unwrap_or_default()
+}
+
+#[tauri::command(async)]
+fn get_meeting_actions(state: State<AppState>) -> Vec<summary::Action> {
+    open_actions(&state)
+}
+
+#[tauri::command(async)]
+fn set_action_done(app: AppHandle, id: i64, done: bool) -> CmdResult<()> {
+    summary::set_done(&app.state::<AppState>().db.relock(), id, done, &now()).map_err(err)?;
+    refresh_count(&app);
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
+}
+
+/// Hide an action item until `until` (an ISO time; none shows it again now).
+#[tauri::command(async)]
+fn snooze_action(app: AppHandle, id: i64, until: Option<String>) -> CmdResult<()> {
+    let until = match until {
+        Some(u) => Some(derive::parse_ts(&u).map(derive::fmt_ts).ok_or("Bad snooze time")?),
+        None => None,
+    };
+    summary::snooze(&app.state::<AppState>().db.relock(), id, until.as_deref()).map_err(err)?;
+    refresh_count(&app);
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
+}
+
 /// Make (or remake) a meeting's summary now.
 #[tauri::command(async)]
 fn summarise_meeting_now(app: AppHandle, id: String) -> CmdResult<()> {
@@ -1523,12 +1554,16 @@ fn list_meetings(state: State<AppState>) -> CmdResult<Vec<meetings::Meeting>> {
 struct MeetingDetail {
     meeting: meetings::Meeting,
     segments: Vec<meetings::Segment>,
+    /// The notes' action items, with your progress on them.
+    actions: Vec<summary::Action>,
 }
 
 #[tauri::command(async)]
 fn get_meeting(state: State<AppState>, id: String) -> CmdResult<MeetingDetail> {
-    let (meeting, segments) = meetings::get(&state.db.relock(), &id).map_err(err)?.ok_or("Unknown meeting")?;
-    Ok(MeetingDetail { meeting, segments })
+    let conn = state.db.relock();
+    let (meeting, segments) = meetings::get(&conn, &id).map_err(err)?.ok_or("Unknown meeting")?;
+    let actions = summary::meeting_actions(&conn, &id).map_err(err)?;
+    Ok(MeetingDetail { meeting, segments, actions })
 }
 
 #[tauri::command(async)]
@@ -1785,6 +1820,9 @@ pub fn run() {
             get_ticket,
             get_ticket_attention,
             summarise_meeting_now,
+            get_meeting_actions,
+            set_action_done,
+            snooze_action,
             summary_status,
             set_anthropic_key,
             clear_anthropic_key,

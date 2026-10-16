@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Meeting, type MeetingSummary, type RecordingStatus, type Segment } from "../lib/api";
+import { api, type Meeting, type MeetingAction, type MeetingSummary, type RecordingStatus, type Segment } from "../lib/api";
+import { setActionDone } from "./MeetingActions";
 import { dayKey } from "../lib/day";
 import { clock, friendlyDate } from "../lib/time";
 import { toast } from "../lib/toast";
@@ -232,7 +233,16 @@ function notesText(s: MeetingSummary): string {
 }
 
 /** AI notes for a meeting: overview, decisions, action items — or where they're up to. */
-function MeetingNotes({ meeting, hasTranscript }: { meeting: Meeting; hasTranscript: boolean }) {
+function MeetingNotes({
+  meeting,
+  actions,
+  hasTranscript,
+}: {
+  meeting: Meeting;
+  /** Progress on the action items (yours can be ticked off; they also show in Today). */
+  actions: MeetingAction[];
+  hasTranscript: boolean;
+}) {
   const summarise = () => api.summariseMeeting(meeting.id).catch((e) => toast(String(e), true));
   const who = meeting.summaryBy === "claude" ? "Claude" : "Apple Intelligence on this Mac";
   if (meeting.summaryStatus === "summarising") {
@@ -293,12 +303,25 @@ function MeetingNotes({ meeting, hasTranscript }: { meeting: Meeting; hasTranscr
         <>
           <div className="notes-label">Action items</div>
           <ul className="notes-list notes-actions">
-            {s.actionItems.map((a, i) => (
-              <li key={i}>
-                <span className={`owner owner-${a.owner}`}>{OWNER[a.owner] ?? a.owner}</span>
-                <span>{a.text}</span>
-              </li>
-            ))}
+            {s.actionItems.map((a, i) => {
+              const tracked = a.owner === "you" ? actions.find((x) => x.text === a.text.trim()) : undefined;
+              return (
+                <li key={i} className={tracked?.done ? "done" : undefined}>
+                  {tracked ? (
+                    <input
+                      type="checkbox"
+                      checked={tracked.done}
+                      title={tracked.done ? "Done" : "Mark done (it's also in Today)"}
+                      onChange={(e) => void setActionDone(tracked, e.target.checked)}
+                    />
+                  ) : (
+                    <span className="no-check" />
+                  )}
+                  <span className={`owner owner-${a.owner}`}>{OWNER[a.owner] ?? a.owner}</span>
+                  <span>{a.text}</span>
+                </li>
+              );
+            })}
           </ul>
         </>
       )}
@@ -335,6 +358,7 @@ function MeetingDetail({
   onOpenDay: (day: string) => void;
 }) {
   const [segments, setSegments] = useState<Segment[] | null>(null);
+  const [actions, setActions] = useState<MeetingAction[]>([]);
   const [title, setTitle] = useState(meeting.title);
   const [ticket, setTicket] = useState(meeting.ticket ?? "");
   const [find, setFind] = useState("");
@@ -344,7 +368,13 @@ function MeetingDetail({
   const system = useRef<HTMLAudioElement>(null);
 
   useEffect(() => {
-    api.getMeeting(meeting.id).then((d) => setSegments(d.segments)).catch((e) => toast(String(e), true));
+    api
+      .getMeeting(meeting.id)
+      .then((d) => {
+        setSegments(d.segments);
+        setActions(d.actions);
+      })
+      .catch((e) => toast(String(e), true));
   }, [meeting.id, meeting.status, version]);
 
   const sources = (meeting.sources ?? "").split(",").filter(Boolean);
@@ -462,7 +492,7 @@ function MeetingDetail({
           <p className="muted small">The audio has been deleted (Settings → Meetings); the transcript is kept.</p>
         )}
 
-        <MeetingNotes meeting={meeting} hasTranscript={!!segments?.length} />
+        <MeetingNotes meeting={meeting} actions={actions} hasTranscript={!!segments?.length} />
 
         <div className="timeline">
           <div className="transcript-head">

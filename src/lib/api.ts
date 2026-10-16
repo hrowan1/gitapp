@@ -149,6 +149,20 @@ export interface MeetingSummary {
   actionItems: { owner: "you" | "others" | "unclear"; text: string }[];
 }
 
+/** An action item from a meeting's notes, with your progress on it. */
+export interface MeetingAction {
+  id: number;
+  meetingId: string;
+  meetingTitle: string;
+  /** When the meeting started. */
+  meetingAt: string;
+  ticket?: string | null;
+  owner: "you" | "others" | "unclear";
+  text: string;
+  done: boolean;
+  snoozedUntil?: string | null;
+}
+
 export interface SummaryStatus {
   /** apple | claude | off */
   provider: string;
@@ -345,7 +359,11 @@ export const api = {
   startRecording: (title?: string) => invoke<RecordingStatus>("start_recording", { title: title ?? null }),
   stopRecording: () => invoke<void>("stop_recording"),
   listMeetings: () => invoke<Meeting[]>("list_meetings"),
-  getMeeting: (id: string) => invoke<{ meeting: Meeting; segments: Segment[] }>("get_meeting", { id }),
+  getMeeting: (id: string) =>
+    invoke<{ meeting: Meeting; segments: Segment[]; actions: MeetingAction[] }>("get_meeting", { id }),
+  getMeetingActions: () => invoke<MeetingAction[]>("get_meeting_actions"),
+  setActionDone: (id: number, done: boolean) => invoke<void>("set_action_done", { id, done }),
+  snoozeAction: (id: number, until: string | null) => invoke<void>("snooze_action", { id, until }),
   updateMeeting: (id: string, title: string, ticket: string | null) => invoke<void>("update_meeting", { id, title, ticket }),
   deleteMeeting: (id: string) => invoke<void>("delete_meeting", { id }),
   retranscribeMeeting: (id: string) => invoke<void>("retranscribe_meeting", { id }),

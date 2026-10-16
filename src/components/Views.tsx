@@ -12,6 +12,7 @@ import {
   type StateId,
   type TicketAttention,
   type SummaryStatus,
+  type MeetingAction,
 } from "../lib/api";
 import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
@@ -20,11 +21,14 @@ import { clock, friendlyDate } from "../lib/time";
 import { Icon, type IconName } from "./Icon";
 import { PrList } from "./PrList";
 import { TicketsNeedingYou } from "./TicketsNeedingYou";
+import { MeetingActions } from "./MeetingActions";
 import { useSelection, Workspace } from "./Workspace";
 
 export function Today({
   items,
   tickets,
+  actions,
+  onOpenMeeting,
   now,
   active,
   onOpenTicket,
@@ -32,9 +36,12 @@ export function Today({
   items: Item[];
   /** Jira tickets that need you. */
   tickets: TicketAttention[];
+  /** Action items of yours from meeting notes. */
+  actions: MeetingAction[];
   now: number;
   active: boolean;
   onOpenTicket: (key: string) => void;
+  onOpenMeeting: (id: string) => void;
 }) {
   const groups = useMemo(() => groupItems(items), [items]);
   const sections = useMemo(
@@ -47,7 +54,7 @@ export function Today({
     [groups],
   );
   const { selectedId, selection, onSelect, clear } = useSelection(items);
-  const needs = groups.needs.length + tickets.length;
+  const needs = groups.needs.length + tickets.length + actions.length;
   const fresh = items.filter((i) => i.isNew);
   const header = (
     <div className="headline">
@@ -70,6 +77,7 @@ export function Today({
   return (
     <Workspace header={header} selection={selection} now={now} onClose={clear}>
       <TicketsNeedingYou tickets={tickets} now={now} onOpen={onOpenTicket} />
+      <MeetingActions actions={actions} onOpenMeeting={onOpenMeeting} />
       <PrList sections={sections} now={now} active={active} selectedId={selectedId} onSelect={onSelect} />
     </Workspace>
   );
