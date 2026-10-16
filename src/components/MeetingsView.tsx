@@ -30,10 +30,13 @@ function lasted(total: number): string {
 export function MeetingsView({
   version,
   recording,
+  target,
   onOpenDay,
 }: {
   version: number;
   recording: RecordingStatus;
+  /** Open this meeting (e.g. clicked in the Day view). */
+  target?: { id: string } | null;
   onOpenDay: (day: string) => void;
 }) {
   const [meetings, setMeetings] = useState<Meeting[] | null>(null);
@@ -42,6 +45,9 @@ export function MeetingsView({
   const [busy, setBusy] = useState(false);
   const [levels, setLevels] = useState({ mic: 0, system: 0, seconds: 0 });
   const [warnings, setWarnings] = useState<string[]>([]);
+  useEffect(() => {
+    if (target) setSelected(target.id);
+  }, [target]);
 
   useEffect(() => {
     api.listMeetings().then(setMeetings).catch((e) => toast(String(e), true));

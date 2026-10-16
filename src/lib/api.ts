@@ -177,6 +177,27 @@ export interface DayReport {
   totalMinutes: number;
   blocks: TimeBlock[];
   groups: DayGroup[];
+  /** Every movement that day on Jira tickets that involve you. */
+  ticketMoves: TicketMove[];
+  /** Meetings recorded that day. */
+  meetings: Meeting[];
+}
+
+export interface TicketMove {
+  key: string;
+  summary: string;
+  /** The ticket's status now. */
+  status: string;
+  category: string;
+  url: string;
+  at: string;
+  /** status | assignee | resolution | comment | created */
+  kind: string;
+  detail: string;
+  actor?: string | null;
+  actorIsMe: boolean;
+  /** An assignee change that gave the ticket to you. */
+  toMe: boolean;
 }
 
 export interface FollowItem {
@@ -213,6 +234,8 @@ export interface Ticket {
   project: string;
   assignee?: string | null;
   assignedToMe: boolean;
+  /** How it involves you: assigned | was_assigned | reported | updated */
+  involvement: string;
   url: string;
   updated?: string | null;
   resolved?: string | null;

@@ -134,15 +134,10 @@ pub fn merge(mut you: Vec<Segment>, others: Vec<Segment>) -> Vec<Segment> {
     all
 }
 
-/// The ticket a meeting is most about, from keys spoken or written in it ("IO-2641").
-pub fn guess_ticket(segments: &[Segment]) -> Option<String> {
-    let mut counts: std::collections::HashMap<String, usize> = Default::default();
-    for s in segments {
-        if let Some(t) = crate::day::ticket_in_text(&s.text) {
-            *counts.entry(t).or_default() += 1;
-        }
-    }
-    counts.into_iter().max_by_key(|(_, n)| *n).map(|(t, _)| t)
+/// The ticket a meeting is about: the key in its title ("IO-2641 refinement"). Not the transcript: a
+/// standup mentions tickets without being about them, and spoken keys rarely transcribe cleanly anyway.
+pub fn guess_ticket(title: &str) -> Option<String> {
+    crate::day::ticket_in_text(title)
 }
 
 // ---------- storage ----------
@@ -178,7 +173,8 @@ pub fn save_transcript(conn: &Connection, id: &str, segments: &[Segment]) -> Res
         )?;
     }
     // Only fill the ticket in if the user hasn't chosen one.
-    if let Some(t) = guess_ticket(segments) {
+    let title: String = tx.query_row("SELECT title FROM meetings WHERE id = ?1", [id], |r| r.get(0)).unwrap_or_default();
+    if let Some(t) = guess_ticket(&title) {
         tx.execute("UPDATE meetings SET ticket = COALESCE(ticket, ?2) WHERE id = ?1", params![id, t])?;
     }
     tx.execute("UPDATE meetings SET status = 'done', error = NULL WHERE id = ?1", [id])?;
@@ -228,6 +224,15 @@ const MEETING_COLUMNS: &str = "m.id, m.title, m.started_at, m.ended_at, m.second
 pub fn list(conn: &Connection) -> Result<Vec<Meeting>> {
     let mut stmt = conn.prepare(&format!("SELECT {MEETING_COLUMNS} FROM meetings m ORDER BY m.started_at DESC"))?;
     let rows = stmt.query_map([], row_to_meeting)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Meetings that started in `[start, end)`, oldest first.
+pub fn started_between(conn: &Connection, start: &str, end: &str) -> Result<Vec<Meeting>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEETING_COLUMNS} FROM meetings m WHERE m.started_at >= ?1 AND m.started_at < ?2 ORDER BY m.started_at"
+    ))?;
+    let rows = stmt.query_map(params![start, end], row_to_meeting)?.collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -331,7 +336,8 @@ mod tests {
         assert_eq!(merged[0].speaker, "you");
         assert_eq!(merged[1].text, "Yes, IO-2641 first.");
         assert_eq!(merged[2].speaker, "others", "the echo on the mic is dropped");
-        assert_eq!(guess_ticket(&merged).as_deref(), Some("IO-2641"));
+        assert_eq!(guess_ticket("ES-12 sync").as_deref(), Some("ES-12"));
+        assert_eq!(guess_ticket("Standup"), None, "mentions in the transcript don't count");
     }
 }
 

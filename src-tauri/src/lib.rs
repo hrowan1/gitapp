@@ -835,6 +835,9 @@ fn jira_client(state: &AppState) -> Option<jira::Client> {
 
 /// Fetch tickets assigned to the user (now or before) that changed since the last sync,
 /// with their movement history.
+/// Which tickets a Jira sync fetches; bump to re-fetch the first-sync window after widening it.
+const JIRA_SCOPE: &str = "involved";
+
 async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if state.demo {
@@ -844,14 +847,17 @@ async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
     let Some(me) = state.setting("jira_account") else { return Ok(()) };
     let _guard = state.jira_lock.lock().await;
     let now = chrono::Utc::now();
-    // Overlap a day so nothing slips between syncs; first sync looks back 30 days.
+    // Overlap a day so nothing slips between syncs; first sync looks back 30 days. Syncs from before
+    // tickets you reported or worked on (not just assigned ones) were included look back 30 days once more.
+    let rescan = state.setting("jira_scope").as_deref() != Some(JIRA_SCOPE);
     let since = state
         .setting("jira_last_sync")
+        .filter(|_| !rescan)
         .and_then(|s| derive::parse_ts(&s))
         .map(|t| t - chrono::Duration::days(1))
         .unwrap_or(now - chrono::Duration::days(jira::FIRST_SYNC_DAYS));
     let result = async {
-        let issues = client.assigned_issues(since).await?;
+        let issues = client.involved_issues(since, &me).await?;
         let mut changes = client.changelogs(&issues).await?;
         for i in &issues {
             changes.extend(jira::issue_changes(i, &me));
@@ -864,6 +870,7 @@ async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
     match result {
         Ok(_) => {
             let _ = db::set_setting(&conn, "jira_last_sync", &derive::fmt_ts(now));
+            let _ = db::set_setting(&conn, "jira_scope", JIRA_SCOPE);
             let _ = db::delete_setting(&conn, "jira_error");
             drop(conn);
             let _ = app.emit("jira-updated", ());
@@ -956,7 +963,8 @@ async fn jira_sync_now(app: AppHandle) -> CmdResult<()> {
 
 #[tauri::command]
 fn get_tickets(state: State<AppState>) -> CmdResult<Vec<jira::Ticket>> {
-    jira::list_tickets(&state.db.lock().unwrap()).map_err(err)
+    let me = state.setting("jira_account").unwrap_or_default();
+    jira::list_tickets(&state.db.lock().unwrap(), &me).map_err(err)
 }
 
 #[derive(Serialize)]
@@ -1249,6 +1257,7 @@ fn start_local_tracker(app: AppHandle) {
 #[tauri::command]
 async fn get_day(app: AppHandle, day: String, start: String, end: String) -> CmdResult<day::DayReport> {
     let state = app.state::<AppState>();
+    let me = state.setting("jira_account").unwrap_or_default();
     let (Some(s), Some(e)) = (derive::parse_ts(&start), derive::parse_ts(&end)) else {
         return Err("Bad day bounds".into());
     };
@@ -1270,7 +1279,10 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
     events.extend(day::jira_events(&conn, &start, &end, &titles).map_err(err)?);
     let meeting_spans = meetings::day_spans(&conn, &start, &end).map_err(err)?;
     let manual = day::manual_blocks(&conn, &day).map_err(err)?;
-    Ok(day::build(&day, events, manual, s, e, &titles, &meeting_spans))
+    let mut report = day::build(&day, events, manual, s, e, &titles, &meeting_spans);
+    report.ticket_moves = jira::moves_between(&conn, &start, &end, &me).map_err(err)?;
+    report.meetings = meetings::started_between(&conn, &start, &end).map_err(err)?;
+    Ok(report)
 }
 
 /// Save corrected blocks for a day (freezes it).

@@ -280,6 +280,8 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
         ("MOB-77", "Offline mode for the order list", "In Progress", "indeterminate", true),
         ("ES-310", "QA: checkout on Safari 17", "Done", "done", true),
         ("ES-298", "Spike: payments provider fees", "In Progress", "indeterminate", false),
+        // Reported by you, worked on by someone else.
+        ("ES-305", "Receipts show the wrong VAT rate for EU customers", "In Progress", "indeterminate", false),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO jira_issues (key, id, summary, status, category, issue_type, priority, project, assignee, assigned_to_me, url, updated)
@@ -295,13 +297,54 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
         ("j5", "ES-310", "16:18", "status", "In QA → Done", true),
         ("j6", "ES-310", "16:24", "comment", "Commented: Verified on Safari 17.4 and 17.6, no regressions", true),
         ("j7", "ES-298", "17:05", "assignee", "Assigned to Sam", true),
+        ("created:ES-305", "ES-305", "10:40", "created", "Created", true),
+        ("j8", "ES-305", "15:02", "status", "To Do → In Progress", false),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO jira_events (id, issue_key, at, kind, from_value, to_value, actor, actor_is_me, detail)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
-            rusqlite::params![id, key, at(t), kind, if kind == "assignee" && !me { Some("demo-me") } else { None }, if me { "You" } else { "Sam" }, me, detail],
+             VALUES (?1, ?2, ?3, ?4, ?9, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                id, key, at(t), kind,
+                // Assigned to you by someone else / handed on by you.
+                if kind == "assignee" && !me { Some("demo-me") } else { None },
+                if me { "You" } else { "Sam" }, me, detail,
+                if kind == "assignee" && me { Some("demo-me") } else { None },
+            ],
         )?;
     }
+    // Recorded meetings (no audio in the demo, just transcripts).
+    for (id, title, from, to, ticket, lines) in [
+        ("demo-standup", "Standup", "09:30", "09:44", None, &[
+            ("others", "Morning. Quick round, anything blocked?"),
+            ("you", "I'm finishing proration on BILL-142, should be in review before lunch."),
+        ][..]),
+        ("demo-proration", "BILL-142 proration sync", "14:00", "14:26", Some("BILL-142"), &[
+            ("others", "Okay, so the question is where proration happens."),
+            ("you", "I think we prorate on the day the plan changes rather than at the end of the cycle."),
+            ("others", "That works for upgrades. Downgrades are trickier because of credits."),
+            ("you", "Let's issue a credit note and apply it to the next invoice."),
+        ][..]),
+    ] {
+        let (start, end) = (at(from), at(to));
+        let seconds = crate::derive::parse_ts(&end).zip(crate::derive::parse_ts(&start)).map(|(e, s)| (e - s).num_seconds());
+        conn.execute(
+            "INSERT OR REPLACE INTO meetings (id, title, started_at, ended_at, seconds, status, ticket, audio_deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'done', ?6, 1)",
+            rusqlite::params![id, title, start, end, seconds, ticket],
+        )?;
+        let segments: Vec<crate::meetings::Segment> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, (who, text))| crate::meetings::Segment {
+                start: i as f64 * 6.0,
+                end: i as f64 * 6.0 + 5.0,
+                speaker: who.to_string(),
+                text: text.to_string(),
+            })
+            .collect();
+        crate::meetings::save_transcript(conn, id, &segments)?;
+    }
+
     db::set_setting(conn, "jira_account", "demo-me")?;
     db::set_setting(conn, "jira_site", site)?;
     db::set_setting(conn, "jira_name", "You")?;
@@ -325,11 +368,13 @@ mod tests {
         let titles = crate::jira::titles(&conn).unwrap();
         let mut events = crate::day::gather(&conn, &s, &e).unwrap();
         events.extend(crate::day::jira_events(&conn, &s, &e, &titles).unwrap());
-        let r = crate::day::build(&y.to_string(), events, None, start, end, &titles, &[]);
+        let mut r = crate::day::build(&y.to_string(), events, None, start, end, &titles, &[]);
+        r.ticket_moves = crate::jira::moves_between(&conn, &s, &e, "demo-me").unwrap();
+        r.meetings = crate::meetings::started_between(&conn, &s, &e).unwrap();
         if std::env::var("DAY_JSON").is_ok() {
             println!("DAYJSON {}", serde_json::to_string(&r).unwrap());
-            println!("TICKETSJSON {}", serde_json::to_string(&crate::jira::list_tickets(&conn).unwrap()).unwrap());
-            let detail: std::collections::HashMap<String, Vec<crate::jira::TicketEvent>> = ["BILL-142", "MOB-77", "ES-310", "ES-298"]
+            println!("TICKETSJSON {}", serde_json::to_string(&crate::jira::list_tickets(&conn, "demo-me").unwrap()).unwrap());
+            let detail: std::collections::HashMap<String, Vec<crate::jira::TicketEvent>> = ["BILL-142", "MOB-77", "ES-310", "ES-298", "ES-305"]
                 .iter()
                 .map(|k| (k.to_string(), crate::jira::ticket_events(&conn, k, "demo-me").unwrap()))
                 .collect();
@@ -338,6 +383,17 @@ mod tests {
         let es = r.groups.iter().find(|g| g.key == "T:ES-310").expect("a Jira-only ticket appears on the day");
         assert_eq!(es.status.as_deref(), Some("Done"));
         assert!(es.minutes > 0, "your own Jira moves count a little");
+        let moves = crate::jira::moves_between(&conn, &s, &e, "demo-me").unwrap();
+        assert!(moves.iter().any(|m| m.key == "MOB-77" && m.kind == "assignee" && m.to_me));
+        assert!(moves.iter().any(|m| m.key == "ES-305" && m.kind == "created" && m.actor_is_me));
+        assert!(moves.iter().any(|m| m.key == "ES-305" && m.kind == "status" && !m.actor_is_me), "others' moves on your tickets are listed");
+        let involvement: std::collections::HashMap<String, String> =
+            crate::jira::list_tickets(&conn, "demo-me").unwrap().into_iter().map(|t| (t.key, t.involvement)).collect();
+        assert_eq!(involvement["MOB-77"], "assigned");
+        assert_eq!(involvement["ES-298"], "was_assigned");
+        assert_eq!(involvement["ES-305"], "reported");
+        let meetings = crate::meetings::started_between(&conn, &s, &e).unwrap();
+        assert_eq!(meetings.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["Standup", "BILL-142 proration sync"]);
         let keys: Vec<&str> = r.groups.iter().map(|g| g.key.as_str()).collect();
         assert!(keys.contains(&"T:BILL-142"), "{keys:?}");
         assert!(keys.contains(&"T:MOB-77"), "{keys:?}");

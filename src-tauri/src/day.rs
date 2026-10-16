@@ -75,6 +75,7 @@ pub fn ticket_in_text(text: &str) -> Option<String> {
     TEXT_TICKET.captures(text).map(|c| c[1].to_string()).filter(|t| valid(t))
 }
 
+
 fn is_trunk(branch: &str) -> bool {
     matches!(branch, "main" | "master" | "develop" | "dev" | "trunk")
 }
@@ -160,6 +161,10 @@ pub struct DayReport {
     pub total_minutes: i64,
     pub blocks: Vec<Block>,
     pub groups: Vec<Group>,
+    /// Every movement that day on Jira tickets that involve you (filled in by the caller).
+    pub ticket_moves: Vec<crate::jira::DayMove>,
+    /// Meetings recorded that day (filled in by the caller; listed even on days you've edited).
+    pub meetings: Vec<crate::meetings::Meeting>,
 }
 
 /// Total minutes covered by a set of intervals, counting overlaps once.
@@ -276,6 +281,8 @@ pub fn build(
 
     for (key, _, start, end) in meetings {
         let (Some(s), Some(e)) = (parse_ts(start), parse_ts(end)) else { continue };
+        // Even a very short recording shows up on the timeline.
+        let e = e.max(s + Duration::minutes(1));
         let (s, e) = (s.max(day_start), e.min(day_end));
         if e > s {
             let label = by_key.get(key).map(|g| g.0.clone()).unwrap_or_default();
@@ -332,7 +339,7 @@ pub fn build(
 
     let mut blocks = blocks;
     blocks.sort_by(|a, b| a.start.cmp(&b.start));
-    DayReport { day: day.to_string(), frozen, total_minutes, blocks, groups }
+    DayReport { day: day.to_string(), frozen, total_minutes, blocks, groups, ticket_moves: Vec::new(), meetings: Vec::new() }
 }
 
 // ---------- storage & gathering ----------

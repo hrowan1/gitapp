@@ -31,6 +31,15 @@ export default function App() {
   const [shortcuts, setShortcuts] = useState(false);
   /** A date to show in the Day view (e.g. from a ticket's history). */
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
+  const [ticketTarget, setTicketTarget] = useState<{ key: string } | null>(null);
+  const [meetingTarget, setMeetingTarget] = useState<{ id: string } | null>(null);
+  // Navigating yourself (sidebar, keys, ⌘K) starts each view fresh rather than at the last jump target.
+  const go = useCallback((v: View) => {
+    setDayTarget(null);
+    setTicketTarget(null);
+    setMeetingTarget(null);
+    setView(v);
+  }, []);
   const [recording, setRecording] = useState<RecordingStatus>({ recording: false });
   const refreshRecording = useCallback(() => {
     api.recordingStatus().then(setRecording).catch(() => {});
@@ -101,9 +110,9 @@ export default function App() {
       if (overlay || tag === "input" || tag === "select" || tag === "textarea" || e.metaKey || e.ctrlKey || e.altKey) return;
       const nav = NAV.find((n) => n.key === e.key);
       // preventDefault so the key isn't also typed into whatever the shortcut opens.
-      if (nav) setView(nav.id);
+      if (nav) go(nav.id);
       else if (e.key === "r") sync();
-      else if (e.key === "s") setView("day");
+      else if (e.key === "s") go("day");
       else if (e.key === "/") setPalette(true);
       else if (e.key === "?") setShortcuts(true);
       else return;
@@ -111,7 +120,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, overlay, sync]);
+  }, [palette, overlay, sync, go]);
 
   if (session === undefined) return null;
   if (session === null) return <SignIn onSignedIn={setSession} />;
@@ -124,7 +133,7 @@ export default function App() {
     <div className="app shell">
       <Sidebar
         view={view}
-        onView={setView}
+        onView={go}
         counts={{ today: needs, all: items.length }}
         session={session}
         syncing={syncing}
@@ -156,11 +165,25 @@ export default function App() {
           <>
             {view === "today" && <Today items={items} now={now} active={!overlay} />}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
-            {view === "day" && <DayView version={version} target={dayTarget} />}
+            {view === "day" && (
+              <DayView
+                version={version}
+                target={dayTarget}
+                onOpenTicket={(key) => {
+                  setTicketTarget({ key });
+                  setView("tickets");
+                }}
+                onOpenMeeting={(id) => {
+                  setMeetingTarget({ id });
+                  setView("meetings");
+                }}
+              />
+            )}
             {view === "meetings" && (
               <MeetingsView
                 version={version}
                 recording={recording}
+                target={meetingTarget}
                 onOpenDay={(day) => {
                   setDayTarget({ day });
                   setView("day");
@@ -171,6 +194,7 @@ export default function App() {
               <TicketsView
                 version={version}
                 now={now}
+                target={ticketTarget}
                 onOpenDay={(day) => {
                   setDayTarget({ day });
                   setView("day");
@@ -217,7 +241,7 @@ export default function App() {
           items={items}
           onClose={() => setPalette(false)}
           onNavigate={(v) => {
-            setView(v);
+            go(v);
             setPalette(false);
           }}
           onSync={sync}

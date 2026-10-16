@@ -1,5 +1,6 @@
-//! Jira Cloud, read-only: tickets that are (or were) assigned to the user, and how they moved —
-//! status changes, assignment changes, resolutions and the user's comments. Feeds the Tickets
+//! Jira Cloud, read-only: tickets that involve the user — assigned to them now or before, reported by
+//! them, or moved, edited or commented on by them — and how they moved: status changes, assignment
+//! changes, resolutions and the user's comments. Feeds the Tickets
 //! page and the Day view. Authenticates with the user's email + API token (token in the keychain).
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -146,12 +147,18 @@ impl Client {
         })
     }
 
-    /// Tickets assigned to the user now or at any point, updated since `since`.
-    pub async fn assigned_issues(&self, since: Ts) -> Result<Vec<Issue>> {
-        let jql = format!(
-            "assignee WAS currentUser() AND updated >= \"{}\" ORDER BY updated DESC",
-            since.format("%Y-%m-%d %H:%M")
-        );
+    /// Tickets that involve the user, updated since `since`: assigned to them now or at any point,
+    /// reported by them, or moved / edited / commented on by them (`account_id` is theirs).
+    pub async fn involved_issues(&self, since: Ts, account_id: &str) -> Result<Vec<Issue>> {
+        match self.search(&involved_jql(since, account_id, true)).await {
+            Ok(issues) => Ok(issues),
+            // updatedBy() is Jira Cloud only and fairly new; if the site rejects it, do without.
+            Err(e) if e.to_string().contains("400") => self.search(&involved_jql(since, account_id, false)).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn search(&self, jql: &str) -> Result<Vec<Issue>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         for _ in 0..20 {
@@ -212,6 +219,25 @@ impl Client {
     pub fn browse_url(&self, key: &str) -> String {
         format!("{}/browse/{key}", self.base)
     }
+}
+
+/// JQL for tickets involving the user. `updated_by` adds `updatedBy()`, which also catches comments and edits.
+pub fn involved_jql(since: Ts, account_id: &str, updated_by: bool) -> String {
+    let date = since.format("%Y/%m/%d");
+    let mut who = vec![
+        "assignee WAS currentUser()".to_string(),
+        "reporter = currentUser()".to_string(),
+        format!("status CHANGED BY currentUser() AFTER \"{date}\""),
+    ];
+    if updated_by {
+        let id = account_id.replace(['"', '\\'], "");
+        who.push(format!("issuekey IN updatedBy(\"{id}\", \"{date}\")"));
+    }
+    format!(
+        "({}) AND updated >= \"{}\" ORDER BY updated DESC",
+        who.join(" OR "),
+        since.format("%Y-%m-%d %H:%M")
+    )
 }
 
 fn parse_issue(i: &Value) -> Issue {
@@ -397,6 +423,8 @@ pub struct Ticket {
     pub project: String,
     pub assignee: Option<String>,
     pub assigned_to_me: bool,
+    /// How the ticket involves the user: assigned | was_assigned | reported | updated
+    pub involvement: String,
     pub url: String,
     pub updated: Option<String>,
     pub resolved: Option<String>,
@@ -405,16 +433,23 @@ pub struct Ticket {
     pub last_move_at: Option<String>,
 }
 
-pub fn list_tickets(conn: &Connection) -> Result<Vec<Ticket>> {
+pub fn list_tickets(conn: &Connection, me: &str) -> Result<Vec<Ticket>> {
     let mut stmt = conn.prepare(
         "SELECT t.key, t.summary, t.status, t.category, t.issue_type, t.priority, t.project, t.assignee,
                 t.assigned_to_me, t.url, t.updated, t.resolved,
                 (SELECT detail FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1),
-                (SELECT at FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1)
+                (SELECT at FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1),
+                CASE
+                  WHEN t.assigned_to_me THEN 'assigned'
+                  WHEN EXISTS (SELECT 1 FROM jira_events e WHERE e.issue_key = t.key AND e.kind = 'assignee'
+                               AND (e.from_value = ?1 OR e.to_value = ?1)) THEN 'was_assigned'
+                  WHEN EXISTS (SELECT 1 FROM jira_events e WHERE e.issue_key = t.key AND e.kind = 'created' AND e.actor_is_me) THEN 'reported'
+                  ELSE 'updated'
+                END
          FROM jira_issues t ORDER BY COALESCE(t.updated, '') DESC",
     )?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([me], |r| {
             Ok(Ticket {
                 key: r.get(0)?,
                 summary: r.get(1)?,
@@ -430,6 +465,7 @@ pub fn list_tickets(conn: &Connection) -> Result<Vec<Ticket>> {
                 resolved: r.get(11)?,
                 last_move: r.get(12)?,
                 last_move_at: r.get(13)?,
+                involvement: r.get(14)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -493,10 +529,58 @@ pub fn events_between(conn: &Connection, start: &str, end: &str) -> Result<Vec<(
     Ok(rows)
 }
 
+/// One movement on a ticket, for the Day view's "Ticket moves".
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayMove {
+    pub key: String,
+    pub summary: String,
+    /// The ticket's status now.
+    pub status: String,
+    pub category: String,
+    pub url: String,
+    pub at: String,
+    /// status | assignee | resolution | comment | created
+    pub kind: String,
+    pub detail: String,
+    pub actor: Option<String>,
+    pub actor_is_me: bool,
+    /// An assignee change that gave the ticket to the user.
+    pub to_me: bool,
+}
+
+/// Every movement between `start` and `end` on the tickets that involve the user (`me`), oldest first.
+pub fn moves_between(conn: &Connection, start: &str, end: &str, me: &str) -> Result<Vec<DayMove>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.issue_key, t.summary, t.status, t.category, t.url, e.at, e.kind, e.detail, e.actor, e.actor_is_me,
+                COALESCE(e.kind = 'assignee' AND e.to_value = ?3, 0)
+         FROM jira_events e JOIN jira_issues t ON t.key = e.issue_key
+         WHERE e.at >= ?1 AND e.at < ?2 ORDER BY e.at",
+    )?;
+    let rows = stmt
+        .query_map(params![start, end, me], |r| {
+            Ok(DayMove {
+                key: r.get(0)?,
+                summary: r.get(1)?,
+                status: r.get(2)?,
+                category: r.get(3)?,
+                url: r.get(4)?,
+                at: r.get(5)?,
+                kind: r.get(6)?,
+                detail: r.get(7)?,
+                actor: r.get(8)?,
+                actor_is_me: r.get(9)?,
+                to_me: r.get(10)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub fn forget(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM jira_issues; DELETE FROM jira_events;
-         DELETE FROM settings WHERE key IN ('jira_site', 'jira_email', 'jira_account', 'jira_name', 'jira_last_sync', 'jira_error');",
+         DELETE FROM settings WHERE key IN ('jira_site', 'jira_email', 'jira_account', 'jira_name', 'jira_last_sync', 'jira_error', 'jira_scope');",
     )?;
     Ok(())
 }
@@ -504,6 +588,18 @@ pub fn forget(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn involved_jql_covers_assigned_reported_and_updated() {
+        let since = parse_jira_ts("2026-09-16T08:00:00.000+0000").unwrap();
+        let q = involved_jql(since, "abc\"123", true);
+        assert_eq!(
+            q,
+            "(assignee WAS currentUser() OR reporter = currentUser() OR status CHANGED BY currentUser() AFTER \"2026/09/16\" \
+             OR issuekey IN updatedBy(\"abc123\", \"2026/09/16\")) AND updated >= \"2026-09-16 08:00\" ORDER BY updated DESC"
+        );
+        assert!(!involved_jql(since, "abc", false).contains("updatedBy"));
+    }
 
     #[test]
     fn sites_and_dates() {

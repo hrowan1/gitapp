@@ -42,14 +42,34 @@ function describe(e: TicketEvent): string {
 }
 
 /** Jira tickets that are or were assigned to you, and how they moved. Read-only. */
+const INVOLVEMENT: Record<string, string> = {
+  was_assigned: "previously yours",
+  reported: "you reported it",
+  updated: "you worked on it",
+};
+
+/** One day's movements, newest day first. */
+function byDay(events: TicketEvent[]): { day: string; events: TicketEvent[] }[] {
+  const out: { day: string; events: TicketEvent[] }[] = [];
+  for (const e of events) {
+    const day = dayKey(new Date(e.at));
+    if (out[out.length - 1]?.day !== day) out.push({ day, events: [] });
+    out[out.length - 1].events.push(e);
+  }
+  return out;
+}
+
 export function TicketsView({
   version,
   now,
+  target,
   onOpenDay,
   onSettings,
 }: {
   version: number;
   now: number;
+  /** Open this ticket (e.g. clicked in the Day view). */
+  target?: { key: string } | null;
   onOpenDay: (day: string) => void;
   onSettings: () => void;
 }) {
@@ -61,6 +81,13 @@ export function TicketsView({
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<TicketDetail | null>(null);
   const [syncing, setSyncing] = useState(false);
+  useEffect(() => {
+    if (target) {
+      setSelected(target.key);
+      setFilter("all");
+      setText("");
+    }
+  }, [target]);
 
   useEffect(() => {
     api.jiraStatus().then(setStatus).catch(() => setStatus(null));
@@ -93,8 +120,8 @@ export function TicketsView({
           <Icon name="ticket" size={26} />
           <p className="strong">Connect Jira to see your tickets</p>
           <p className="muted small">
-            Read-only: the tickets assigned to you (now or before) and how they moved, so your Day view shows the whole
-            picture.
+            Read-only: the tickets that involve you — assigned to you now or before, reported by you, or moved or
+            commented on by you — and how they moved, so your Day view shows the whole picture.
           </p>
           <button className="primary" onClick={onSettings}>
             Connect Jira in Settings
@@ -109,7 +136,7 @@ export function TicketsView({
       <div className="headline compact">
         <h1>Tickets</h1>
         <p className="muted">
-          {mineOnly ? "Assigned to you" : "Assigned to you now or before"}{status?.site ? ` · ${status.site.replace("https://", "")}` : ""}
+          {mineOnly ? "Assigned to you" : "Assigned to you, reported by you or worked on by you"}{status?.site ? ` · ${status.site.replace("https://", "")}` : ""}
           {status?.lastSync && ` · synced ${age(status.lastSync, now)} ago`}{" "}
           <button
             className="link"
@@ -143,8 +170,8 @@ export function TicketsView({
           ))}
         </div>
         <label className="check">
-          <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Hide previously
-          yours
+          <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Only assigned to
+          you
         </label>
       </div>
     </>
@@ -181,7 +208,7 @@ export function TicketsView({
                   <span>{t.status}</span>
                   <span className="sep">·</span>
                   <span className="reason">{t.lastMove ?? t.issueType}</span>
-                  {!t.assignedToMe && <span className="pill">previously yours</span>}
+                  {INVOLVEMENT[t.involvement] && <span className="pill">{INVOLVEMENT[t.involvement]}</span>}
                 </div>
               </div>
               <div className="row-right">
@@ -246,20 +273,23 @@ export function TicketsView({
               <div className="group-label">How it moved</div>
               {!detail && <div className="muted small">Loading…</div>}
               {detail?.events.length === 0 && <div className="muted small">No movement recorded in the last 30 days.</div>}
-              {detail?.events.map((e, i) => (
-                <div
-                  key={i}
-                  className={`tl-row link-row${e.actorIsMe ? " mine" : ""}`}
-                  onClick={() => onOpenDay(dayKey(new Date(e.at)))}
-                  title="See this day in the Day view"
-                >
-                  <Icon name={EVENT_ICON[e.kind] ?? "clock"} size={13} />
-                  <span className="tl-text">{describe(e)}</span>
-                  <span className="tl-time">
-                    {friendlyDate(e.at)} {clock(e.at)}
-                  </span>
-                </div>
-              ))}
+              {detail &&
+                byDay(detail.events).map(({ day, events }) => (
+                  <div key={day} className="tl-day">
+                    <button className="tl-day-head link-row" onClick={() => onOpenDay(day)} title="See this day in the Day view">
+                      <span>{friendlyDate(events[0].at)}</span>
+                      <span className="muted small">open day</span>
+                      <Icon name="chevronRight" size={12} />
+                    </button>
+                    {events.map((e, i) => (
+                      <div key={i} className={`tl-row${e.actorIsMe ? " mine" : ""}`}>
+                        <Icon name={EVENT_ICON[e.kind] ?? "clock"} size={13} />
+                        <span className="tl-text">{describe(e)}</span>
+                        <span className="tl-time">{clock(e.at)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
             </div>
           </div>
         </aside>

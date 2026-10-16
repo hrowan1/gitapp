@@ -2180,3 +2180,75 @@ a {
 .line-text {
   overflow-wrap: anywhere;
 }
+
+/* ---------- day: meetings and ticket moves ---------- */
+
+.day-section {
+  margin-top: 14px;
+}
+.day-section .group-label {
+  margin-bottom: 6px;
+}
+.day-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  min-width: 0;
+}
+.day-item > .icon {
+  color: var(--faint);
+  flex-shrink: 0;
+}
+.day-section > .day-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.day-section > .day-item:hover {
+  background: var(--hover);
+}
+.move-group {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 0 6px;
+  margin-bottom: 6px;
+}
+.move-group .day-item {
+  font-weight: 550;
+  border-radius: 8px 8px 0 0;
+}
+.move-group .dg-event {
+  margin: 0 8px;
+}
+.dg-event.theirs {
+  color: var(--muted);
+}
+.tl-day + .tl-day {
+  margin-top: 10px;
+}
+.tl-day-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  text-align: left;
+}
+.tl-day-head .muted {
+  margin-left: auto;
+  font-weight: 450;
+  opacity: 0;
+}
+.tl-day-head:hover .muted {
+  opacity: 1;
+}

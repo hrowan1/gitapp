@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { api, type DayEvent, type DayReport, type TimeBlock } from "../lib/api";
+import { api, type DayEvent, type DayReport, type Meeting, type TicketMove, type TimeBlock } from "../lib/api";
 import {
   addDays,
   dayBounds,
@@ -34,8 +34,57 @@ const EVENT_ICON: Record<string, IconName> = {
   meeting: "mic",
 };
 
+const MOVE_ICON: Record<string, IconName> = {
+  status: "chevronRight",
+  assignee: "today",
+  resolution: "checkCircle",
+  comment: "message",
+  created: "ticket",
+};
+const CATEGORY_TONE: Record<string, string> = { new: "gray", indeterminate: "blue", done: "green" };
+
+function describeMove(m: TicketMove): string {
+  const who = m.actorIsMe ? "You" : (m.actor ?? "Someone");
+  switch (m.kind) {
+    case "status":
+      return `${who} moved it ${m.detail}`;
+    case "created":
+      return `${who} created it`;
+    case "comment":
+      return `${who} ${m.detail.charAt(0).toLowerCase()}${m.detail.slice(1)}`;
+    case "assignee": {
+      const to = m.detail.match(/^Assigned to (.+)$/)?.[1];
+      if (!to) return `${who} unassigned it`;
+      if (m.toMe) return m.actorIsMe ? "You took it" : `${who} assigned it to you`;
+      return `${who} ${m.actorIsMe ? "handed it to" : "assigned it to"} ${to}`;
+    }
+    default:
+      return `${who}: ${m.detail}`;
+  }
+}
+
+/** Moves grouped by ticket, in the order each ticket first moved that day. */
+function movesByTicket(moves: TicketMove[]): TicketMove[][] {
+  const groups = new Map<string, TicketMove[]>();
+  for (const m of moves) {
+    if (!groups.has(m.key)) groups.set(m.key, []);
+    groups.get(m.key)!.push(m);
+  }
+  return [...groups.values()];
+}
+
 /** What you worked on, for how long, on any day; editable, and shaped for Jira worklogs. */
-export function DayView({ version, target }: { version: number; target?: { day: string } | null }) {
+export function DayView({
+  version,
+  target,
+  onOpenTicket,
+  onOpenMeeting,
+}: {
+  version: number;
+  target?: { day: string } | null;
+  onOpenTicket: (key: string) => void;
+  onOpenMeeting: (id: string) => void;
+}) {
   const today = dayKey(new Date());
   const [day, setDay] = useState(target?.day ?? today);
   // Jump to a requested date (e.g. clicked in a ticket's history).
@@ -192,7 +241,11 @@ export function DayView({ version, target }: { version: number; target?: { day: 
         </button>
       </div>
 
-      {report && report.blocks.length === 0 && report.groups.length === 0 ? (
+      {report &&
+      report.blocks.length === 0 &&
+      report.groups.length === 0 &&
+      report.ticketMoves.length === 0 &&
+      report.meetings.length === 0 ? (
         <div className="empty big">
           <Icon name="calendar" size={24} />
           <p className="strong">Nothing tracked on this day</p>
@@ -251,6 +304,8 @@ export function DayView({ version, target }: { version: number; target?: { day: 
                   </div>
                 );
               })}
+              <DayMeetings meetings={report.meetings} onOpen={onOpenMeeting} />
+              <TicketMoves moves={report.ticketMoves} onOpen={onOpenTicket} />
             </div>
           </div>
         )
@@ -278,6 +333,69 @@ export function DayView({ version, target }: { version: number; target?: { day: 
         />
       )}
     </div>
+  );
+}
+
+/** The day's recorded meetings; click one to read its transcript. */
+function DayMeetings({ meetings, onOpen }: { meetings: Meeting[]; onOpen: (id: string) => void }) {
+  if (meetings.length === 0) return null;
+  return (
+    <section className="day-section">
+      <div className="group-label">Meetings</div>
+      {meetings.map((m) => (
+        <div
+          key={m.id}
+          className="day-item link-row"
+          style={{ "--h": hueFor(m.ticket ? `T:${m.ticket}` : `MTG:${m.id}`) } as React.CSSProperties}
+          onClick={() => onOpen(m.id)}
+          title="Open the transcript"
+        >
+          <Icon name="mic" size={14} />
+          <div className="grow">
+            <div className="dg-title">
+              {m.ticket && !m.title.toUpperCase().includes(m.ticket) && <span className="ticket">{m.ticket}</span>}
+              <span className="ellipsis">{m.title}</span>
+            </div>
+            <div className="muted small ellipsis">
+              {m.endedAt ? `${hhmm(m.startedAt)}–${hhmm(m.endedAt)}` : `${hhmm(m.startedAt)} · recording`}
+              {m.status === "transcribing" && " · transcribing…"}
+              {m.status === "failed" && " · transcription failed"}
+              {m.status === "done" && (m.preview ? ` · ${m.preview}` : " · no speech found")}
+            </div>
+          </div>
+          <Icon name="chevronRight" size={13} />
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/** How the tickets that involve you moved that day — yours and other people's moves. */
+function TicketMoves({ moves, onOpen }: { moves: TicketMove[]; onOpen: (key: string) => void }) {
+  if (moves.length === 0) return null;
+  return (
+    <section className="day-section">
+      <div className="group-label">Ticket moves</div>
+      {movesByTicket(moves).map((ms) => {
+        const t = ms[0];
+        return (
+          <div key={t.key} className="move-group" style={{ "--h": hueFor(`T:${t.key}`) } as React.CSSProperties}>
+            <div className="day-item link-row" onClick={() => onOpen(t.key)} title="Open in Tickets">
+              <span className="ticket">{t.key}</span>
+              <span className="grow ellipsis">{t.summary}</span>
+              <span className={`chip-state tone-${CATEGORY_TONE[t.category] ?? "gray"}`}>{t.status}</span>
+            </div>
+            {ms.map((m, i) => (
+              <div key={i} className={`dg-event${m.actorIsMe ? " mine" : " theirs"}`}>
+                <span className="tl-time">{hhmm(m.at)}</span>
+                <Icon name={MOVE_ICON[m.kind] ?? "clock"} size={13} />
+                <span className="grow">{describeMove(m)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 
