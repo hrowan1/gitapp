@@ -2252,3 +2252,20 @@ a {
 .tl-day-head:hover .muted {
   opacity: 1;
 }
+
+/* ---------- Today: Jira tickets that need you ---------- */
+
+.ticket-attention + .list {
+  margin-top: 4px;
+}
+.row-action {
+  opacity: 0;
+  padding: 3px;
+}
+.row:hover .row-action,
+.row-action:focus-visible {
+  opacity: 1;
+}
+.pal-item .ticket-key {
+  margin-right: 4px;
+}

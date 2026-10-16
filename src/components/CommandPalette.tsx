@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type Item } from "../lib/api";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { api, type Item, type Ticket } from "../lib/api";
 import { toast } from "../lib/toast";
 import { copyCheckout, openInEditor, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
 import { openDialog } from "../lib/dialog";
@@ -21,6 +22,7 @@ interface Command {
 type Entry =
   | { kind: "command"; command: Command }
   | { kind: "pr"; item: Item }
+  | { kind: "ticket"; ticket: Ticket }
   | { kind: "suggestion"; text: string }
   | { kind: "action"; label: string; action: PaletteAction };
 
@@ -79,17 +81,37 @@ function actionsFor(item: Item): { label: string; action: PaletteAction }[] {
   return list;
 }
 
+/** Tickets whose key or title match every word typed; exact key prefixes first. */
+function matchTickets(tickets: Ticket[], q: string): Ticket[] {
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const key = q.trim().toLowerCase();
+  return tickets
+    .filter((t) => {
+      const hay = `${t.key} ${t.summary}`.toLowerCase();
+      return words.every((w) => hay.includes(w));
+    })
+    .sort((a, b) => Number(b.key.toLowerCase().startsWith(key)) - Number(a.key.toLowerCase().startsWith(key)))
+    .slice(0, 8);
+}
+
 export function CommandPalette({
   items,
   onClose,
   onNavigate,
   onSync,
+  onOpenTicket,
 }: {
   items: Item[];
   onClose: () => void;
   onNavigate: (v: View) => void;
   onSync: () => void;
+  onOpenTicket: (key: string) => void;
 }) {
+  const [tickets, setTickets] = useState<Ticket[]>([]);
+  useEffect(() => {
+    api.getTickets().then(setTickets).catch(() => {});
+  }, []);
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
   /** When set, the palette lists actions for this PR instead of searching. */
@@ -142,9 +164,13 @@ export function CommandPalette({
       ];
     }
     const prs = items.filter(parsed.filter).sort(compareItems).slice(0, 50);
-    return [...cmds, ...prs.map((item) => ({ kind: "pr" as const, item }))];
+    const ticketHits = matchTickets(tickets, q).map((ticket) => ({ kind: "ticket" as const, ticket }));
+    // "ES-310" is clearly a ticket: list it first.
+    const byKey = /^[a-z][a-z0-9]*-\d*$/i.test(q.trim());
+    const prEntries = prs.map((item) => ({ kind: "pr" as const, item }));
+    return byKey ? [...ticketHits, ...cmds, ...prEntries] : [...cmds, ...ticketHits, ...prEntries];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, items, parsed, action, focus]);
+  }, [q, items, tickets, parsed, action, focus]);
 
   useEffect(() => setSel(0), [q, focus]);
   useEffect(() => {
@@ -163,6 +189,10 @@ export function CommandPalette({
       return;
     }
     if (e.kind === "command") e.command.run();
+    else if (e.kind === "ticket") {
+      if (alt) openUrl(e.ticket.url);
+      else onOpenTicket(e.ticket.key);
+    }
     else if (e.kind === "action" && focus) runAction(e.action, focus);
     else if (e.kind === "pr") {
       if (action) runAction(action.action, e.item);
@@ -227,7 +257,15 @@ export function CommandPalette({
           {entries.map((e, i) => (
             <div
               key={
-                e.kind === "pr" ? e.item.id : e.kind === "command" ? e.command.id : e.kind === "action" ? e.label : e.text
+                e.kind === "pr"
+                  ? e.item.id
+                  : e.kind === "ticket"
+                    ? `t:${e.ticket.key}`
+                    : e.kind === "command"
+                      ? e.command.id
+                      : e.kind === "action"
+                        ? e.label
+                        : e.text
               }
               className={`pal-item${i === sel ? " selected" : ""}${e.kind === "suggestion" ? " suggestion" : ""}`}
               onMouseMove={() => setSel(i)}
@@ -251,6 +289,17 @@ export function CommandPalette({
                 </>
               )}
               {e.kind === "action" && <span className="grow">{e.label}</span>}
+              {e.kind === "ticket" && (
+                <>
+                  <span className="pal-icon">
+                    <Icon name="ticket" size={14} />
+                  </span>
+                  <span className="grow ellipsis">
+                    <span className="ticket-key">{e.ticket.key}</span> {e.ticket.summary}
+                  </span>
+                  <span className="muted small">{e.ticket.status}</span>
+                </>
+              )}
               {e.kind === "pr" && (
                 <>
                   <span className="pal-icon">

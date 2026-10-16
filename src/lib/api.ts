@@ -243,6 +243,21 @@ export interface Ticket {
   lastMoveAt?: string | null;
 }
 
+/** A Jira ticket where someone else did something since you last looked. */
+export interface TicketAttention {
+  key: string;
+  summary: string;
+  status: string;
+  category: string;
+  url: string;
+  at: string;
+  /** assignee | mention | comment | status | resolution */
+  kind: string;
+  /** "Sam assigned it to you", "Sam moved it In QA → In Progress", "Sam mentioned you: …" */
+  reason: string;
+  count: number;
+}
+
 export interface TicketEvent {
   at: string;
   /** status | assignee | resolution | comment | created */
@@ -298,6 +313,8 @@ export const api = {
   jiraSyncNow: () => invoke<void>("jira_sync_now"),
   getTickets: () => invoke<Ticket[]>("get_tickets"),
   getTicket: (key: string) => invoke<TicketDetail>("get_ticket", { key }),
+  getTicketAttention: () => invoke<TicketAttention[]>("get_ticket_attention"),
+  markTicketSeen: (key: string) => invoke<void>("mark_ticket_seen", { key }),
   recordingStatus: () => invoke<RecordingStatus>("recording_status"),
   startRecording: (title?: string) => invoke<RecordingStatus>("start_recording", { title: title ?? null }),
   stopRecording: () => invoke<void>("stop_recording"),

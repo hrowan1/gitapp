@@ -10,6 +10,7 @@ import {
   type JiraStatus,
   type Settings,
   type StateId,
+  type TicketAttention,
 } from "../lib/api";
 import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
@@ -17,9 +18,23 @@ import { setTheme as applyThemeChoice, getTheme, type Theme } from "../lib/theme
 import { clock, friendlyDate } from "../lib/time";
 import { Icon, type IconName } from "./Icon";
 import { PrList } from "./PrList";
+import { TicketsNeedingYou } from "./TicketsNeedingYou";
 import { useSelection, Workspace } from "./Workspace";
 
-export function Today({ items, now, active }: { items: Item[]; now: number; active: boolean }) {
+export function Today({
+  items,
+  tickets,
+  now,
+  active,
+  onOpenTicket,
+}: {
+  items: Item[];
+  /** Jira tickets that need you. */
+  tickets: TicketAttention[];
+  now: number;
+  active: boolean;
+  onOpenTicket: (key: string) => void;
+}) {
   const groups = useMemo(() => groupItems(items), [items]);
   const sections = useMemo(
     () =>
@@ -31,7 +46,7 @@ export function Today({ items, now, active }: { items: Item[]; now: number; acti
     [groups],
   );
   const { selectedId, selection, onSelect, clear } = useSelection(items);
-  const needs = groups.needs.length;
+  const needs = groups.needs.length + tickets.length;
   const fresh = items.filter((i) => i.isNew);
   const header = (
     <div className="headline">
@@ -53,6 +68,7 @@ export function Today({ items, now, active }: { items: Item[]; now: number; acti
   );
   return (
     <Workspace header={header} selection={selection} now={now} onClose={clear}>
+      <TicketsNeedingYou tickets={tickets} now={now} onOpen={onOpenTicket} />
       <PrList sections={sections} now={now} active={active} selectedId={selectedId} onSelect={onSelect} />
     </Workspace>
   );

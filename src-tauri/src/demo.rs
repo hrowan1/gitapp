@@ -312,6 +312,20 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
             ],
         )?;
     }
+    // Since you last looked: Sam mentioned you, and QA sent a ticket of yours back.
+    let ago = |mins: i64| fmt_ts(Utc::now() - chrono::Duration::minutes(mins));
+    for (id, key, at, kind, detail) in [
+        ("j9", "MOB-77", ago(130), "status", "In QA → In Progress"),
+        ("j10", "BILL-142", ago(40), "mention", "Mentioned you: can you double-check the rounding on annual plans?"),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO jira_events (id, issue_key, at, kind, actor, actor_is_me, detail, notified)
+             VALUES (?1, ?2, ?3, ?4, 'Sam', 0, ?5, 1)",
+            rusqlite::params![id, key, at, kind, detail],
+        )?;
+    }
+    db::set_setting(conn, "jira_attention_since", &ago(3 * 24 * 60))?;
+
     // Recorded meetings (no audio in the demo, just transcripts).
     for (id, title, from, to, ticket, lines) in [
         ("demo-standup", "Standup", "09:30", "09:44", None, &[
@@ -394,6 +408,9 @@ mod tests {
         assert_eq!(involvement["ES-305"], "reported");
         let meetings = crate::meetings::started_between(&conn, &s, &e).unwrap();
         assert_eq!(meetings.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["Standup", "BILL-142 proration sync"]);
+        let since = crate::db::get_setting(&conn, "jira_attention_since").unwrap().unwrap();
+        let attention: Vec<String> = crate::jira::attention(&conn, "demo-me", &since).unwrap().into_iter().map(|a| a.key).collect();
+        assert_eq!(attention, ["BILL-142", "MOB-77"]);
         let keys: Vec<&str> = r.groups.iter().map(|g| g.key.as_str()).collect();
         assert!(keys.contains(&"T:BILL-142"), "{keys:?}");
         assert!(keys.contains(&"T:MOB-77"), "{keys:?}");

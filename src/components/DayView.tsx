@@ -39,6 +39,7 @@ const MOVE_ICON: Record<string, IconName> = {
   assignee: "today",
   resolution: "checkCircle",
   comment: "message",
+  mention: "message",
   created: "ticket",
 };
 const CATEGORY_TONE: Record<string, string> = { new: "gray", indeterminate: "blue", done: "green" };
@@ -51,6 +52,7 @@ function describeMove(m: TicketMove): string {
     case "created":
       return `${who} created it`;
     case "comment":
+    case "mention":
       return `${who} ${m.detail.charAt(0).toLowerCase()}${m.detail.slice(1)}`;
     case "assignee": {
       const to = m.detail.match(/^Assigned to (.+)$/)?.[1];

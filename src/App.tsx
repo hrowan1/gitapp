@@ -15,7 +15,7 @@ import { ActionDialog } from "./components/ActionDialog";
 import { DayView } from "./components/DayView";
 import { TicketsView } from "./components/TicketsView";
 import { MeetingsView } from "./components/MeetingsView";
-import type { RecordingStatus } from "./lib/api";
+import type { RecordingStatus, TicketAttention } from "./lib/api";
 import "./styles.css";
 
 export default function App() {
@@ -33,6 +33,12 @@ export default function App() {
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
   const [ticketTarget, setTicketTarget] = useState<{ key: string } | null>(null);
   const [meetingTarget, setMeetingTarget] = useState<{ id: string } | null>(null);
+  /** Jira tickets that need you, for Today and its count. */
+  const [attention, setAttention] = useState<TicketAttention[]>([]);
+  const openTicket = useCallback((key: string) => {
+    setTicketTarget({ key });
+    setView("tickets");
+  }, []);
   // Navigating yourself (sidebar, keys, ⌘K) starts each view fresh rather than at the last jump target.
   const go = useCallback((v: View) => {
     setDayTarget(null);
@@ -100,6 +106,10 @@ export default function App() {
   }, [session, refreshRecording]);
 
   useEffect(() => {
+    if (session) api.getTicketAttention().then(setAttention).catch(() => {});
+  }, [session, version]);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
@@ -134,7 +144,7 @@ export default function App() {
       <Sidebar
         view={view}
         onView={go}
-        counts={{ today: needs, all: items.length }}
+        counts={{ today: needs + attention.length, all: items.length }}
         session={session}
         syncing={syncing}
         lastSync={inbox?.lastSync}
@@ -163,16 +173,15 @@ export default function App() {
           </div>
         ) : (
           <>
-            {view === "today" && <Today items={items} now={now} active={!overlay} />}
+            {view === "today" && (
+              <Today items={items} tickets={attention} now={now} active={!overlay} onOpenTicket={openTicket} />
+            )}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
             {view === "day" && (
               <DayView
                 version={version}
                 target={dayTarget}
-                onOpenTicket={(key) => {
-                  setTicketTarget({ key });
-                  setView("tickets");
-                }}
+                onOpenTicket={openTicket}
                 onOpenMeeting={(id) => {
                   setMeetingTarget({ id });
                   setView("meetings");
@@ -245,6 +254,10 @@ export default function App() {
             setPalette(false);
           }}
           onSync={sync}
+          onOpenTicket={(key) => {
+            openTicket(key);
+            setPalette(false);
+          }}
         />
       )}
       {dialog && <ActionDialog request={dialog} onClose={() => setDialog(null)} />}

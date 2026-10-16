@@ -1,6 +1,8 @@
 //! Jira Cloud, read-only: tickets that involve the user — assigned to them now or before, reported by
 //! them, or moved, edited or commented on by them — and how they moved: status changes, assignment
-//! changes, resolutions and the user's comments. Feeds the Tickets
+//! changes, resolutions, the user's comments and other people's comments and @mentions. Also works
+//! out which tickets need the user (assigned to them, mentioned, commented on or moved by someone
+//! else since they last looked) for Today and desktop notifications. Feeds the Tickets
 //! page and the Day view. Authenticates with the user's email + API token (token in the keychain).
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -84,8 +86,35 @@ pub struct Issue {
     pub created: Option<Ts>,
     pub updated: Option<Ts>,
     pub resolved: Option<Ts>,
-    /// (comment id, author account id, author name, created, text)
-    pub comments: Vec<(String, String, String, Ts, String)>,
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub id: String,
+    pub author_id: String,
+    pub author: String,
+    pub at: Ts,
+    pub text: String,
+    /// Account ids @mentioned in it.
+    pub mentions: Vec<String>,
+}
+
+/// Account ids @mentioned in an Atlassian Document Format body.
+pub fn adf_mentions(v: &Value) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        if v.get("type").and_then(Value::as_str) == Some("mention") {
+            if let Some(id) = v["attrs"]["id"].as_str() {
+                out.push(id.to_string());
+            }
+        }
+        for c in v.get("content").and_then(Value::as_array).into_iter().flatten() {
+            walk(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut out);
+    out
 }
 
 /// One movement on a ticket.
@@ -248,13 +277,14 @@ fn parse_issue(i: &Value) -> Issue {
         .into_iter()
         .flatten()
         .filter_map(|c| {
-            Some((
-                c["id"].as_str()?.to_string(),
-                c["author"]["accountId"].as_str().unwrap_or_default().to_string(),
-                c["author"]["displayName"].as_str().unwrap_or_default().to_string(),
-                parse_jira_ts(c["created"].as_str()?)?,
-                adf_text(&c["body"]),
-            ))
+            Some(Comment {
+                id: c["id"].as_str()?.to_string(),
+                author_id: c["author"]["accountId"].as_str().unwrap_or_default().to_string(),
+                author: c["author"]["displayName"].as_str().unwrap_or_default().to_string(),
+                at: parse_jira_ts(c["created"].as_str()?)?,
+                text: adf_text(&c["body"]),
+                mentions: adf_mentions(&c["body"]),
+            })
         })
         .collect();
     Issue {
@@ -323,7 +353,8 @@ fn parse_history(key: &str, h: &Value) -> Vec<Change> {
         .collect()
 }
 
-/// Comments by the user, and ticket creation, as changes too.
+/// Ticket creation and comments as changes too: the user's own ("comment"), other people's that
+/// @mention the user ("mention"), and other people's ("comment", by someone else).
 pub fn issue_changes(i: &Issue, me: &str) -> Vec<Change> {
     let mut out = Vec::new();
     if let (Some(created), Some(reporter)) = (i.created, &i.reporter) {
@@ -339,21 +370,20 @@ pub fn issue_changes(i: &Issue, me: &str) -> Vec<Change> {
             detail: "Created".into(),
         });
     }
-    for (id, author_id, author, at, text) in &i.comments {
-        if author_id != me {
-            continue;
-        }
-        let snippet: String = text.chars().take(140).collect();
+    for c in &i.comments {
+        let mention = c.author_id != me && c.mentions.iter().any(|m| m == me);
+        let snippet: String = c.text.chars().take(140).collect();
+        let verb = if mention { "Mentioned you" } else { "Commented" };
         out.push(Change {
-            id: format!("comment:{id}"),
+            id: format!("comment:{}", c.id),
             issue_key: i.key.clone(),
-            at: *at,
-            kind: "comment".into(),
+            at: c.at,
+            kind: if mention { "mention" } else { "comment" }.into(),
             from: None,
             to: None,
-            actor_id: Some(author_id.clone()),
-            actor: Some(author.clone()),
-            detail: if snippet.is_empty() { "Commented".into() } else { format!("Commented: {snippet}") },
+            actor_id: Some(c.author_id.clone()),
+            actor: Some(c.author.clone()),
+            detail: if snippet.is_empty() { verb.into() } else { format!("{verb}: {snippet}") },
         });
     }
     out
@@ -437,8 +467,8 @@ pub fn list_tickets(conn: &Connection, me: &str) -> Result<Vec<Ticket>> {
     let mut stmt = conn.prepare(
         "SELECT t.key, t.summary, t.status, t.category, t.issue_type, t.priority, t.project, t.assignee,
                 t.assigned_to_me, t.url, t.updated, t.resolved,
-                (SELECT detail FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1),
-                (SELECT at FROM jira_events e WHERE e.issue_key = t.key AND e.kind != 'comment' ORDER BY e.at DESC LIMIT 1),
+                (SELECT detail FROM jira_events e WHERE e.issue_key = t.key AND e.kind NOT IN ('comment', 'mention') ORDER BY e.at DESC LIMIT 1),
+                (SELECT at FROM jira_events e WHERE e.issue_key = t.key AND e.kind NOT IN ('comment', 'mention') ORDER BY e.at DESC LIMIT 1),
                 CASE
                   WHEN t.assigned_to_me THEN 'assigned'
                   WHEN EXISTS (SELECT 1 FROM jira_events e WHERE e.issue_key = t.key AND e.kind = 'assignee'
@@ -521,7 +551,9 @@ pub fn titles(conn: &Connection) -> Result<std::collections::HashMap<String, (St
 /// Jira movements in [start, end) for the Day view: (key, at, detail, by_me).
 pub fn events_between(conn: &Connection, start: &str, end: &str) -> Result<Vec<(String, String, String, bool)>> {
     let mut stmt = conn.prepare(
-        "SELECT issue_key, at, detail, actor_is_me FROM jira_events WHERE at >= ?1 AND at < ?2 AND kind != 'created' ORDER BY at",
+        "SELECT issue_key, at, detail, actor_is_me FROM jira_events
+         WHERE at >= ?1 AND at < ?2 AND kind NOT IN ('created', 'mention') AND NOT (kind = 'comment' AND NOT actor_is_me)
+         ORDER BY at",
     )?;
     let rows = stmt
         .query_map(params![start, end], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -555,7 +587,7 @@ pub fn moves_between(conn: &Connection, start: &str, end: &str, me: &str) -> Res
         "SELECT e.issue_key, t.summary, t.status, t.category, t.url, e.at, e.kind, e.detail, e.actor, e.actor_is_me,
                 COALESCE(e.kind = 'assignee' AND e.to_value = ?3, 0)
          FROM jira_events e JOIN jira_issues t ON t.key = e.issue_key
-         WHERE e.at >= ?1 AND e.at < ?2 ORDER BY e.at",
+         WHERE e.at >= ?1 AND e.at < ?2 AND NOT (e.kind = 'comment' AND NOT e.actor_is_me) ORDER BY e.at",
     )?;
     let rows = stmt
         .query_map(params![start, end, me], |r| {
@@ -577,10 +609,113 @@ pub fn moves_between(conn: &Connection, start: &str, end: &str, me: &str) -> Res
     Ok(rows)
 }
 
+// ---------- what needs you ----------
+
+/// A ticket that needs you: something happened on it, by someone else, since you last looked.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Attention {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    pub category: String,
+    pub url: String,
+    /// The latest thing that happened.
+    pub at: String,
+    /// assignee | mention | comment | status | resolution
+    pub kind: String,
+    /// "Sam assigned it to you", "Sam moved it In QA → In Progress", "Sam mentioned you: …"
+    pub reason: String,
+    /// How many things happened since you last looked.
+    pub count: usize,
+}
+
+/// What another person did, in words.
+pub fn describe(kind: &str, detail: &str, actor: Option<&str>) -> String {
+    let who = actor.unwrap_or("Someone");
+    let lower = |s: &str| format!("{}{}", s.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_default(), s.chars().skip(1).collect::<String>());
+    match kind {
+        "assignee" => format!("{who} assigned it to you"),
+        "status" => format!("{who} moved it {detail}"),
+        _ => format!("{who} {}", lower(detail)),
+    }
+}
+
+/// Events that make a ticket need you, newest first. `since` stops
+/// history from before you connected counting; anything you did on the ticket afterwards settles it.
+const ATTENTION_SQL: &str = "
+    SELECT t.key, t.summary, t.status, t.category, t.url, e.at, e.kind, e.detail, e.actor
+    FROM jira_events e JOIN jira_issues t ON t.key = e.issue_key
+    WHERE NOT e.actor_is_me AND e.at > ?2
+      AND e.at > COALESCE(t.seen_at, '')
+      AND e.at > COALESCE((SELECT MAX(m.at) FROM jira_events m WHERE m.issue_key = t.key AND m.actor_is_me), '')
+      AND (   (e.kind = 'assignee' AND e.to_value = ?1 AND t.assigned_to_me)
+           OR e.kind = 'mention'
+           OR (e.kind = 'comment' AND (t.assigned_to_me OR EXISTS (
+                 SELECT 1 FROM jira_events c WHERE c.issue_key = t.key AND c.kind = 'created' AND c.actor_is_me)))
+           OR (e.kind IN ('status', 'resolution') AND t.assigned_to_me))
+      {extra}
+    ORDER BY e.at DESC";
+
+fn attention_rows(conn: &Connection, me: &str, since: &str, extra: &str) -> Result<Vec<Attention>> {
+    let mut stmt = conn.prepare(&ATTENTION_SQL.replace("{extra}", extra))?;
+    let rows = stmt
+        .query_map(params![me, since], |r| {
+            let kind: String = r.get(6)?;
+            let detail: String = r.get(7)?;
+            let actor: Option<String> = r.get(8)?;
+            Ok(Attention {
+                key: r.get(0)?,
+                summary: r.get(1)?,
+                status: r.get(2)?,
+                category: r.get(3)?,
+                url: r.get(4)?,
+                at: r.get(5)?,
+                reason: describe(&kind, &detail, actor.as_deref()),
+                kind,
+                count: 1,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Tickets that need you, most recent first; each shows its latest event and how many there were.
+pub fn attention(conn: &Connection, me: &str, since: &str) -> Result<Vec<Attention>> {
+    let mut out: Vec<Attention> = Vec::new();
+    for item in attention_rows(conn, me, since, "")? {
+        match out.iter_mut().find(|a| a.key == item.key) {
+            Some(a) => a.count += 1,
+            None => out.push(item),
+        }
+    }
+    Ok(out)
+}
+
+/// New events that need you and haven't been notified yet; marks every event as notified.
+pub fn take_notifications(conn: &Connection, me: &str, since: &str) -> Result<Vec<Attention>> {
+    let fresh = attention_rows(conn, me, since, "AND NOT e.notified")?;
+    conn.execute("UPDATE jira_events SET notified = 1 WHERE NOT notified", [])?;
+    Ok(fresh)
+}
+
+/// Mark everything so far as notified (the first sync shouldn't notify 30 days of history).
+pub fn mark_all_notified(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE jira_events SET notified = 1 WHERE NOT notified", [])?;
+    Ok(())
+}
+
+/// You've looked at the ticket: whatever happened so far no longer needs you. True if it did.
+pub fn mark_seen(conn: &Connection, key: &str, me: &str, since: &str, now: &str) -> Result<bool> {
+    let needed = attention(conn, me, since)?.iter().any(|a| a.key == key);
+    conn.execute("UPDATE jira_issues SET seen_at = ?2 WHERE key = ?1", params![key, now])?;
+    Ok(needed)
+}
+
 pub fn forget(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM jira_issues; DELETE FROM jira_events;
-         DELETE FROM settings WHERE key IN ('jira_site', 'jira_email', 'jira_account', 'jira_name', 'jira_last_sync', 'jira_error', 'jira_scope');",
+         DELETE FROM settings WHERE key IN ('jira_site', 'jira_email', 'jira_account', 'jira_name', 'jira_last_sync', 'jira_error', 'jira_scope', 'jira_attention_since');",
     )?;
     Ok(())
 }
@@ -599,6 +734,63 @@ mod tests {
              OR issuekey IN updatedBy(\"abc123\", \"2026/09/16\")) AND updated >= \"2026-09-16 08:00\" ORDER BY updated DESC"
         );
         assert!(!involved_jql(since, "abc", false).contains("updatedBy"));
+    }
+
+    #[test]
+    fn finds_mentions() {
+        let body = json!({"type": "doc", "content": [{"type": "paragraph", "content": [
+            {"type": "mention", "attrs": {"id": "me", "text": "@Harry"}}, {"type": "text", "text": " can you check?"}]}]});
+        assert_eq!(adf_mentions(&body), ["me"]);
+    }
+
+    #[test]
+    fn what_needs_you() {
+        let path = std::env::temp_dir().join(format!("dev-inbox-attention-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::db::open(&path).unwrap();
+        let ticket = |key: &str, mine: bool| {
+            conn.execute(
+                "INSERT INTO jira_issues (key, id, summary, status, category, issue_type, project, assigned_to_me, url)
+                 VALUES (?1, ?1, 'S', 'In Progress', 'indeterminate', 'Story', 'ES', ?2, 'u')",
+                params![key, mine],
+            )
+            .unwrap();
+        };
+        let event = |id: &str, key: &str, at: &str, kind: &str, by_me: bool, to: Option<&str>| {
+            conn.execute(
+                "INSERT INTO jira_events (id, issue_key, at, kind, to_value, actor, actor_is_me, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'In QA → In Progress')",
+                params![id, key, at, kind, to, if by_me { "You" } else { "Sam" }, by_me],
+            )
+            .unwrap();
+        };
+        ticket("ES-1", true); // yours: moved back by Sam
+        event("a", "ES-1", "2026-10-16T09:00:00Z", "status", false, None);
+        ticket("ES-2", true); // Sam assigned it to you, then you moved it: settled
+        event("b", "ES-2", "2026-10-16T09:00:00Z", "assignee", false, Some("me"));
+        event("c", "ES-2", "2026-10-16T09:30:00Z", "status", true, None);
+        ticket("ES-3", false); // not yours: a status move doesn't need you, a mention does
+        event("d", "ES-3", "2026-10-16T10:00:00Z", "status", false, None);
+        event("e", "ES-3", "2026-10-16T11:00:00Z", "mention", false, None);
+        ticket("ES-4", true); // before you connected
+        event("f", "ES-4", "2026-10-01T09:00:00Z", "status", false, None);
+
+        let since = "2026-10-15T00:00:00Z";
+        let keys = |a: Vec<Attention>| a.into_iter().map(|a| a.key).collect::<Vec<_>>();
+        assert_eq!(keys(attention(&conn, "me", since).unwrap()), ["ES-3", "ES-1"]);
+        let es3 = attention(&conn, "me", since).unwrap().remove(0);
+        assert_eq!(es3.kind, "mention");
+        assert_eq!(es3.count, 1, "the status move on someone else's ticket isn't counted");
+        assert_eq!(attention(&conn, "me", since).unwrap()[1].reason, "Sam moved it In QA → In Progress");
+
+        assert_eq!(keys(take_notifications(&conn, "me", since).unwrap()), ["ES-3", "ES-1"]);
+        assert!(take_notifications(&conn, "me", since).unwrap().is_empty(), "each event notifies once");
+
+        assert!(mark_seen(&conn, "ES-1", "me", since, "2026-10-16T12:00:00Z").unwrap());
+        assert_eq!(keys(attention(&conn, "me", since).unwrap()), ["ES-3"]);
+        event("g", "ES-1", "2026-10-16T13:00:00Z", "comment", false, None);
+        assert_eq!(keys(attention(&conn, "me", since).unwrap()), ["ES-1", "ES-3"], "something new brings it back");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

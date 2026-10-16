@@ -76,10 +76,11 @@ fn update_tray(app: &AppHandle, needs_you: usize) {
 
 fn refresh_count(app: &AppHandle) {
     let state = app.state::<AppState>();
+    let tickets = ticket_attention(&state).len();
     let n = db::list_items(&state.db.lock().unwrap())
         .map(|items| items.iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).count())
         .unwrap_or(0);
-    update_tray(app, n);
+    update_tray(app, n + tickets);
     let _ = app.emit("inbox-updated", ());
 }
 
@@ -104,7 +105,7 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
                     notify(app, n);
                 }
             }
-            update_tray(app, out.needs_you);
+            update_tray(app, out.needs_you + ticket_attention(&state).len());
             let _ = app.emit("inbox-updated", ());
             Ok(())
         }
@@ -149,7 +150,9 @@ fn notify(app: &AppHandle, n: sync::Notice) {
                 WAITING.fetch_sub(1, Ordering::SeqCst);
             }
             if let Ok(mac_notification_sys::NotificationResponse::Click) = res {
-                if let Some(id) = &n.item_id {
+                if let Some(key) = n.item_id.as_deref().and_then(|id| id.strip_prefix("jira:")) {
+                    seen_ticket(&app, key);
+                } else if let Some(id) = &n.item_id {
                     let state = app.state::<AppState>();
                     let _ = db::mark_seen(&state.db.lock().unwrap(), id, &now());
                     let _ = app.emit("inbox-updated", ());
@@ -872,7 +875,23 @@ async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
             let _ = db::set_setting(&conn, "jira_last_sync", &derive::fmt_ts(now));
             let _ = db::set_setting(&conn, "jira_scope", JIRA_SCOPE);
             let _ = db::delete_setting(&conn, "jira_error");
+            // The first sync brings in 30 days of history: only the last day can need you, and none of it notifies.
+            let since = match db::get_setting(&conn, "jira_attention_since") {
+                Ok(Some(s)) => s,
+                _ => {
+                    let s = derive::fmt_ts(now - chrono::Duration::days(1));
+                    let _ = db::set_setting(&conn, "jira_attention_since", &s);
+                    let _ = jira::mark_all_notified(&conn);
+                    s
+                }
+            };
+            let fresh = jira::take_notifications(&conn, &me, &since).unwrap_or_default();
+            let notifications = db::get_setting(&conn, "notifications").ok().flatten().as_deref() != Some("0");
             drop(conn);
+            if notifications {
+                notify_tickets(app, fresh);
+            }
+            refresh_count(app);
             let _ = app.emit("jira-updated", ());
             Ok(())
         }
@@ -882,6 +901,69 @@ async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
             Err(msg)
         }
     }
+}
+
+/// Tickets that need you (empty if Jira isn't connected). Reads settings before locking the database.
+fn ticket_attention(state: &AppState) -> Vec<jira::Attention> {
+    let (Some(me), Some(since)) = (state.setting("jira_account"), state.setting("jira_attention_since")) else {
+        return Vec::new();
+    };
+    jira::attention(&state.db.lock().unwrap(), &me, &since).unwrap_or_default()
+}
+
+/// Desktop notifications for tickets that newly need you; a burst becomes one summary.
+fn notify_tickets(app: &AppHandle, fresh: Vec<jira::Attention>) {
+    if fresh.len() > 3 {
+        notify(
+            app,
+            sync::Notice {
+                title: "🎫 Jira".into(),
+                body: format!("{} ticket updates need you\n{}", fresh.len(), fresh.iter().map(|a| a.key.as_str()).collect::<Vec<_>>().join(", ")),
+                url: None,
+                item_id: None,
+            },
+        );
+        return;
+    }
+    for a in fresh {
+        let title = match a.kind.as_str() {
+            "assignee" => "🎫 Assigned to you",
+            "mention" => "💬 You were mentioned",
+            "comment" => "💬 New comment",
+            _ => "↪ Ticket moved",
+        };
+        notify(
+            app,
+            sync::Notice {
+                title: title.into(),
+                body: format!("{} {}\n{}", a.key, a.summary, a.reason),
+                url: Some(a.url.clone()),
+                item_id: Some(format!("jira:{}", a.key)),
+            },
+        );
+    }
+}
+
+/// You've looked at a ticket: it leaves Today.
+fn seen_ticket(app: &AppHandle, key: &str) {
+    let state = app.state::<AppState>();
+    let (Some(me), Some(since)) = (state.setting("jira_account"), state.setting("jira_attention_since")) else { return };
+    let needed = jira::mark_seen(&state.db.lock().unwrap(), key, &me, &since, &now()).unwrap_or(false);
+    if needed {
+        refresh_count(app);
+        let _ = app.emit("jira-updated", ());
+    }
+}
+
+/// Tickets that need you, for Today.
+#[tauri::command]
+fn get_ticket_attention(state: State<AppState>) -> Vec<jira::Attention> {
+    ticket_attention(&state)
+}
+
+#[tauri::command]
+fn mark_ticket_seen(app: AppHandle, key: String) {
+    seen_ticket(&app, &key);
 }
 
 #[derive(Serialize)]
@@ -1437,6 +1519,8 @@ pub fn run() {
             jira_sync_now,
             get_tickets,
             get_ticket,
+            get_ticket_attention,
+            mark_ticket_seen,
             recording_status,
             start_recording,
             stop_recording,

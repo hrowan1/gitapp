@@ -188,6 +188,20 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 6 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- When you last looked at a ticket (Today stops showing what came before).
+            ALTER TABLE jira_issues ADD COLUMN seen_at TEXT;
+            -- Whether a desktop notification went out for this event; existing ones never will.
+            ALTER TABLE jira_events ADD COLUMN notified INTEGER NOT NULL DEFAULT 0;
+            UPDATE jira_events SET notified = 1;
+            PRAGMA user_version = 6;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 

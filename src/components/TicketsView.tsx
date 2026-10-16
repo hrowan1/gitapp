@@ -20,6 +20,7 @@ const EVENT_ICON: Record<string, IconName> = {
   assignee: "today",
   resolution: "checkCircle",
   comment: "message",
+  mention: "message",
   created: "ticket",
 };
 
@@ -33,6 +34,7 @@ function describe(e: TicketEvent): string {
       if (e.fromMe) return `${e.actorIsMe ? "You handed it on" : `${who} reassigned it`} · ${e.detail}`;
       return `${who}: ${e.detail}`;
     case "comment":
+    case "mention":
       return `${who} ${e.detail.charAt(0).toLowerCase()}${e.detail.slice(1)}`;
     case "created":
       return e.actorIsMe ? "You created it" : "Created";
@@ -93,6 +95,11 @@ export function TicketsView({
     api.jiraStatus().then(setStatus).catch(() => setStatus(null));
     api.getTickets().then(setTickets).catch(() => setTickets([]));
   }, [version]);
+
+  // Looking at a ticket settles whatever made it need you (it leaves Today).
+  useEffect(() => {
+    if (selected) api.markTicketSeen(selected).catch(() => {});
+  }, [selected]);
 
   useEffect(() => {
     if (!selected) return setDetail(null);
