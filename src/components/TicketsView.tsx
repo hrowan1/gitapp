@@ -57,6 +57,7 @@ export function TicketsView({
   const [tickets, setTickets] = useState<Ticket[] | null>(null);
   const [filter, setFilter] = useState<Filter>("active");
   const [text, setText] = useState("");
+  const [mineOnly, setMineOnly] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<TicketDetail | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -76,9 +77,10 @@ export function TicketsView({
     return (tickets ?? []).filter(
       (t) =>
         (filter === "all" || (filter === "done" ? t.category === "done" : t.category !== "done")) &&
+        (!mineOnly || t.assignedToMe) &&
         (!q || `${t.key} ${t.summary} ${t.status} ${t.project}`.toLowerCase().includes(q)),
     );
-  }, [tickets, filter, text]);
+  }, [tickets, filter, mineOnly, text]);
   const ticket = tickets?.find((t) => t.key === selected) ?? null;
 
   if (status && !status.connected) {
@@ -107,7 +109,7 @@ export function TicketsView({
       <div className="headline compact">
         <h1>Tickets</h1>
         <p className="muted">
-          Assigned to you now or before{status?.site ? ` · ${status.site.replace("https://", "")}` : ""}
+          {mineOnly ? "Assigned to you" : "Assigned to you now or before"}{status?.site ? ` · ${status.site.replace("https://", "")}` : ""}
           {status?.lastSync && ` · synced ${age(status.lastSync, now)} ago`}{" "}
           <button
             className="link"
@@ -140,6 +142,10 @@ export function TicketsView({
             </button>
           ))}
         </div>
+        <label className="check">
+          <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Hide previously
+          yours
+        </label>
       </div>
     </>
   );
@@ -179,7 +185,10 @@ export function TicketsView({
                 </div>
               </div>
               <div className="row-right">
-                <span className="age">{t.lastMoveAt ? age(t.lastMoveAt, now) : t.updated ? age(t.updated, now) : ""}</span>
+                {/* The list is sorted by last update, so show that rather than the last status move. */}
+                <span className="age" title={t.updated ? `Updated ${friendlyDate(t.updated)} ${clock(t.updated)}` : undefined}>
+                  {t.updated ? age(t.updated, now) : t.lastMoveAt ? age(t.lastMoveAt, now) : ""}
+                </span>
               </div>
             </div>
           ))}
