@@ -325,6 +325,21 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
         )?;
     }
     db::set_setting(conn, "jira_attention_since", &ago(3 * 24 * 60))?;
+    for (key, description) in [
+        ("BILL-142", "When a customer changes plan mid-cycle we charge the full new price from the next invoice. \
+          Prorate instead: credit the unused part of the old plan and charge the remaining part of the new one.\n\n\
+          Acceptance criteria\n\n\
+          • Upgrades are charged immediately for the remaining days\n\
+          • Downgrades become a credit note applied to the next invoice\n\
+          • Annual plans round to the nearest penny, not the nearest day\n\n\
+          Out of scope: refunds to card."),
+        ("MOB-77", "Field engineers lose signal in basements. The order list should open from the last sync and show \
+          when it was last refreshed.\n\n• Cache the last 200 orders\n• Show a banner when offline\n• Queue edits and replay them on reconnect"),
+        ("ES-305", "EU customers' receipts show 20% VAT whatever their country.\n\nSteps to reproduce\n\n\
+          1. Buy anything with a German billing address\n2. Open the receipt email\n\nExpected 19%, got 20%."),
+    ] {
+        conn.execute("UPDATE jira_issues SET description = ?2 WHERE key = ?1", rusqlite::params![key, description])?;
+    }
 
     // Recorded meetings (no audio in the demo, just transcripts).
     for (id, title, from, to, ticket, lines) in [

@@ -50,6 +50,56 @@ const INVOLVEMENT: Record<string, string> = {
   updated: "you worked on it",
 };
 
+const DESCRIPTION_OPEN = "ticket-description-open";
+
+/** Text with its URLs clickable (they open in the browser). */
+function Linkified({ text }: { text: string }) {
+  const parts = text.split(/(https?:\/\/[^\s)]+)/g);
+  return (
+    <>
+      {parts.map((p, i) =>
+        i % 2 ? (
+          <a key={i} href={p} onClick={(e) => (e.preventDefault(), openUrl(p))}>
+            {p}
+          </a>
+        ) : (
+          p
+        ),
+      )}
+    </>
+  );
+}
+
+/** The ticket's description: a short preview, or all of it. Remembers which you prefer. */
+function Description({ text }: { text: string }) {
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem(DESCRIPTION_OPEN) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggle = () => {
+    setOpen(!open);
+    try {
+      localStorage.setItem(DESCRIPTION_OPEN, open ? "0" : "1");
+    } catch {
+      // Not remembered; fine.
+    }
+  };
+  return (
+    <div className={`description${open ? " open" : ""}`}>
+      <button className="description-head" onClick={toggle} aria-expanded={open}>
+        <Icon name="chevronDown" size={13} className={`chevron${open ? "" : " closed"}`} />
+        <span className="group-label">Description</span>
+      </button>
+      <div className="description-body" onClick={open ? undefined : toggle} title={open ? undefined : "Show all"}>
+        <Linkified text={text} />
+      </div>
+    </div>
+  );
+}
+
 /** One day's movements, newest day first. */
 function byDay(events: TicketEvent[]): { day: string; events: TicketEvent[] }[] {
   const out: { day: string; events: TicketEvent[] }[] = [];
@@ -260,6 +310,8 @@ export function TicketsView({
                 <span className="grow">Open in Jira</span>
               </button>
             </div>
+
+            {detail?.description && <Description text={detail.description} />}
 
             {detail && detail.prs.length > 0 && (
               <div className="timeline">

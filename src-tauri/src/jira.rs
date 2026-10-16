@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -75,6 +75,8 @@ pub struct Issue {
     pub id: String,
     pub key: String,
     pub summary: String,
+    /// Plain text, see `adf_plain`.
+    pub description: Option<String>,
     pub status: String,
     /// new | indeterminate | done
     pub category: String,
@@ -98,6 +100,96 @@ pub struct Comment {
     pub text: String,
     /// Account ids @mentioned in it.
     pub mentions: Vec<String>,
+}
+
+/// An Atlassian Document Format body as readable plain text: blocks separated by blank lines, list
+/// items as "• " / "1. " lines, mentions and emoji as their text, links as their URL.
+pub fn adf_plain(v: &Value) -> String {
+    fn inline(v: &Value, out: &mut String) {
+        match v.get("type").and_then(Value::as_str) {
+            Some("text") => out.push_str(v["text"].as_str().unwrap_or_default()),
+            Some("hardBreak") => out.push('\n'),
+            Some("mention" | "emoji") => out.push_str(v["attrs"]["text"].as_str().or(v["attrs"]["shortName"].as_str()).unwrap_or_default()),
+            Some("inlineCard" | "blockCard") => out.push_str(v["attrs"]["url"].as_str().unwrap_or_default()),
+            _ => {
+                for c in v.get("content").and_then(Value::as_array).into_iter().flatten() {
+                    inline(c, out);
+                }
+            }
+        }
+    }
+    fn block(v: &Value, indent: &str, out: &mut String) {
+        let children = || v.get("content").and_then(Value::as_array).into_iter().flatten();
+        match v.get("type").and_then(Value::as_str) {
+            Some("doc" | "panel" | "blockquote" | "expand" | "nestedExpand" | "layoutSection" | "layoutColumn") => {
+                for c in children() {
+                    block(c, indent, out);
+                }
+            }
+            Some(list @ ("bulletList" | "orderedList")) => {
+                for (n, item) in children().enumerate() {
+                    let marker = if list == "bulletList" { "• ".to_string() } else { format!("{}. ", n + 1) };
+                    out.push_str(indent);
+                    out.push_str(&marker);
+                    let mut first = true;
+                    for c in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+                        if matches!(c["type"].as_str(), Some("bulletList" | "orderedList")) {
+                            out.push('\n');
+                            block(c, &format!("{indent}   "), out);
+                            first = true;
+                            continue;
+                        }
+                        if !first {
+                            out.push(' ');
+                        }
+                        inline(c, out);
+                        first = false;
+                    }
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                if indent.is_empty() {
+                    out.push('\n');
+                }
+            }
+            Some("rule") => out.push_str("———\n\n"),
+            Some("table") => {
+                for row in children() {
+                    let cells: Vec<String> = row
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .map(|cell| {
+                            let mut t = String::new();
+                            inline(cell, &mut t);
+                            t.trim().to_string()
+                        })
+                        .collect();
+                    out.push_str(&cells.join(" | "));
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            _ => {
+                // paragraph, heading, codeBlock, mediaGroup…
+                let mut t = String::new();
+                inline(v, &mut t);
+                if !t.trim().is_empty() {
+                    out.push_str(t.trim_end());
+                    out.push_str("\n\n");
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    match v {
+        Value::String(s) => out.push_str(s),
+        Value::Null => {}
+        _ => block(v, "", &mut out),
+    }
+    out.trim().to_string()
 }
 
 /// Account ids @mentioned in an Atlassian Document Format body.
@@ -193,7 +285,7 @@ impl Client {
         for _ in 0..20 {
             let body = json!({
                 "jql": jql,
-                "fields": ["summary", "status", "issuetype", "priority", "project", "assignee", "reporter",
+                "fields": ["summary", "description", "status", "issuetype", "priority", "project", "assignee", "reporter",
                            "created", "updated", "resolutiondate", "comment"],
                 "maxResults": 100,
                 "nextPageToken": token,
@@ -291,6 +383,7 @@ fn parse_issue(i: &Value) -> Issue {
         id: i["id"].as_str().unwrap_or_default().to_string(),
         key: i["key"].as_str().unwrap_or_default().to_string(),
         summary: s(&f["summary"]).unwrap_or_default(),
+        description: Some(adf_plain(&f["description"])).filter(|d| !d.is_empty()),
         status: s(&f["status"]["name"]).unwrap_or_default(),
         category: s(&f["status"]["statusCategory"]["key"]).unwrap_or_else(|| "new".into()),
         issue_type: s(&f["issuetype"]["name"]).unwrap_or_default(),
@@ -396,9 +489,10 @@ pub fn store(conn: &Connection, client: &Client, me: &str, issues: &[Issue], cha
     for i in issues {
         tx.execute(
             "INSERT INTO jira_issues (key, id, summary, status, category, issue_type, priority, project, assignee,
-                                      assigned_to_me, url, created, updated, resolved)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                                      assigned_to_me, url, created, updated, resolved, description)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(key) DO UPDATE SET summary = excluded.summary, status = excluded.status,
+                description = excluded.description,
                 category = excluded.category, issue_type = excluded.issue_type, priority = excluded.priority,
                 assignee = excluded.assignee, assigned_to_me = excluded.assigned_to_me, updated = excluded.updated,
                 resolved = excluded.resolved",
@@ -417,6 +511,7 @@ pub fn store(conn: &Connection, client: &Client, me: &str, issues: &[Issue], cha
                 i.created.map(fmt_ts),
                 i.updated.map(fmt_ts),
                 i.resolved.map(fmt_ts),
+                i.description,
             ],
         )?;
     }
@@ -712,6 +807,14 @@ pub fn mark_seen(conn: &Connection, key: &str, me: &str, since: &str, now: &str)
     Ok(needed)
 }
 
+/// A ticket's description, if it has one.
+pub fn description(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT description FROM jira_issues WHERE key = ?1", [key], |r| r.get(0))
+        .optional()?
+        .flatten())
+}
+
 pub fn forget(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM jira_issues; DELETE FROM jira_events;
@@ -734,6 +837,26 @@ mod tests {
              OR issuekey IN updatedBy(\"abc123\", \"2026/09/16\")) AND updated >= \"2026-09-16 08:00\" ORDER BY updated DESC"
         );
         assert!(!involved_jql(since, "abc", false).contains("updatedBy"));
+    }
+
+    #[test]
+    fn description_as_plain_text() {
+        let t = |s: &str| json!({"type": "text", "text": s});
+        let p = |c: Value| json!({"type": "paragraph", "content": c});
+        let doc = json!({"type": "doc", "content": [
+            {"type": "heading", "attrs": {"level": 2}, "content": [t("Problem")]},
+            p(json!([t("Receipts use the "), {"type": "text", "text": "UK", "marks": [{"type": "strong"}]}, t(" rate."), {"type": "hardBreak"}, t("Ask "), {"type": "mention", "attrs": {"id": "x", "text": "@Sam"}}])),
+            {"type": "bulletList", "content": [
+                {"type": "listItem", "content": [p(json!([t("Germany")]))]},
+                {"type": "listItem", "content": [p(json!([t("France")])), {"type": "orderedList", "content": [
+                    {"type": "listItem", "content": [p(json!([t("Paris")]))]}]}]}]},
+            p(json!([{"type": "inlineCard", "attrs": {"url": "https://example.com/x"}}])),
+        ]});
+        assert_eq!(
+            adf_plain(&doc),
+            "Problem\n\nReceipts use the UK rate.\nAsk @Sam\n\n• Germany\n• France\n   1. Paris\n\nhttps://example.com/x"
+        );
+        assert_eq!(adf_plain(&Value::Null), "");
     }
 
     #[test]

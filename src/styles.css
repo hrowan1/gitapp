@@ -2269,3 +2269,40 @@ a {
 .pal-item .ticket-key {
   margin-right: 4px;
 }
+
+/* ---------- ticket description ---------- */
+
+.description {
+  margin-top: 18px;
+}
+.description-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.description-head .group-label {
+  margin: 0;
+}
+.description-body {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.description:not(.open) .description-body {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--muted);
+  cursor: pointer;
+}
+.description-body a {
+  color: var(--accent-text);
+}

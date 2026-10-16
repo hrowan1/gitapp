@@ -202,6 +202,17 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 7 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- The ticket's description as plain text (paragraphs and list items on their own lines).
+            ALTER TABLE jira_issues ADD COLUMN description TEXT;
+            PRAGMA user_version = 7;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 

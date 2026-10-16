@@ -270,6 +270,8 @@ export interface TicketEvent {
 }
 
 export interface TicketDetail {
+  /** Plain text: paragraphs separated by blank lines, list items as "• " lines. */
+  description?: string | null;
   events: TicketEvent[];
   prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
 }

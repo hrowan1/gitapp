@@ -838,8 +838,9 @@ fn jira_client(state: &AppState) -> Option<jira::Client> {
 
 /// Fetch tickets assigned to the user (now or before) that changed since the last sync,
 /// with their movement history.
-/// Which tickets a Jira sync fetches; bump to re-fetch the first-sync window after widening it.
-const JIRA_SCOPE: &str = "involved";
+/// What a Jira sync fetches; bump to re-fetch the first-sync window after widening it
+/// (tickets that involve you, then descriptions).
+const JIRA_SCOPE: &str = "involved+description";
 
 async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
@@ -1063,6 +1064,7 @@ struct PrLink {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TicketDetail {
+    description: Option<String>,
     events: Vec<jira::TicketEvent>,
     prs: Vec<PrLink>,
 }
@@ -1073,6 +1075,7 @@ fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
     let me = state.setting("jira_account").unwrap_or_default();
     let conn = state.db.lock().unwrap();
     let events = jira::ticket_events(&conn, &key, &me).map_err(err)?;
+    let description = jira::description(&conn, &key).map_err(err)?;
     let like = format!("%{}%", key.to_lowercase());
     let mut stmt = conn
         .prepare(
@@ -1097,7 +1100,7 @@ fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
         })
         .map(|(p, _)| p)
         .collect();
-    Ok(TicketDetail { events, prs })
+    Ok(TicketDetail { description, events, prs })
 }
 
 // ---------- Meetings ----------
