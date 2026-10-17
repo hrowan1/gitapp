@@ -94,41 +94,21 @@ fn now() -> String {
 
 // ---------- sync ----------
 
-/// One thing in the menu bar's list: (menu id, label).
-fn tray_entries(state: &AppState) -> (usize, Vec<(String, String)>) {
-    let clip = |s: &str, n: usize| -> String {
-        let s = s.trim();
-        if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n - 1).collect::<String>()) }
-    };
-    let mut prs: Vec<db::Item> = db::list_items(&state.db.relock())
-        .map(|items| items.into_iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).collect())
-        .unwrap_or_default();
-    prs.sort_by(|a, b| b.since.cmp(&a.since));
-    let tickets = ticket_attention(state);
-    let actions = open_actions(state);
-    let total = prs.len() + tickets.len() + actions.len();
-    let mut entries: Vec<(String, String)> = Vec::new();
-    for i in prs.iter().take(5) {
-        let repo = i.repo.split('/').nth(1).unwrap_or(&i.repo);
-        let what = if i.kind == "run" { format!("{repo} — {}", clip(&i.title, 46)) } else { format!("{repo}#{} {}", i.number, clip(&i.title, 46)) };
-        entries.push((format!("pr:{}", i.id), what));
-    }
-    for t in tickets.iter().take(3) {
-        entries.push((format!("ticket:{}", t.key), format!("{} {}", t.key, clip(&t.reason, 48))));
-    }
-    for a in actions.iter().take(3) {
-        entries.push((format!("meeting:{}", a.meeting_id), format!("☐ {}", clip(&a.text, 52))));
-    }
-    (total, entries)
+/// How many things need you: PRs and issues, Jira tickets, and your meeting action items.
+fn needs_you_count(state: &AppState) -> usize {
+    let prs = db::list_items(&state.db.relock())
+        .map(|items| items.iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).count())
+        .unwrap_or(0);
+    prs + ticket_attention(state).len() + open_actions(state).len()
 }
 
 /// The menu bar: a monochrome inbox icon (with a dot when something needs you, and the number too if
-/// Settings asks for it), "REC" while recording, and a menu listing what needs you.
+/// Settings asks for it) and "REC" while recording. Clicking it opens the panel.
 fn refresh_tray(app: &AppHandle) {
     let state = app.state::<AppState>();
     let show_count = state.setting("menu_bar_count").as_deref() == Some("1");
     let recording = state.recorder.relock().is_some();
-    let (total, entries) = tray_entries(&state);
+    let total = needs_you_count(&state);
     let Some(tray) = app.tray_by_id("main") else { return };
     #[cfg(target_os = "macos")]
     {
@@ -150,74 +130,113 @@ fn refresh_tray(app: &AppHandle) {
         n => format!("Dev Inbox — {n} things need you"),
     };
     let _ = tray.set_tooltip(Some(tooltip));
-    if let Ok(menu) = tray_menu(app, total, &entries, recording) {
-        let _ = tray.set_menu(Some(menu));
-    }
+    // Let an open panel catch up.
+    let _ = app.emit_to("tray", "inbox-updated", ());
 }
 
-fn tray_menu(app: &AppHandle, total: usize, entries: &[(String, String)], recording: bool) -> tauri::Result<Menu<tauri::Wry>> {
+/// Right-click on the icon: a short native menu.
+fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
-    let header = match total {
-        0 => "You're all caught up".to_string(),
-        1 => "1 thing needs you".to_string(),
-        n => format!("{n} things need you"),
-    };
-    menu.append(&MenuItem::with_id(app, "today", header, true, None::<&str>)?)?;
-    for (id, label) in entries {
-        menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
-    }
-    if total > entries.len() {
-        menu.append(&MenuItem::with_id(app, "today", format!("…and {} more", total - entries.len()), true, None::<&str>)?)?;
-    }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "open", "Open Dev Inbox", true, None::<&str>)?)?;
-    if recording {
-        menu.append(&MenuItem::with_id(app, "stop-recording", "Stop recording", true, None::<&str>)?)?;
-    } else {
-        menu.append(&MenuItem::with_id(app, "record", "Record a meeting", true, None::<&str>)?)?;
-    }
     menu.append(&MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "Quit Dev Inbox", true, None::<&str>)?)?;
     Ok(menu)
 }
 
-/// A menu bar item was chosen.
 fn tray_action(app: &AppHandle, id: &str) {
     match id {
-        "open" | "today" => {
-            show_main(app);
-            let _ = app.emit("navigate", "today");
-        }
+        "open" => show_main(app),
         "sync" => app.state::<AppState>().wake.notify_one(),
         "quit" => app.exit(0),
-        "record" => {
-            show_main(app);
-            let _ = app.emit("navigate", "meetings");
-            if let Err(e) = start_recording(app.clone(), None) {
-                let _ = app.emit("recording-event", serde_json::json!({"event": "error", "message": e}));
-            }
-        }
-        "stop-recording" => {
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = stop_recording(app).await;
-            });
-        }
-        _ => {
-            if let Some(pr) = id.strip_prefix("pr:") {
-                let state = app.state::<AppState>();
-                let url = db::PrRef::load(&state.db.relock(), pr).ok().flatten().map(|p| p.url);
-                notification_clicked(app, url, Some(pr.to_string()));
-            } else if let Some(key) = id.strip_prefix("ticket:") {
-                show_main(app);
-                let _ = app.emit("open-ticket", key);
-            } else if let Some(meeting) = id.strip_prefix("meeting:") {
-                show_main(app);
-                let _ = app.emit("open-meeting", meeting);
-            }
-        }
+        _ => {}
     }
+}
+
+const PANEL_WIDTH: f64 = 380.0;
+
+/// The menu bar panel: a borderless glass window of the app's own UI, under the icon.
+fn create_panel(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::utils::config::{WindowEffectsConfig};
+    use tauri::window::{Effect, EffectState};
+    let panel = tauri::WebviewWindowBuilder::new(app, "tray", tauri::WebviewUrl::App("index.html".into()))
+        .title("Dev Inbox")
+        .inner_size(PANEL_WIDTH, 480.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        // The glass draws its own rounded edge; a window shadow would outline the square frame.
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible_on_all_workspaces(true)
+        .visible(false)
+        .focused(false)
+        .effects(WindowEffectsConfig {
+            // Liquid Glass on macOS 26+, the classic popover material before.
+            effects: vec![Effect::LiquidGlassRegular, Effect::Popover],
+            state: Some(EffectState::Active),
+            radius: Some(16.0),
+            color: None,
+            interactive: false,
+        })
+        .build()?;
+    let _ = panel;
+    Ok(())
+}
+
+/// Show the panel under the tray icon (or hide it if it's showing).
+fn toggle_panel(app: &AppHandle, icon: tauri::Rect) {
+    let Some(panel) = app.get_webview_window("tray") else { return };
+    if panel.is_visible().unwrap_or(false) {
+        let _ = panel.hide();
+        return;
+    }
+    let scale = panel.scale_factor().unwrap_or(2.0);
+    let at = icon.position.to_physical::<f64>(scale);
+    let size = icon.size.to_physical::<f64>(scale);
+    let width = PANEL_WIDTH * scale;
+    let mut x = at.x + size.width / 2.0 - width / 2.0;
+    // Keep it on the screen the icon is on.
+    if let Ok(Some(monitor)) = panel.monitor_from_point(at.x, at.y) {
+        let left = monitor.position().x as f64;
+        let right = left + monitor.size().width as f64;
+        x = x.clamp(left + 8.0 * scale, right - width - 8.0 * scale);
+    }
+    let y = at.y + size.height + 6.0 * scale;
+    let _ = panel.set_position(tauri::PhysicalPosition::new(x, y));
+    let _ = panel.show();
+    let _ = panel.set_focus();
+    let _ = app.emit_to("tray", "panel-shown", ());
+}
+
+/// From the panel: open something in the main window ("view" with a view name, "ticket" with a key,
+/// "meeting" with an id, "palette"), and put the panel away.
+#[tauri::command(async)]
+fn open_in_main(app: AppHandle, kind: String, target: Option<String>) {
+    if let Some(panel) = app.get_webview_window("tray") {
+        let _ = panel.hide();
+    }
+    show_main(&app);
+    let target = target.unwrap_or_default();
+    let _ = match kind.as_str() {
+        "ticket" => app.emit_to("main", "open-ticket", target),
+        "meeting" => app.emit_to("main", "open-meeting", target),
+        "palette" => app.emit_to("main", "open-palette", ()),
+        _ => app.emit_to("main", "navigate", if target.is_empty() { "today".to_string() } else { target }),
+    };
+}
+
+#[tauri::command(async)]
+fn hide_panel(app: AppHandle) {
+    if let Some(panel) = app.get_webview_window("tray") {
+        let _ = panel.hide();
+    }
+}
+
+#[tauri::command(async)]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
 }
 
 fn refresh_count(app: &AppHandle) {
@@ -2389,20 +2408,43 @@ pub fn run() {
                 }
             }
 
-            let menu = tray_menu(app.handle(), 0, &[], false)?;
+            let menu = tray_menu(app.handle())?;
             // macOS: a monochrome template icon that adapts to light/dark menu bars.
             #[cfg(target_os = "macos")]
             let (icon, template) = (tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?, true);
             #[cfg(not(target_os = "macos"))]
             let (icon, template) = (app.default_window_icon().unwrap().clone(), false);
+            create_panel(app.handle())?;
             TrayIconBuilder::with_id("main")
                 .icon(icon)
                 .icon_as_template(template)
                 .tooltip("Dev Inbox")
                 .menu(&menu)
-                .show_menu_on_left_click(true)
+                // Left click: the panel. Right click: the short menu.
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| tray_action(app, event.id.as_ref()))
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        rect,
+                        ..
+                    } = event
+                    {
+                        toggle_panel(tray.app_handle(), rect);
+                    }
+                })
                 .build(app)?;
+            // Test aid: DEV_INBOX_PANEL_TEST=1 opens the panel a few seconds after launch.
+            if std::env::var("DEV_INBOX_PANEL_TEST").is_ok_and(|v| v == "1") {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                    if let Some(rect) = handle.tray_by_id("main").and_then(|t| t.rect().ok().flatten()) {
+                        toggle_panel(&handle, rect);
+                    }
+                });
+            }
             refresh_tray(app.handle());
 
             if let Err(e) = app.global_shortcut().register(palette_shortcut()) {
@@ -2413,6 +2455,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // The menu bar panel goes away when you click anywhere else.
+            if window.label() == "tray" {
+                if let WindowEvent::Focused(false) = event {
+                    let _ = window.hide();
+                }
+                return;
+            }
             // Closing the window keeps the app alive in the tray.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
@@ -2447,6 +2496,9 @@ pub fn run() {
             search_meetings,
             link_meeting,
             dismiss_suggestion,
+            open_in_main,
+            hide_panel,
+            quit_app,
             explain_ci,
             known_voices,
             ask_history,
