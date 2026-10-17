@@ -1032,6 +1032,64 @@ fn maybe_digest(app: &AppHandle) {
 
 const JIRA_KEYRING_USER: &str = "jira-token";
 
+/// Jira, for changing a ticket; an error if it isn't connected (or this is the demo).
+fn jira_for_edit(state: &AppState) -> CmdResult<jira::Client> {
+    if state.demo {
+        return Err("Jira isn't connected in demo mode".into());
+    }
+    jira_client(state).ok_or_else(|| "Connect Jira in Settings first".to_string())
+}
+
+/// After changing a ticket: fetch it again so the app shows the new status, assignee and history.
+async fn refresh_ticket(app: &AppHandle, client: &jira::Client, key: &str) {
+    let me = app.state::<AppState>().setting("jira_account").unwrap_or_default();
+    if let Ok((issues, mut changes)) = client.issue_with_history(key).await {
+        for i in &issues {
+            changes.extend(jira::issue_changes(i, &me));
+        }
+        let _ = jira::store(&app.state::<AppState>().db.relock(), client, &me, &issues, &changes);
+    }
+    refresh_tray(app);
+    let _ = app.emit("jira-updated", ());
+}
+
+/// The statuses a ticket can move to from where it is.
+#[tauri::command]
+async fn jira_transitions(app: AppHandle, key: String) -> CmdResult<Vec<jira::Transition>> {
+    let client = jira_for_edit(&app.state::<AppState>())?;
+    client.transitions(&key).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Move a ticket to another status (in Jira).
+#[tauri::command]
+async fn jira_move(app: AppHandle, key: String, transition_id: String) -> CmdResult<()> {
+    let client = jira_for_edit(&app.state::<AppState>())?;
+    client.transition(&key, &transition_id).await.map_err(|e| format!("{e:#}"))?;
+    refresh_ticket(&app, &client, &key).await;
+    Ok(())
+}
+
+/// People a ticket can be assigned to, matching what's typed.
+#[tauri::command]
+async fn jira_assignable(app: AppHandle, key: String, query: String) -> CmdResult<Vec<jira::JiraUser>> {
+    let client = jira_for_edit(&app.state::<AppState>())?;
+    client.assignable(&key, query.trim()).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Assign a ticket (in Jira); None unassigns it.
+#[tauri::command]
+async fn jira_assign(app: AppHandle, key: String, account_id: Option<String>) -> CmdResult<()> {
+    let client = jira_for_edit(&app.state::<AppState>())?;
+    // "me": the connected Jira account.
+    let account_id = match account_id.as_deref() {
+        Some("me") => Some(app.state::<AppState>().setting("jira_account").ok_or("Connect Jira in Settings first")?),
+        _ => account_id,
+    };
+    client.assign(&key, account_id.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+    refresh_ticket(&app, &client, &key).await;
+    Ok(())
+}
+
 fn jira_client(state: &AppState) -> Option<jira::Client> {
     let site = state.setting("jira_site")?;
     let email = state.setting("jira_email")?;
@@ -2503,6 +2561,10 @@ pub fn run() {
             link_meeting,
             dismiss_suggestion,
             open_in_main,
+            jira_transitions,
+            jira_move,
+            jira_assignable,
+            jira_assign,
             hide_panel,
             quit_app,
             explain_ci,

@@ -200,6 +200,24 @@ export interface Segment {
   voice?: string | null;
 }
 
+/** A move a ticket can make in Jira. */
+export interface JiraTransition {
+  id: string;
+  /** The transition's name ("Start progress"). */
+  name: string;
+  /** The status it moves to ("In Progress"). */
+  to: string;
+  /** new | indeterminate | done */
+  category: string;
+}
+
+/** Someone a ticket can be assigned to. */
+export interface JiraUser {
+  accountId: string;
+  name: string;
+  avatar?: string | null;
+}
+
 /** Why a PR's checks failed, in words. */
 export interface CiExplanation {
   text: string;
@@ -466,6 +484,11 @@ export const api = {
   searchMeetings: (query: string) => invoke<MeetingSearchResult[]>("search_meetings", { query }),
   linkMeeting: (id: string, ticket: string | null) => invoke<void>("link_meeting", { id, ticket }),
   dismissSuggestion: (id: string) => invoke<void>("dismiss_suggestion", { id }),
+  jiraTransitions: (key: string) => invoke<JiraTransition[]>("jira_transitions", { key }),
+  jiraMove: (key: string, transitionId: string) => invoke<void>("jira_move", { key, transitionId }),
+  jiraAssignable: (key: string, query: string) => invoke<JiraUser[]>("jira_assignable", { key, query }),
+  /** accountId "me" assigns it to you; null unassigns. */
+  jiraAssign: (key: string, accountId: string | null) => invoke<void>("jira_assign", { key, accountId }),
   knownVoices: () => invoke<KnownVoice[]>("known_voices"),
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
   explainCi: (prId: string) => invoke<CiExplanation>("explain_ci", { prId }),

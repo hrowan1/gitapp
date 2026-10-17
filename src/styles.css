@@ -2891,3 +2891,51 @@ html.panel-window #root {
   font-size: 10.5px;
   color: var(--muted);
 }
+
+/* ---------- ticket status & assignee pickers ---------- */
+
+.picker {
+  position: relative;
+  display: inline-flex;
+}
+.picker-menu {
+  left: 0;
+  right: auto;
+  top: calc(100% + 4px);
+  width: 260px;
+}
+.chip-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  box-shadow: none;
+}
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 13px;
+}
+.link-button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.picker-menu .menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}

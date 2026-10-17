@@ -974,9 +974,9 @@ function JiraCard() {
     <section className="card">
       <h2>Jira</h2>
       <p className="muted">
-        Read-only. Shows tickets that involve you (assigned, reported or worked on), and how they moved, in Today,
-        Tickets and the Day view.
-        Nothing is written to Jira. The token is stored in your system keychain.
+        Shows tickets that involve you (assigned, reported or worked on), and how they moved, in Today, Tickets and
+        the Day view. From Tickets you can move a ticket's status and assign it; nothing else is written to Jira. The
+        token is stored in your system keychain.
       </p>
       <form
         onSubmit={async (e) => {

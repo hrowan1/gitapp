@@ -250,14 +250,73 @@ impl Client {
         }
         let body: Value = res.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
-            let msg = body["errorMessages"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            bail!("Jira returned {status} {msg}");
+            bail!("Jira returned {status} {}", error_text(&body));
         }
         Ok(body)
+    }
+
+    // ---------- the two things Dev Inbox changes in Jira: status and assignee ----------
+
+    /// The moves available for a ticket from its current status (as the user's own permissions allow).
+    pub async fn transitions(&self, key: &str) -> Result<Vec<Transition>> {
+        let v = self.send(self.http.get(format!("{}/rest/api/3/issue/{key}/transitions", self.base))).await?;
+        Ok(v["transitions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["isAvailable"].as_bool() != Some(false))
+            .filter_map(|t| {
+                Some(Transition {
+                    id: t["id"].as_str()?.to_string(),
+                    name: t["name"].as_str().unwrap_or_default().to_string(),
+                    to: t["to"]["name"].as_str().unwrap_or_default().to_string(),
+                    category: t["to"]["statusCategory"]["key"].as_str().unwrap_or("new").to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Move a ticket. Transitions that need fields filled in (a resolution, a comment…) are refused by
+    /// Jira with a message saying which; that message is passed on.
+    pub async fn transition(&self, key: &str, transition_id: &str) -> Result<()> {
+        let body = json!({ "transition": { "id": transition_id } });
+        self.send(self.http.post(format!("{}/rest/api/3/issue/{key}/transitions", self.base)).json(&body)).await?;
+        Ok(())
+    }
+
+    /// People who can be assigned the ticket, matching `query` (name or email); all of them if empty.
+    pub async fn assignable(&self, key: &str, query: &str) -> Result<Vec<JiraUser>> {
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/rest/api/3/user/assignable/search", self.base),
+            &[("issueKey", key), ("query", query), ("maxResults", "20")],
+        )?;
+        let v = self.send(self.http.get(url)).await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|u| u["active"].as_bool() != Some(false))
+            .filter_map(|u| {
+                Some(JiraUser {
+                    account_id: u["accountId"].as_str()?.to_string(),
+                    name: u["displayName"].as_str().unwrap_or_default().to_string(),
+                    avatar: u["avatarUrls"]["24x24"].as_str().map(String::from),
+                })
+            })
+            .collect())
+    }
+
+    /// Assign a ticket to someone (None: unassign).
+    pub async fn assign(&self, key: &str, account_id: Option<&str>) -> Result<()> {
+        let body = json!({ "accountId": account_id });
+        self.send(self.http.put(format!("{}/rest/api/3/issue/{key}/assignee", self.base)).json(&body)).await?;
+        Ok(())
+    }
+
+    /// One ticket and its history, fresh (after changing it, so the app shows the result at once).
+    pub async fn issue_with_history(&self, key: &str) -> Result<(Vec<Issue>, Vec<Change>)> {
+        let issues = self.search(&format!("key = \"{}\"", key.replace('"', ""))).await?;
+        let changes = self.changelogs(&issues).await?;
+        Ok((issues, changes))
     }
 
     pub async fn myself(&self) -> Result<Me> {
@@ -340,6 +399,37 @@ impl Client {
     pub fn browse_url(&self, key: &str) -> String {
         format!("{}/browse/{key}", self.base)
     }
+}
+
+/// Jira's error body in words: its messages, then any per-field errors.
+fn error_text(body: &Value) -> String {
+    let mut parts: Vec<String> = body["errorMessages"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect();
+    if let Some(fields) = body["errors"].as_object() {
+        parts.extend(fields.iter().map(|(field, msg)| format!("{field}: {}", msg.as_str().unwrap_or_default())));
+    }
+    parts.join("; ")
+}
+
+/// A move a ticket can make: "Start progress" → In Progress.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transition {
+    pub id: String,
+    /// The transition's own name ("Start progress").
+    pub name: String,
+    /// The status it moves to ("In Progress").
+    pub to: String,
+    /// new | indeterminate | done
+    pub category: String,
+}
+
+/// Someone a ticket can be assigned to.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraUser {
+    pub account_id: String,
+    pub name: String,
+    pub avatar: Option<String>,
 }
 
 /// JQL for tickets involving the user. `updated_by` adds `updatedBy()`, which also catches comments and edits.
@@ -914,6 +1004,13 @@ mod tests {
         event("g", "ES-1", "2026-10-16T13:00:00Z", "comment", false, None);
         assert_eq!(keys(attention(&conn, "me", since).unwrap()), ["ES-1", "ES-3"], "something new brings it back");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn jira_errors_in_words() {
+        let body = json!({"errorMessages": ["You can't do that"], "errors": {"resolution": "Resolution is required."}});
+        assert_eq!(error_text(&body), "You can't do that; resolution: Resolution is required.");
+        assert_eq!(error_text(&Value::Null), "");
     }
 
     #[test]

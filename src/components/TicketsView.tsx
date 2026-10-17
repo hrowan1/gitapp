@@ -1,6 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { api, type JiraStatus, type Ticket, type TicketDetail, type TicketEvent } from "../lib/api";
+import {
+  api,
+  type JiraStatus,
+  type JiraTransition,
+  type JiraUser,
+  type Ticket,
+  type TicketDetail,
+  type TicketEvent,
+} from "../lib/api";
 import { setActionDone } from "./MeetingActions";
 import { dayKey } from "../lib/day";
 import { clock, friendlyDate } from "../lib/time";
@@ -12,9 +20,6 @@ type Filter = "active" | "all" | "done";
 
 const CATEGORY_TONE: Record<string, string> = { new: "gray", indeterminate: "blue", done: "green" };
 
-function StatusChip({ t }: { t: { status: string; category: string } }) {
-  return <span className={`chip-state tone-${CATEGORY_TONE[t.category] ?? "gray"}`}>{t.status}</span>;
-}
 
 const EVENT_ICON: Record<string, IconName> = {
   status: "chevronRight",
@@ -50,6 +55,152 @@ const INVOLVEMENT: Record<string, string> = {
   reported: "you reported it",
   updated: "you worked on it",
 };
+
+const STATUS_COLOR: Record<string, string> = { new: "var(--muted)", indeterminate: "var(--blue)", done: "var(--green)" };
+
+/** Close a popover when clicking anywhere else. */
+function useDismiss(open: boolean, close: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && close();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open, close]);
+  return ref;
+}
+
+/** The ticket's status; click to move it (in Jira) to one of the statuses its workflow allows. */
+function StatusPicker({ ticket }: { ticket: Ticket }) {
+  const [open, setOpen] = useState(false);
+  const [moves, setMoves] = useState<JiraTransition[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+  const ref = useDismiss(open, close);
+  const toggle = () => {
+    if (open) return setOpen(false);
+    setOpen(true);
+    setMoves(null);
+    api.jiraTransitions(ticket.key).then(setMoves, (e) => {
+      setOpen(false);
+      toast(String(e), true);
+    });
+  };
+  const move = async (t: JiraTransition) => {
+    setOpen(false);
+    setBusy(true);
+    try {
+      await api.jiraMove(ticket.key, t.id);
+      toast(`${ticket.key} moved to ${t.to}`);
+    } catch (e) {
+      toast(String(e), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="picker" ref={ref}>
+      <button
+        className={`chip-state chip-button tone-${CATEGORY_TONE[ticket.category] ?? "gray"}`}
+        onClick={toggle}
+        disabled={busy}
+        title="Move to another status (in Jira)"
+      >
+        {busy ? "Moving…" : ticket.status}
+        <Icon name="chevronDown" size={11} />
+      </button>
+      {open && (
+        <div className="menu picker-menu">
+          <div className="menu-label">Move to</div>
+          {moves === null && <div className="menu-item muted">Loading…</div>}
+          {moves?.length === 0 && <div className="menu-item muted">No moves available from {ticket.status}</div>}
+          {moves
+            ?.filter((t) => t.to !== ticket.status)
+            .map((t) => (
+              <button key={t.id} className="menu-item" onClick={() => void move(t)}>
+                <span className="status-dot" style={{ background: STATUS_COLOR[t.category] ?? "var(--muted)" }} />
+                <span className="grow">{t.to}</span>
+                {t.name.toLowerCase() !== t.to.toLowerCase() && <span className="muted small">{t.name}</span>}
+              </button>
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Who has the ticket; click to assign it (in Jira) to you, someone else, or nobody. */
+function AssigneePicker({ ticket }: { ticket: Ticket }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [people, setPeople] = useState<JiraUser[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+  const ref = useDismiss(open, close);
+  useEffect(() => {
+    if (!open) return;
+    setPeople(null);
+    const t = setTimeout(() => {
+      api.jiraAssignable(ticket.key, query).then(setPeople, (e) => {
+        setOpen(false);
+        toast(String(e), true);
+      });
+    }, 200);
+    return () => clearTimeout(t);
+  }, [open, query, ticket.key]);
+  const assign = async (accountId: string | null, name: string) => {
+    setOpen(false);
+    setBusy(true);
+    try {
+      await api.jiraAssign(ticket.key, accountId);
+      toast(accountId === null ? `${ticket.key} unassigned` : `${ticket.key} assigned to ${name}`);
+    } catch (e) {
+      toast(String(e), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const label = ticket.assignedToMe ? "Assigned to you" : ticket.assignee ? `With ${ticket.assignee}` : "Unassigned";
+  return (
+    <div className="picker" ref={ref}>
+      <button className="link-button" onClick={() => setOpen(!open)} disabled={busy} title="Assign to someone (in Jira)">
+        <Icon name="today" size={12} />
+        {busy ? "Assigning…" : label}
+        <Icon name="chevronDown" size={11} />
+      </button>
+      {open && (
+        <div className="menu picker-menu">
+          {!ticket.assignedToMe && (
+            <button className="menu-item" onClick={() => void assign("me", "you")}>
+              <Icon name="check" size={13} /> <span className="grow">Assign to me</span>
+            </button>
+          )}
+          <div className="menu-input">
+            <input autoFocus placeholder="Find someone…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          </div>
+          {people === null && <div className="menu-item muted">Loading…</div>}
+          {people?.length === 0 && <div className="menu-item muted">Nobody matches</div>}
+          {people?.slice(0, 8).map((p) => (
+            <button key={p.accountId} className="menu-item" onClick={() => void assign(p.accountId, p.name)}>
+              {p.avatar ? <img className="avatar xs" src={p.avatar} alt="" /> : <Icon name="today" size={13} />}
+              <span className="grow">{p.name}</span>
+            </button>
+          ))}
+          {ticket.assignee && (
+            <button className="menu-item" onClick={() => void assign(null, "")}>
+              <Icon name="x" size={13} /> <span className="grow">Unassign</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /** Meetings linked to the ticket in this app (Jira isn't touched), with their notes and your action items. */
 function TicketMeetings({ ticketKey, detail, onOpen }: { ticketKey: string; detail: TicketDetail; onOpen: (id: string) => void }) {
@@ -357,10 +508,8 @@ export function TicketsView({
             </div>
             <h2 className="detail-title">{ticket.summary}</h2>
             <div className="detail-state">
-              <StatusChip t={ticket} />
-              <span className="muted">
-                {ticket.assignedToMe ? "Assigned to you" : ticket.assignee ? `Now with ${ticket.assignee}` : "Unassigned"}
-              </span>
+              <StatusPicker ticket={ticket} />
+              <AssigneePicker ticket={ticket} />
             </div>
             <div className="action-group">
               <button className="action primary" onClick={() => openUrl(ticket.url)}>
