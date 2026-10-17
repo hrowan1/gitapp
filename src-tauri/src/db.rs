@@ -339,6 +339,24 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 14 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Your comments the reminder rules didn't match but that might mean "come back to this later",
+            -- waiting for the AI to read (once each).
+            CREATE TABLE IF NOT EXISTS intent_queue (
+                comment_key TEXT PRIMARY KEY,  -- "intent:<comment id>", as the rules use
+                pr_id TEXT NOT NULL,
+                at TEXT NOT NULL,
+                body TEXT NOT NULL,
+                checked INTEGER NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 14;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -950,7 +968,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries; DELETE FROM intent_queue;",
     )?;
     Ok(())
 }

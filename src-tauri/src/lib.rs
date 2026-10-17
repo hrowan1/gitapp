@@ -10,6 +10,7 @@ mod ai;
 mod ask;
 mod ci;
 mod meetings;
+mod reminders;
 mod search;
 mod suggest;
 mod summary;
@@ -132,6 +133,7 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
             }
             update_tray(app, out.needs_you + ticket_attention(&state).len() + open_actions(&state).len());
             let _ = app.emit("inbox-updated", ());
+            read_intents(app);
             Ok(())
         }
         Err(e) => {
@@ -1567,6 +1569,64 @@ async fn explain_ci(app: AppHandle, pr_id: String) -> CmdResult<CiExplanation> {
         .map_err(err)?
         .map_err(|e| format!("{e:#}"))?;
     Ok(CiExplanation { text, by, checks: failed.into_iter().map(|c| (c.name, c.url)).collect() })
+}
+
+/// Smarter reminders: have the AI read the comments the reminder rules didn't match but that might
+/// mean "I'll come back to this", and park those PRs. A background job; each comment is read once,
+/// and if the AI can't be reached they wait for the next sync.
+fn read_intents(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.demo {
+        return;
+    }
+    let Some(engine) = ai_engine(&state) else { return };
+    let pending = reminders::pending(&state.db.relock(), 10).unwrap_or_default();
+    if pending.is_empty() {
+        return;
+    }
+    spawn_job(app, "ai-intents".into(), |_| {}, move |app| {
+        let state = app.state::<AppState>();
+        let notifications = state.setting("notifications").as_deref() != Some("0");
+        let mut changed = false;
+        for (key, pr_id, at, body) in pending {
+            let prompt = ai::Prompt {
+                instructions: reminders::INSTRUCTIONS.into(),
+                prompt: format!("Comment:\n{}", ai::fit(&body, engine.budget().saturating_sub(800))),
+                max_tokens: 512,
+            };
+            let answer = match ai::complete(&engine, &prompt) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("reading comments for reminders paused: {e:#}");
+                    break;
+                }
+            };
+            let verdict = reminders::parse(&answer);
+            let applied = {
+                let conn = state.db.relock();
+                let r = reminders::apply(&conn, &key, &pr_id, &at, &verdict, chrono::Utc::now()).ok().flatten();
+                let _ = reminders::mark_checked(&conn, &key);
+                r
+            };
+            if let Some((back, pr)) = applied {
+                changed = true;
+                if notifications {
+                    notify(
+                        app,
+                        sync::Notice {
+                            title: "📌 Noted from your comment".into(),
+                            body: format!("{}#{} {}\n{back}", pr.repo, pr.number, pr.title),
+                            url: Some(pr.url.clone()),
+                            item_id: Some(pr.id.clone()),
+                        },
+                    );
+                }
+            }
+        }
+        if changed {
+            refresh_count(app);
+        }
+    });
 }
 
 /// "Not this": forget the suggested ticket for a meeting.

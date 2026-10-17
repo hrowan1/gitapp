@@ -103,6 +103,21 @@ static TRIGGER: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+/// Looser than TRIGGER: comments that might be promising to come back later, worth asking the AI about
+/// when the rules above don't match ("I'll look at this once Sam's PR is in", "will check tomorrow").
+static MAYBE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(i'?ll|i will|i'm going to|let me|will (look|check|get|come|follow|circle|pick|do|review|test|try|fix|update|handle|deal)|later|tomorrow|tonight|next week|monday|tuesday|wednesday|thursday|friday|after (the|this|that|lunch|standup|[\w-]+#?\d+)|once|get back to|look into|on my list|todo|park)\b",
+    )
+    .unwrap()
+});
+
+/// Whether a comment the rules didn't catch might still be a "come back to this later" (for the AI).
+pub fn maybe_intent(body: &str) -> bool {
+    let prose: String = body.lines().filter(|l| !l.trim_start().starts_with('>')).collect::<Vec<_>>().join("\n");
+    prose.chars().count() <= 2_000 && MAYBE.is_match(&prose)
+}
+
 static CONDITION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(after|once|until|when)\b\s+(.+)").unwrap());
 
 /// "the API migration lands" from "... after the API migration lands".

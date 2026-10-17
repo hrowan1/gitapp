@@ -248,7 +248,16 @@ impl Pass<'_> {
                 continue;
             }
             let Some(at_ts) = parse_ts(at) else { continue };
-            let Some(found) = intent::detect(body, &t.repo, at_ts) else { continue };
+            let Some(found) = intent::detect(body, &t.repo, at_ts) else {
+                // Not one the rules recognise, but it might be: the AI reads it after the sync.
+                if intent::maybe_intent(body) {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO intent_queue (comment_key, pr_id, at, body) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![key, t.id, at, body],
+                    )?;
+                }
+                continue;
+            };
             let r = t.as_ref();
             // The user has decided something about this item since writing the comment: leave it.
             if db::get_personal(conn, &t.id)?.is_some_and(|p| p.set_at.as_str() > at.as_str()) {
