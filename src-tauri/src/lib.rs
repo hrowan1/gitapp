@@ -6,6 +6,8 @@ mod editor;
 mod github;
 mod intent;
 mod jira;
+mod ai;
+mod ask;
 mod meetings;
 mod search;
 mod summary;
@@ -767,6 +769,12 @@ struct Settings {
     /// Which Claude model, when it's Claude.
     #[serde(default = "haiku")]
     claude_model: String,
+    /// The other AI features (Ask, day and week summaries, suggestions, CI explanations, reminders):
+    /// apple | claude | off, and the Claude model for them.
+    #[serde(default = "apple")]
+    ai_provider: String,
+    #[serde(default = "haiku")]
+    ai_model: String,
     /// Show what's being said while recording.
     #[serde(default = "yes")]
     live_captions: bool,
@@ -820,6 +828,8 @@ fn get_settings(state: State<AppState>) -> Settings {
         audio_retention_days: audio_retention_days(&state),
         summary_provider: chosen_provider(&state).id().into(),
         claude_model: claude_model(&state).into(),
+        ai_provider: chosen(&state, "ai_provider").id().into(),
+        ai_model: summary::claude_model(state.setting("ai_model").as_deref()).into(),
         live_captions: state.setting("live_captions").as_deref() != Some("0"),
         separate_speakers: state.setting("separate_speakers").as_deref() != Some("0"),
         recognise_voices: state.setting("recognise_voices").as_deref() != Some("0"),
@@ -839,6 +849,9 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         let provider = summary::Provider::from_setting(Some(&settings.summary_provider));
         db::set_setting(&conn, "summary_provider", provider.id()).map_err(err)?;
         db::set_setting(&conn, "claude_model", summary::claude_model(Some(&settings.claude_model))).map_err(err)?;
+        let ai = summary::Provider::from_setting(Some(&settings.ai_provider));
+        db::set_setting(&conn, "ai_provider", ai.id()).map_err(err)?;
+        db::set_setting(&conn, "ai_model", summary::claude_model(Some(&settings.ai_model))).map_err(err)?;
         db::set_setting(&conn, "live_captions", if settings.live_captions { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "separate_speakers", if settings.separate_speakers { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "recognise_voices", if settings.recognise_voices { "1" } else { "0" }).map_err(err)?;
@@ -1352,26 +1365,47 @@ fn resume_meeting_jobs(app: &AppHandle) {
 
 const ANTHROPIC_KEYRING_USER: &str = "anthropic-api-key";
 
-/// The summariser chosen in Settings. Until one is chosen: Claude if an Anthropic key is saved,
-/// otherwise Apple Intelligence on this Mac.
-fn chosen_provider(state: &AppState) -> summary::Provider {
-    match state.setting("summary_provider") {
+/// An engine chosen in Settings (`setting`: "summary_provider" for meeting notes, "ai_provider" for
+/// the other AI features). Until one is chosen: Claude if an Anthropic key is saved, otherwise Apple
+/// Intelligence on this Mac.
+fn chosen(state: &AppState, setting: &str) -> summary::Provider {
+    match state.setting(setting) {
         Some(s) => summary::Provider::from_setting(Some(&s)),
         None if anthropic_key(state).is_some() => summary::Provider::Claude,
         None => summary::Provider::Apple,
     }
 }
 
-/// The summariser that will actually run: Claude needs a key, so without one it's Apple Intelligence.
-fn summary_provider(state: &AppState) -> summary::Provider {
-    match chosen_provider(state) {
+/// The engine that will actually run: Claude needs a key, so without one it's Apple Intelligence.
+fn effective(state: &AppState, setting: &str) -> summary::Provider {
+    match chosen(state, setting) {
         summary::Provider::Claude if anthropic_key(state).is_none() => summary::Provider::Apple,
         p => p,
     }
 }
 
+fn chosen_provider(state: &AppState) -> summary::Provider {
+    chosen(state, "summary_provider")
+}
+
+fn summary_provider(state: &AppState) -> summary::Provider {
+    effective(state, "summary_provider")
+}
+
 fn claude_model(state: &AppState) -> &'static str {
     summary::claude_model(state.setting("claude_model").as_deref())
+}
+
+/// The engine for the AI features other than meeting notes (Settings → AI); None when they're off.
+fn ai_engine(state: &AppState) -> Option<ai::Engine> {
+    match effective(state, "ai_provider") {
+        summary::Provider::Off => None,
+        summary::Provider::Apple => Some(ai::Engine::Apple),
+        summary::Provider::Claude => Some(ai::Engine::Claude {
+            key: anthropic_key(state)?,
+            model: summary::claude_model(state.setting("ai_model").as_deref()),
+        }),
+    }
 }
 
 fn anthropic_key(state: &AppState) -> Option<String> {
@@ -1488,6 +1522,8 @@ fn summarise_meeting_now(app: AppHandle, id: String) -> CmdResult<()> {
 struct SummaryStatus {
     /// The summariser that will actually run (Claude falls back to Apple Intelligence without a key).
     provider: String,
+    /// The engine the other AI features will actually use.
+    ai_provider: String,
     /// Apple Intelligence can summarise on this Mac now.
     apple_ready: bool,
     /// Why not, in words.
@@ -1518,6 +1554,7 @@ async fn summary_status(app: AppHandle) -> SummaryStatus {
     let state = app.state::<AppState>();
     SummaryStatus {
         provider: summary_provider(&state).id().into(),
+        ai_provider: effective(&state, "ai_provider").id().into(),
         apple_ready: check["summary"].as_bool().unwrap_or(false),
         apple_reason: check["summaryReason"].as_str().map(String::from).or_else(|| {
             (!check["summary"].as_bool().unwrap_or(false)).then(|| "On-device summaries need macOS 26 and Apple Intelligence".into())
@@ -1685,6 +1722,36 @@ fn get_meeting(state: State<AppState>, id: String) -> CmdResult<MeetingDetail> {
     let speakers = meetings::speaker_names(&conn, &id).map_err(err)?;
     let recognised = meetings::recognised_voices(&conn, &id).map_err(err)?;
     Ok(MeetingDetail { meeting, segments, actions, speakers, recognised })
+}
+
+/// Answer a question about your own work from what the app has recorded (Settings → AI picks the engine).
+#[tauri::command]
+async fn ask_history(app: AppHandle, question: String) -> CmdResult<ask::Answer> {
+    let state = app.state::<AppState>();
+    let engine = ai_engine(&state).ok_or("AI features are off (Settings → AI)")?;
+    let me = state.setting("jira_account").unwrap_or_default();
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("Ask a question".into());
+    }
+    let (facts, sources, period) = {
+        let conn = state.db.relock();
+        ask::gather(&conn, &question, &me, engine.budget().saturating_sub(1_200)).map_err(err)?
+    };
+    let by = engine.id().to_string();
+    if facts.trim().is_empty() {
+        return Ok(ask::Answer { answer: format!("Nothing is recorded for {period} yet."), sources, by, period });
+    }
+    let prompt = ai::Prompt {
+        instructions: ask::INSTRUCTIONS.into(),
+        prompt: ask::prompt(&question, &facts, &period),
+        max_tokens: 2_000,
+    };
+    let answer = tauri::async_runtime::spawn_blocking(move || ai::complete(&engine, &prompt))
+        .await
+        .map_err(err)?
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(ask::Answer { answer, sources, by, period })
 }
 
 /// People whose voices the app recognises (they were named in a meeting).
@@ -1972,6 +2039,7 @@ pub fn run() {
             search_meetings,
             link_meeting,
             known_voices,
+            ask_history,
             forget_voice,
             name_speaker,
             set_action_done,

@@ -170,26 +170,8 @@ pub fn parse_claude_response(v: &Value) -> Result<Summary> {
 }
 
 pub async fn with_claude(api_key: &str, model: &str, title: &str, transcript: &str) -> Result<Summary> {
-    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600)).build()?;
-    let res = http
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&claude_request(model, title, transcript))
-        .send()
-        .await
-        .context("Couldn't reach Anthropic")?;
-    let status = res.status();
-    let body: Value = res.json().await.unwrap_or(Value::Null);
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("Anthropic rejected the API key (Settings → Meetings)");
-    }
-    if !status.is_success() {
-        let msg = body["error"]["message"].as_str().unwrap_or("");
-        bail!("Anthropic returned {status} {msg}");
-    }
-    parse_claude_response(&body)
+    let response = crate::ai::claude(api_key, &claude_request(model, title, transcript)).await?;
+    parse_claude_response(&response)
 }
 
 // ---------- storage ----------

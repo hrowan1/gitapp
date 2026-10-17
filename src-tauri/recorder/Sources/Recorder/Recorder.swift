@@ -7,6 +7,7 @@
 //                                                   ends it; with --captions, live {"event":"caption"} lines too
 //   dev-inbox-recorder transcribe <file> [locale] -> {"start","end","text"} lines, then {"event":"done"}
 //   dev-inbox-recorder summarise <transcript.txt> -> {"event":"summary","overview","decisions","actionItems"}
+//   dev-inbox-recorder generate <request.json>       -> Apple Intelligence text (see Generate.swift)
 //   dev-inbox-recorder diarize <file> <models dir>     -> who spoke when (see Diarize.swift)
 //   dev-inbox-recorder check [locale]             -> {"speech":bool,"locale":...,"summary":bool,"summaryReason":...}
 
@@ -574,6 +575,12 @@ struct Main {
                 await summarise(path: args[2])
             } else {
                 fail("Summarising on this Mac needs macOS 26 or later")
+            }
+        case "generate" where args.count >= 3:
+            if #available(macOS 26, *) {
+                await generate(requestPath: args[2])
+            } else {
+                fail("Apple Intelligence needs macOS 26 or later")
             }
         case "diarize" where args.count >= 4:
             await diarize(path: args[2], modelsDir: args[3])

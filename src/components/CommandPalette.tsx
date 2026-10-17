@@ -102,6 +102,7 @@ export function CommandPalette({
   onSync,
   onOpenTicket,
   onSearchMeetings,
+  onAsk,
 }: {
   items: Item[];
   onClose: () => void;
@@ -109,6 +110,7 @@ export function CommandPalette({
   onSync: () => void;
   onOpenTicket: (key: string) => void;
   onSearchMeetings: (query: string) => void;
+  onAsk: (question: string) => void;
 }) {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   useEffect(() => {
@@ -170,13 +172,21 @@ export function CommandPalette({
     // "ES-310" is clearly a ticket: list it first.
     const byKey = /^[a-z][a-z0-9]*-\d*$/i.test(q.trim());
     const prEntries = prs.map((item) => ({ kind: "pr" as const, item }));
+    // A question ("what did I…?", "who…", "…?") is most likely meant for Ask: list it first.
+    const askEntry: Entry = {
+      kind: "command",
+      command: { id: "ask", label: `Ask: “${q.trim()}”`, hint: "AI", run: () => onAsk(q.trim()) },
+    };
+    const looksLikeQuestion =
+      /\?\s*$/.test(q) || /^(what|who|when|where|which|how|why|did|do|does|was|were|is|are|have|has|summari[sz]e|list|show)\b/i.test(q.trim());
     const searchMeetings: Entry = {
       kind: "command",
       command: { id: "search-meetings", label: `Search meetings for “${q.trim()}”`, run: () => onSearchMeetings(q.trim()) },
     };
+    if (looksLikeQuestion) return [askEntry, ...cmds, ...ticketHits, ...prEntries, searchMeetings];
     return byKey
-      ? [...ticketHits, ...cmds, ...prEntries, searchMeetings]
-      : [...cmds, ...ticketHits, ...prEntries, searchMeetings];
+      ? [...ticketHits, ...cmds, ...prEntries, searchMeetings, askEntry]
+      : [...cmds, ...ticketHits, ...prEntries, searchMeetings, askEntry];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q, items, tickets, parsed, action, focus]);
 

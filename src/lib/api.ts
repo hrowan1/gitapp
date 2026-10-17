@@ -114,6 +114,9 @@ export interface Settings {
   summaryProvider: string;
   /** Which Claude model writes them, when it's Claude (default Haiku 5.5). */
   claudeModel: string;
+  /** The other AI features: apple | claude | off, and their Claude model. */
+  aiProvider: string;
+  aiModel: string;
   /** Show what's being said while recording. */
   liveCaptions: boolean;
   /** Tell the voices on the call apart after recording (on this Mac). */
@@ -177,6 +180,8 @@ export interface SummaryStatus {
   appleReady: boolean;
   appleReason?: string | null;
   claudeKey: boolean;
+  /** The engine the other AI features will actually use. */
+  aiProvider: string;
   /** The Claude models on offer. */
   claudeModels: { id: string; name: string }[];
 }
@@ -188,6 +193,30 @@ export interface Segment {
   text: string;
   /** For "others": which voice on the call ("1", "2"…), when they could be told apart. */
   voice?: string | null;
+}
+
+/** Something an answer can cite. */
+export interface AskSource {
+  /** "S1", "S2"… as cited in the answer */
+  id: string;
+  /** pr | ticket | meeting */
+  kind: string;
+  label: string;
+  url?: string | null;
+  /** A ticket key or meeting id to open in the app. */
+  target?: string | null;
+  /** For a meeting: seconds into it. */
+  at?: number | null;
+}
+
+export interface AskAnswer {
+  /** Text with [S1]-style citations. */
+  answer: string;
+  sources: AskSource[];
+  /** "apple" or the Claude model id. */
+  by: string;
+  /** The period the facts came from, in words. */
+  period: string;
 }
 
 /** Someone whose voice the app recognises (you named them in a meeting). */
@@ -415,6 +444,7 @@ export const api = {
   searchMeetings: (query: string) => invoke<MeetingSearchResult[]>("search_meetings", { query }),
   linkMeeting: (id: string, ticket: string | null) => invoke<void>("link_meeting", { id, ticket }),
   knownVoices: () => invoke<KnownVoice[]>("known_voices"),
+  askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
   forgetVoice: (id: number) => invoke<void>("forget_voice", { id }),
   nameSpeaker: (id: string, voice: string, name: string) => invoke<void>("name_speaker", { id, voice, name }),
   getMeetingActions: () => invoke<MeetingAction[]>("get_meeting_actions"),

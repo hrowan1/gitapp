@@ -323,88 +323,120 @@ function KnownVoices({ settings, onSave }: { settings: Settings; onSave: (s: Set
   );
 }
 
-/** Who writes meeting notes, and the Anthropic key when that's Claude. */
-function SummarySettings({ settings, onSave }: { settings: Settings; onSave: (s: Settings) => void }) {
-  const [status, setStatus] = useState<SummaryStatus | null>(null);
-  const [key, setKey] = useState("");
-  const refresh = () => api.summaryStatus().then(setStatus).catch(() => {});
-  useEffect(() => {
-    refresh();
-  }, []);
-  const provider = settings.summaryProvider;
+/** Apple Intelligence / Claude (with model) / Off, for one use of AI. */
+function EngineChoice({
+  label,
+  provider,
+  model,
+  status,
+  privacy,
+  onChange,
+}: {
+  label: string;
+  provider: string;
+  model: string;
+  status: SummaryStatus | null;
+  /** What gets sent to Anthropic when it's Claude. */
+  privacy: string;
+  onChange: (provider: string, model: string) => void;
+}) {
   return (
     <>
       <label className="field">
-        <span>Summarise meetings</span>
-        <select value={provider} onChange={(e) => onSave({ ...settings, summaryProvider: e.target.value })}>
+        <span>{label}</span>
+        <select value={provider} onChange={(e) => onChange(e.target.value, model)}>
           <option value="apple">On this Mac (Apple Intelligence)</option>
           <option value="claude">With Claude (Anthropic)</option>
           <option value="off">Off</option>
         </select>
+        {provider === "claude" && (
+          <select value={model} onChange={(e) => onChange(provider, e.target.value)} title="Claude model">
+            {(status?.claudeModels ?? [{ id: model, name: model }]).map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name.replace("Claude ", "")}
+                {m.id.includes("haiku") ? " (recommended)" : ""}
+              </option>
+            ))}
+          </select>
+        )}
       </label>
-      {provider === "apple" && (
+      {provider === "apple" && status && !status.appleReady && <p className="warn small">{status.appleReason}.</p>}
+      {provider === "claude" && (
         <p className="muted small">
-          Notes are written on this Mac after each transcript; nothing leaves it.
-          {status && !status.appleReady && <span className="warn"> {status.appleReason}.</span>}
+          {privacy}
+          {status && !status.claudeKey && " Until an Anthropic API key is saved (Settings → AI), Apple Intelligence is used instead."}
         </p>
       )}
-      {provider === "claude" && (
-        <>
-          <label className="field">
-            <span>Model</span>
-            <select value={settings.claudeModel} onChange={(e) => onSave({ ...settings, claudeModel: e.target.value })}>
-              {(status?.claudeModels ?? [{ id: settings.claudeModel, name: settings.claudeModel }]).map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                  {m.id.includes("haiku") ? " — fast and cheapest (recommended)" : ""}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="muted small">
-            After each transcript, it's sent to Anthropic to write the notes, using your own API key (billed to your
-            Anthropic account — with Haiku, well under a cent for a 30-minute meeting).
-            {status && !status.claudeKey && " Until a key is saved, notes are written on this Mac with Apple Intelligence."}
-          </p>
-          {status?.claudeKey ? (
-            <p className="small">
-              <Icon name="checkCircle" size={13} /> API key saved in the keychain ·{" "}
-              <button className="link" onClick={() => api.clearAnthropicKey().then(refresh)}>
-                remove
-              </button>
-            </p>
-          ) : (
-            <div className="field">
-              <span>Anthropic API key</span>
-              <input
-                type="password"
-                className="grow"
-                placeholder="sk-ant-…"
-                autoComplete="off"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-              />
-              <button
-                className="primary"
-                disabled={!key.trim()}
-                onClick={async () => {
-                  try {
-                    await api.setAnthropicKey(key);
-                    setKey("");
-                    refresh();
-                    toast("API key saved");
-                  } catch (e) {
-                    toast(String(e), true);
-                  }
-                }}
-              >
-                Save
-              </button>
-            </div>
-          )}
-        </>
-      )}
     </>
+  );
+}
+
+/** The Anthropic key (entered once, used by every AI feature) and the engine for the AI features. */
+function AiCard({
+  settings,
+  status,
+  onSave,
+  onStatus,
+}: {
+  settings: Settings;
+  status: SummaryStatus | null;
+  onSave: (s: Settings) => void;
+  onStatus: () => void;
+}) {
+  const [key, setKey] = useState("");
+  return (
+    <section className="card">
+      <h2>AI</h2>
+      <p className="muted">
+        Ask about your history in ⌘K, day and week summaries, ticket suggestions for meetings, CI failure explanations and
+        smarter reminders. Apple Intelligence runs on this Mac and is free; Claude uses your own Anthropic API key (Haiku
+        costs well under a cent per question).
+      </p>
+      {status?.claudeKey ? (
+        <p className="small">
+          <Icon name="checkCircle" size={13} /> Anthropic API key saved in the keychain ·{" "}
+          <button className="link" onClick={() => api.clearAnthropicKey().then(onStatus)}>
+            remove
+          </button>
+        </p>
+      ) : (
+        <div className="field">
+          <span>Anthropic API key</span>
+          <input
+            type="password"
+            className="grow"
+            placeholder="sk-ant-… (optional — for Claude)"
+            autoComplete="off"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+          />
+          <button
+            className="primary"
+            disabled={!key.trim()}
+            onClick={async () => {
+              try {
+                await api.setAnthropicKey(key);
+                setKey("");
+                onStatus();
+                toast("API key saved");
+              } catch (e) {
+                toast(String(e), true);
+              }
+            }}
+          >
+            Save
+          </button>
+        </div>
+      )}
+      <EngineChoice
+        label="AI features"
+        provider={settings.aiProvider}
+        model={settings.aiModel}
+        status={status}
+        privacy="The facts each feature needs (activity, ticket moves, meeting notes and lines, CI logs) are sent to Anthropic, billed to your account."
+        onChange={(aiProvider, aiModel) => onSave({ ...settings, aiProvider, aiModel })}
+      />
+    </section>
   );
 }
 
@@ -413,6 +445,9 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
   const [repos, setRepos] = useState<RepoInfo[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [theme, setTheme] = useState<Theme>(getTheme);
+  const [aiStatus, setAiStatus] = useState<SummaryStatus | null>(null);
+  const refreshAi = () => void api.summaryStatus().then(setAiStatus).catch(() => {});
+  useEffect(refreshAi, []);
 
   useEffect(() => {
     api.getSettings().then(setSettings);
@@ -602,9 +637,18 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
             Tell speakers apart (Speaker 1, 2… — on this Mac; downloads a ~20 MB voice model once)
           </label>
           {settings.separateSpeakers && <KnownVoices settings={settings} onSave={save} />}
-          <SummarySettings settings={settings} onSave={save} />
+          <EngineChoice
+            label="Summarise meetings"
+            provider={settings.summaryProvider}
+            model={settings.claudeModel}
+            status={aiStatus}
+            privacy="After each transcript, it's sent to Anthropic to write the notes, billed to your account (Haiku: about $0.002 for a 30-minute meeting)."
+            onChange={(summaryProvider, claudeModel) => save({ ...settings, summaryProvider, claudeModel })}
+          />
         </section>
       )}
+
+      {settings && <AiCard settings={settings} status={aiStatus} onSave={save} onStatus={refreshAi} />}
 
       <JiraCard />
 

@@ -45,7 +45,7 @@ export function MeetingsView({
   version: number;
   recording: RecordingStatus;
   /** Open this meeting (e.g. clicked in the Day view), or search for something (from ⌘K). */
-  target?: { id?: string; query?: string } | null;
+  target?: { id?: string; query?: string; at?: number | null } | null;
   onOpenDay: (day: string) => void;
 }) {
   const [meetings, setMeetings] = useState<Meeting[] | null>(null);
@@ -57,6 +57,7 @@ export function MeetingsView({
   const [captions, setCaptions] = useState<Captions>(NO_CAPTIONS);
   useEffect(() => {
     if (target?.id) setSelected(target.id);
+    if (target?.at != null) setJump({ at: target.at, n: Date.now() });
     if (target?.query !== undefined) setQuery(target.query);
   }, [target]);
 

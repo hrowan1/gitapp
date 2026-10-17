@@ -15,6 +15,7 @@ import { ActionDialog } from "./components/ActionDialog";
 import { DayView } from "./components/DayView";
 import { TicketsView } from "./components/TicketsView";
 import { MeetingsView } from "./components/MeetingsView";
+import { AskPanel } from "./components/AskPanel";
 import type { MeetingAction, RecordingStatus, TicketAttention } from "./lib/api";
 import "./styles.css";
 
@@ -32,13 +33,15 @@ export default function App() {
   /** A date to show in the Day view (e.g. from a ticket's history). */
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
   const [ticketTarget, setTicketTarget] = useState<{ key: string } | null>(null);
-  const [meetingTarget, setMeetingTarget] = useState<{ id?: string; query?: string } | null>(null);
+  const [meetingTarget, setMeetingTarget] = useState<{ id?: string; query?: string; at?: number | null } | null>(null);
+  /** A question being asked about your history (⌘K → Ask). */
+  const [asking, setAsking] = useState<string | null>(null);
   /** Jira tickets that need you, for Today and its count. */
   const [attention, setAttention] = useState<TicketAttention[]>([]);
   /** Action items of yours from meeting notes, for Today and its count. */
   const [actions, setActions] = useState<MeetingAction[]>([]);
-  const openMeeting = useCallback((id: string) => {
-    setMeetingTarget({ id });
+  const openMeeting = useCallback((id: string, at?: number | null) => {
+    setMeetingTarget({ id, at });
     setView("meetings");
   }, []);
   const openTicket = useCallback((key: string) => {
@@ -272,6 +275,10 @@ export default function App() {
             openTicket(key);
             setPalette(false);
           }}
+          onAsk={(question) => {
+            setAsking(question);
+            setPalette(false);
+          }}
           onSearchMeetings={(query) => {
             setMeetingTarget({ query });
             setView("meetings");
@@ -280,6 +287,20 @@ export default function App() {
         />
       )}
       {dialog && <ActionDialog request={dialog} onClose={() => setDialog(null)} />}
+      {asking !== null && (
+        <AskPanel
+          question={asking}
+          onClose={() => setAsking(null)}
+          onOpenTicket={(key) => {
+            setAsking(null);
+            openTicket(key);
+          }}
+          onOpenMeeting={(id, at) => {
+            setAsking(null);
+            openMeeting(id, at);
+          }}
+        />
+      )}
       {shortcuts && <Shortcuts onClose={() => setShortcuts(false)} />}
     </div>
   );
