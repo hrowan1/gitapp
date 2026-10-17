@@ -2493,3 +2493,28 @@ a {
 .voice-3 .line-who { color: var(--violet); }
 .voice-4 .line-who { color: var(--red); }
 .voice-5 .line-who { color: var(--muted); }
+
+/* ---------- live captions ---------- */
+
+.captions {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.caption {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 6px;
+}
+.caption .line-who {
+  font-size: 11px;
+}
+.caption.volatile span:last-child {
+  color: var(--muted);
+}

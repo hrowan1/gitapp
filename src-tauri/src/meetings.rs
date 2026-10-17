@@ -76,12 +76,25 @@ pub struct Recording {
     pub stdin: ChildStdin,
 }
 
-/// Start the helper recording into `dir`. `on_event` receives each JSON line it prints.
-pub fn start(meeting_id: &str, dir: &Path, on_event: impl Fn(Value) + Send + 'static) -> Result<Recording> {
+/// Start the helper recording into `dir` (with live captions in `locale` if asked; empty = the Mac's
+/// language). `on_event` receives each JSON line it prints.
+pub fn start(
+    meeting_id: &str,
+    dir: &Path,
+    locale: &str,
+    captions: bool,
+    on_event: impl Fn(Value) + Send + 'static,
+) -> Result<Recording> {
     std::fs::create_dir_all(dir)?;
-    let mut child = Command::new(helper_path()?)
-        .arg("record")
-        .arg(dir)
+    let mut cmd = Command::new(helper_path()?);
+    cmd.arg("record").arg(dir);
+    if !locale.is_empty() {
+        cmd.arg(locale);
+    }
+    if captions {
+        cmd.arg("--captions");
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

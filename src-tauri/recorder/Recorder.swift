@@ -3,7 +3,8 @@
 // Intelligence's on-device model. Driven by the Dev Inbox app over stdin/stdout; every line it prints
 // is one JSON object.
 //
-//   dev-inbox-recorder record <dir>              -> <dir>/mic.m4a, <dir>/system.m4a; "stop" on stdin ends it
+//   dev-inbox-recorder record <dir> [locale] [--captions] -> <dir>/mic.m4a, <dir>/system.m4a; "stop" on stdin
+//                                                   ends it; with --captions, live {"event":"caption"} lines too
 //   dev-inbox-recorder transcribe <file> [locale] -> {"start","end","text"} lines, then {"event":"done"}
 //   dev-inbox-recorder summarise <transcript.txt> -> {"event":"summary","overview","decisions","actionItems"}
 //   dev-inbox-recorder check [locale]             -> {"speech":bool,"locale":...,"summary":bool,"summaryReason":...}
@@ -55,6 +56,8 @@ final class MicRecorder {
     private let engine = AVAudioEngine()
     private var file: AVAudioFile?
     private(set) var peak: Float = 0
+    /// Each recorded (mono) buffer, e.g. for live captions. Called on the audio thread.
+    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
 
     func start(to url: URL) throws {
         let input = engine.inputNode
@@ -84,6 +87,7 @@ final class MicRecorder {
             }
             try? file.write(from: out)
             self.peak = max(self.peak, level(out))
+            self.onBuffer?(out)
         }
         engine.prepare()
         try engine.start()
@@ -110,6 +114,9 @@ final class SystemRecorder {
     private var file: AVAudioFile?
     private let queue = DispatchQueue(label: "system-audio")
     private(set) var peak: Float = 0
+    /// Each recorded buffer, e.g. for live captions. Called on the audio queue; the buffer is only valid
+    /// during the call.
+    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
 
     private func defaultOutputUID() throws -> String {
         var device = AudioObjectID(kAudioObjectUnknown)
@@ -181,6 +188,7 @@ final class SystemRecorder {
                       let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input, deallocator: nil) else { return }
                 try? file.write(from: buffer)
                 self.peak = max(self.peak, level(buffer))
+                self.onBuffer?(buffer)
             },
             "Starting the audio callback"
         )
@@ -203,9 +211,94 @@ final class SystemRecorder {
     }
 }
 
+// MARK: - Live captions
+
+/// Streams one track's audio through Apple's speech recogniser while recording and prints what it hears.
+/// Best effort: it never touches the recording itself, drops audio rather than falling behind, and stays
+/// silent if live transcription isn't available (the full transcript is still made from the files).
+@available(macOS 26, *)
+final class LiveCaptioner: @unchecked Sendable {
+    private let speaker: String
+    private let lock = NSLock()
+    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var analyzer: SpeechAnalyzer?
+    private var target: AVAudioFormat?
+    private var converter: AVAudioConverter?
+    private var results: Task<Void, Never>?
+
+    init(speaker: String) { self.speaker = speaker }
+
+    /// Returns false (and does nothing) when captions can't run: no recogniser for the language, or its
+    /// model isn't installed yet — a meeting is no time to download one.
+    func start(locale: Locale) async -> Bool {
+        guard SpeechTranscriber.isAvailable,
+              let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else { return false }
+        let transcriber = SpeechTranscriber(
+            locale: supported, transcriptionOptions: [], reportingOptions: [.volatileResults], attributeOptions: [])
+        if (try? await AssetInventory.assetInstallationRequest(supporting: [transcriber])) != nil { return false }
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else { return false }
+        // Bounded: if recognition can't keep up, old audio is dropped instead of piling up in memory.
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingNewest(32))
+        let analyzer = SpeechAnalyzer(inputSequence: stream, modules: [transcriber])
+        let speaker = self.speaker
+        let results = Task.detached {
+            do {
+                for try await result in transcriber.results {
+                    let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if text.isEmpty { continue }
+                    emit(["event": "caption", "speaker": speaker, "text": text, "final": result.isFinal,
+                          "start": result.range.start.seconds])
+                }
+            } catch {}
+        }
+        lock.withLock {
+            self.target = format
+            self.analyzer = analyzer
+            self.continuation = continuation
+            self.results = results
+        }
+        return true
+    }
+
+    /// Feed one recorded buffer (any format: it's converted here). Safe to call before `start` finishes.
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let target, let continuation, buffer.frameLength > 0 else { return }
+        if converter == nil || converter?.inputFormat != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: target)
+            converter?.downmix = true
+        }
+        guard let converter else { return }
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * target.sampleRate / buffer.format.sampleRate) + 512
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
+        var fed = false
+        var error: NSError?
+        converter.convert(to: out, error: &error) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true
+            status.pointee = .haveData
+            return buffer
+        }
+        if error == nil && out.frameLength > 0 {
+            continuation.yield(AnalyzerInput(buffer: out))
+        }
+    }
+
+    func stop() {
+        let (continuation, analyzer, results) = lock.withLock { () -> (AsyncStream<AnalyzerInput>.Continuation?, SpeechAnalyzer?, Task<Void, Never>?) in
+            defer { self.continuation = nil }
+            return (self.continuation, self.analyzer, self.results)
+        }
+        continuation?.finish()
+        results?.cancel()
+        if let analyzer { Task.detached { await analyzer.cancelAndFinishNow() } }
+    }
+}
+
 // MARK: - Commands
 
-func record(dir: String) {
+func record(dir: String, localeID: String, captions: Bool) {
     let folder = URL(fileURLWithPath: dir)
     try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let mic = MicRecorder()
@@ -241,6 +334,29 @@ func record(dir: String) {
     if sources.isEmpty { fail("Nothing could be recorded") }
     emit(["event": "started", "sources": sources])
 
+    // Live captions, if asked for and available. Started off the main thread (it's blocked below).
+    var stopCaptions: () -> Void = {}
+    if captions, #available(macOS 26, *) {
+        let you = LiveCaptioner(speaker: "you")
+        let others = LiveCaptioner(speaker: "others")
+        mic.onBuffer = { you.feed($0) }
+        system.onBuffer = { others.feed($0) }
+        stopCaptions = {
+            mic.onBuffer = nil
+            system.onBuffer = nil
+            you.stop()
+            others.stop()
+        }
+        Task.detached {
+            let locale = Locale(identifier: localeID)
+            let ok = await you.start(locale: locale)
+            _ = await others.start(locale: locale)
+            if !ok {
+                emit(["event": "captions-off", "message": "Live captions start working once a meeting has been transcribed in this language."])
+            }
+        }
+    }
+
     // Level meters for the app.
     let timer = DispatchSource.makeTimerSource(queue: .global())
     timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
@@ -254,6 +370,7 @@ func record(dir: String) {
         if line.trimmingCharacters(in: .whitespaces) == "stop" { break }
     }
     timer.cancel()
+    stopCaptions()
     mic.stop()
     system.stop()
     emit(["event": "stopped", "seconds": Int(Date().timeIntervalSince(started)), "sources": sources])
@@ -439,7 +556,12 @@ struct Main {
         let locale = Locale.current.identifier
         switch args[1] {
         case "record" where args.count >= 3:
-            record(dir: args[2])
+            let rest = Array(args.dropFirst(3))
+            record(
+                dir: args[2],
+                localeID: rest.first(where: { !$0.hasPrefix("--") }) ?? locale,
+                captions: rest.contains("--captions")
+            )
         case "transcribe" where args.count >= 3:
             if #available(macOS 26, *) {
                 await transcribe(path: args[2], localeID: args.count >= 4 ? args[3] : locale)
@@ -451,6 +573,21 @@ struct Main {
                 await summarise(path: args[2])
             } else {
                 fail("Summarising on this Mac needs macOS 26 or later")
+            }
+        case "caption-file" where args.count >= 3:
+            // Test aid: run a file through the live captioner in real-time-sized chunks.
+            if #available(macOS 26, *) {
+                let captioner = LiveCaptioner(speaker: "others")
+                guard await captioner.start(locale: Locale(identifier: args.count >= 4 ? args[3] : locale)) else { fail("Live captions unavailable") }
+                guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: args[2])),
+                      let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 4096) else { fail("Can't read file") }
+                while (try? file.read(into: buffer)) != nil, buffer.frameLength > 0 {
+                    captioner.feed(buffer)
+                    try? await Task.sleep(for: .milliseconds(Int(Double(buffer.frameLength) / file.processingFormat.sampleRate * 1000)))
+                }
+                try? await Task.sleep(for: .seconds(2))
+                captioner.stop()
+                emit(["event": "done"])
             }
         case "check":
             if #available(macOS 26, *) {

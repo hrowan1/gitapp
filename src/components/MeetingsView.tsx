@@ -54,6 +54,7 @@ export function MeetingsView({
   const [busy, setBusy] = useState(false);
   const [levels, setLevels] = useState({ mic: 0, system: 0, seconds: 0 });
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [captions, setCaptions] = useState<Captions>(NO_CAPTIONS);
   useEffect(() => {
     if (target?.id) setSelected(target.id);
     if (target?.query !== undefined) setQuery(target.query);
@@ -82,8 +83,10 @@ export function MeetingsView({
   useEffect(() => {
     const subs = [
       listen<{ mic: number; system: number; seconds: number }>("recording-level", (e) => setLevels(e.payload)),
+      listen<Caption>("recording-caption", (e) => setCaptions((c) => addCaption(c, e.payload))),
       listen<{ event: string; message?: string }>("recording-event", (e) => {
-        if (e.payload.event === "warning" && e.payload.message) setWarnings((w) => [...w, e.payload.message!]);
+        if ((e.payload.event === "warning" || e.payload.event === "info") && e.payload.message)
+          setWarnings((w) => [...w, e.payload.message!]);
         if (e.payload.event === "error") toast(e.payload.message ?? "Recording failed", true);
       }),
     ];
@@ -92,6 +95,7 @@ export function MeetingsView({
 
   useEffect(() => {
     if (!recording.recording) setLevels({ mic: 0, system: 0, seconds: 0 });
+    setCaptions(NO_CAPTIONS);
   }, [recording.recording]);
 
   const start = async () => {
@@ -154,6 +158,7 @@ export function MeetingsView({
                 </div>
                 <Meter label="You" value={levels.mic} />
                 <Meter label="Meeting audio" value={levels.system} />
+                <LiveCaptions captions={captions} />
                 {warnings.map((w, i) => (
                   <p key={i} className="warn small">
                     {w}
@@ -381,6 +386,47 @@ function MeetingNotes({
         </button>
       </p>
     </section>
+  );
+}
+
+interface Caption {
+  speaker: "you" | "others";
+  text: string;
+  /** false while the recogniser may still change it */
+  final: boolean;
+  start: number;
+}
+interface Captions {
+  /** Settled lines, oldest first (only the last few are kept). */
+  done: Caption[];
+  /** The line each speaker is in the middle of. */
+  live: Partial<Record<Caption["speaker"], Caption>>;
+}
+const NO_CAPTIONS: Captions = { done: [], live: {} };
+
+function addCaption(c: Captions, cap: Caption): Captions {
+  const live = { ...c.live };
+  if (cap.final) {
+    delete live[cap.speaker];
+    return { done: [...c.done, cap].slice(-6), live };
+  }
+  live[cap.speaker] = cap;
+  return { done: c.done, live };
+}
+
+/** What's being said right now; the proper transcript is made from the recording afterwards. */
+function LiveCaptions({ captions }: { captions: Captions }) {
+  const lines = [...captions.done, ...Object.values(captions.live)].sort((a, b) => a.start - b.start).slice(-4);
+  if (lines.length === 0) return null;
+  return (
+    <div className="captions" aria-live="polite">
+      {lines.map((l, i) => (
+        <div key={`${l.speaker}-${l.start}-${i}`} className={`caption speaker-${l.speaker}${l.final ? "" : " volatile"}`}>
+          <span className="line-who">{l.speaker === "you" ? "You" : "Others"}</span>
+          <span>{l.text}</span>
+        </div>
+      ))}
+    </div>
   );
 }
 

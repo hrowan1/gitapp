@@ -529,6 +529,22 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
             The first recording asks for Microphone and Screen &amp; System Audio Recording permission (System Settings →
             Privacy &amp; Security).
           </p>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={settings.liveCaptions}
+              onChange={(e) => save({ ...settings, liveCaptions: e.target.checked })}
+            />
+            Live captions while recording
+          </label>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={settings.separateSpeakers}
+              onChange={(e) => save({ ...settings, separateSpeakers: e.target.checked })}
+            />
+            Tell speakers apart (Speaker 1, 2… — on this Mac; downloads a ~50 MB voice model once)
+          </label>
           <SummarySettings settings={settings} onSave={save} />
         </section>
       )}

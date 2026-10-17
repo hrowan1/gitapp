@@ -763,6 +763,12 @@ struct Settings {
     /// Who writes meeting summaries: apple (on this Mac) | claude | off.
     #[serde(default = "apple")]
     summary_provider: String,
+    /// Show what's being said while recording.
+    #[serde(default = "yes")]
+    live_captions: bool,
+    /// Tell the voices on the call apart (Speaker 1, 2…) after recording, on this Mac.
+    #[serde(default = "yes")]
+    separate_speakers: bool,
 }
 
 fn apple() -> String {
@@ -802,6 +808,8 @@ fn get_settings(state: State<AppState>) -> Settings {
         track_local: state.setting("track_local").as_deref() != Some("0"),
         audio_retention_days: audio_retention_days(&state),
         summary_provider: summary_provider(&state).id().into(),
+        live_captions: state.setting("live_captions").as_deref() != Some("0"),
+        separate_speakers: state.setting("separate_speakers").as_deref() != Some("0"),
     }
 }
 
@@ -817,6 +825,8 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "audio_retention_days", &settings.audio_retention_days.to_string()).map_err(err)?;
         let provider = summary::Provider::from_setting(Some(&settings.summary_provider));
         db::set_setting(&conn, "summary_provider", provider.id()).map_err(err)?;
+        db::set_setting(&conn, "live_captions", if settings.live_captions { "1" } else { "0" }).map_err(err)?;
+        db::set_setting(&conn, "separate_speakers", if settings.separate_speakers { "1" } else { "0" }).map_err(err)?;
         let ignored = settings.ignored_users.join(",");
         if db::get_setting(&conn, "ignored_users").map_err(err)?.unwrap_or_default() != ignored {
             db::set_setting(&conn, "ignored_users", &ignored).map_err(err)?;
@@ -1476,7 +1486,9 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
     let handle = app.clone();
     let meeting_id = id.clone();
     let rec_dir = dir.clone();
-    let recording = meetings::start(&id, &dir, move |ev| {
+    let locale = state.setting("transcribe_locale").unwrap_or_default();
+    let captions = state.setting("live_captions").as_deref() != Some("0");
+    let recording = meetings::start(&id, &dir, &locale, captions, move |ev| {
         let state = handle.state::<AppState>();
         match ev["event"].as_str() {
             Some("level") => {
@@ -1484,6 +1496,12 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
             }
             Some("started") | Some("warning") => {
                 let _ = handle.emit("recording-event", &ev);
+            }
+            Some("caption") => {
+                let _ = handle.emit("recording-caption", &ev);
+            }
+            Some("captions-off") => {
+                let _ = handle.emit("recording-event", serde_json::json!({"event": "info", "message": ev["message"]}));
             }
             Some("error") => {
                 let msg = ev["message"].as_str().unwrap_or("Recording failed").to_string();

@@ -112,6 +112,10 @@ export interface Settings {
   audioRetentionDays: number;
   /** Who writes meeting summaries: apple (on this Mac) | claude | off */
   summaryProvider: string;
+  /** Show what's being said while recording. */
+  liveCaptions: boolean;
+  /** Tell the voices on the call apart after recording (on this Mac). */
+  separateSpeakers: boolean;
 }
 
 export interface RecordingStatus {
