@@ -112,6 +112,8 @@ export interface Settings {
   audioRetentionDays: number;
   /** Who writes meeting summaries: apple (on this Mac) | claude | off */
   summaryProvider: string;
+  /** Which Claude model writes them, when it's Claude (default Haiku 5.5). */
+  claudeModel: string;
   /** Show what's being said while recording. */
   liveCaptions: boolean;
   /** Tell the voices on the call apart after recording (on this Mac). */
@@ -175,7 +177,8 @@ export interface SummaryStatus {
   appleReady: boolean;
   appleReason?: string | null;
   claudeKey: boolean;
-  claudeModel: string;
+  /** The Claude models on offer. */
+  claudeModels: { id: string; name: string }[];
 }
 
 export interface Segment {

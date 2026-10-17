@@ -764,6 +764,9 @@ struct Settings {
     /// Who writes meeting summaries: apple (on this Mac) | claude | off.
     #[serde(default = "apple")]
     summary_provider: String,
+    /// Which Claude model, when it's Claude.
+    #[serde(default = "haiku")]
+    claude_model: String,
     /// Show what's being said while recording.
     #[serde(default = "yes")]
     live_captions: bool,
@@ -777,6 +780,10 @@ struct Settings {
 
 fn apple() -> String {
     "apple".into()
+}
+
+fn haiku() -> String {
+    summary::DEFAULT_CLAUDE_MODEL.into()
 }
 
 fn thirty() -> i64 {
@@ -811,7 +818,8 @@ fn get_settings(state: State<AppState>) -> Settings {
         digest_hour: digest_hour(&state),
         track_local: state.setting("track_local").as_deref() != Some("0"),
         audio_retention_days: audio_retention_days(&state),
-        summary_provider: summary_provider(&state).id().into(),
+        summary_provider: chosen_provider(&state).id().into(),
+        claude_model: claude_model(&state).into(),
         live_captions: state.setting("live_captions").as_deref() != Some("0"),
         separate_speakers: state.setting("separate_speakers").as_deref() != Some("0"),
         recognise_voices: state.setting("recognise_voices").as_deref() != Some("0"),
@@ -830,6 +838,7 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "audio_retention_days", &settings.audio_retention_days.to_string()).map_err(err)?;
         let provider = summary::Provider::from_setting(Some(&settings.summary_provider));
         db::set_setting(&conn, "summary_provider", provider.id()).map_err(err)?;
+        db::set_setting(&conn, "claude_model", summary::claude_model(Some(&settings.claude_model))).map_err(err)?;
         db::set_setting(&conn, "live_captions", if settings.live_captions { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "separate_speakers", if settings.separate_speakers { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "recognise_voices", if settings.recognise_voices { "1" } else { "0" }).map_err(err)?;
@@ -1343,8 +1352,26 @@ fn resume_meeting_jobs(app: &AppHandle) {
 
 const ANTHROPIC_KEYRING_USER: &str = "anthropic-api-key";
 
+/// The summariser chosen in Settings. Until one is chosen: Claude if an Anthropic key is saved,
+/// otherwise Apple Intelligence on this Mac.
+fn chosen_provider(state: &AppState) -> summary::Provider {
+    match state.setting("summary_provider") {
+        Some(s) => summary::Provider::from_setting(Some(&s)),
+        None if anthropic_key(state).is_some() => summary::Provider::Claude,
+        None => summary::Provider::Apple,
+    }
+}
+
+/// The summariser that will actually run: Claude needs a key, so without one it's Apple Intelligence.
 fn summary_provider(state: &AppState) -> summary::Provider {
-    summary::Provider::from_setting(state.setting("summary_provider").as_deref())
+    match chosen_provider(state) {
+        summary::Provider::Claude if anthropic_key(state).is_none() => summary::Provider::Apple,
+        p => p,
+    }
+}
+
+fn claude_model(state: &AppState) -> &'static str {
+    summary::claude_model(state.setting("claude_model").as_deref())
 }
 
 fn anthropic_key(state: &AppState) -> Option<String> {
@@ -1380,6 +1407,7 @@ fn summarise_meeting(app: AppHandle, id: String) {
         // while this job waited its turn.
         let provider = summary_provider(&state);
         let key = (provider == summary::Provider::Claude).then(|| anthropic_key(&state)).flatten();
+        let model = claude_model(&state);
         let found = meetings::get(&state.db.relock(), &id).ok().flatten();
         let Some((meeting, segments)) = found.filter(|(_, s)| !s.is_empty()) else {
             let _ = summary::set_status(&state.db.relock(), &id, None, None);
@@ -1394,7 +1422,7 @@ fn summarise_meeting(app: AppHandle, id: String) {
                 return;
             }
             summary::Provider::Claude => match key {
-                Some(key) => tauri::async_runtime::block_on(summary::with_claude(&key, &meeting.title, &transcript)),
+                Some(key) => tauri::async_runtime::block_on(summary::with_claude(&key, model, &meeting.title, &transcript)),
                 None => Err(anyhow::anyhow!("Add your Anthropic API key in Settings → Meetings to summarise with Claude")),
             },
             summary::Provider::Apple => summary::on_device(&id, &transcript),
@@ -1402,7 +1430,7 @@ fn summarise_meeting(app: AppHandle, id: String) {
         {
             let conn = state.db.relock();
             let _ = match &result {
-                Ok(s) => summary::save(&conn, &id, s, provider),
+                Ok(s) => summary::save(&conn, &id, s, if provider == summary::Provider::Claude { model } else { "apple" }),
                 Err(e) => summary::set_status(&conn, &id, Some("failed"), Some(&format!("{e:#}"))),
             };
         }
@@ -1458,6 +1486,7 @@ fn summarise_meeting_now(app: AppHandle, id: String) -> CmdResult<()> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SummaryStatus {
+    /// The summariser that will actually run (Claude falls back to Apple Intelligence without a key).
     provider: String,
     /// Apple Intelligence can summarise on this Mac now.
     apple_ready: bool,
@@ -1465,7 +1494,14 @@ struct SummaryStatus {
     apple_reason: Option<String>,
     /// An Anthropic API key is saved.
     claude_key: bool,
-    claude_model: &'static str,
+    /// The Claude models on offer: (model id, name).
+    claude_models: Vec<ClaudeModel>,
+}
+
+#[derive(Serialize)]
+struct ClaudeModel {
+    id: &'static str,
+    name: &'static str,
 }
 
 /// What Settings shows about summaries. Asks the helper whether Apple Intelligence is ready.
@@ -1487,7 +1523,7 @@ async fn summary_status(app: AppHandle) -> SummaryStatus {
             (!check["summary"].as_bool().unwrap_or(false)).then(|| "On-device summaries need macOS 26 and Apple Intelligence".into())
         }),
         claude_key: anthropic_key(&state).is_some(),
-        claude_model: summary::CLAUDE_MODEL,
+        claude_models: summary::CLAUDE_MODELS.iter().map(|&(id, name)| ClaudeModel { id, name }).collect(),
     }
 }
 

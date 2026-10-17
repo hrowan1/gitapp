@@ -385,7 +385,7 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
             crate::summary::ActionItem { owner: "others".into(), text: "Check the rounding on annual plans".into() },
         ],
     };
-    crate::summary::save(conn, "demo-proration", &notes, crate::summary::Provider::Claude)?;
+    crate::summary::save(conn, "demo-proration", &notes, crate::summary::DEFAULT_CLAUDE_MODEL)?;
 
     db::set_setting(conn, "jira_account", "demo-me")?;
     db::set_setting(conn, "jira_site", site)?;

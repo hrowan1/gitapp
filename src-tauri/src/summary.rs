@@ -91,7 +91,19 @@ fn parse_helper_output(stdout: &str) -> Result<Summary> {
 
 // ---------- Claude ----------
 
-pub const CLAUDE_MODEL: &str = "claude-opus-5-5";
+/// The Claude models notes can be written with: (model id, name). Haiku is plenty for pulling an
+/// overview, decisions and action items out of a transcript, at a fraction of the cost.
+pub const CLAUDE_MODELS: [(&str, &str); 3] = [
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+];
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-haiku-5-5";
+
+/// The model from the setting, if it's one we offer; otherwise the default.
+pub fn claude_model(setting: Option<&str>) -> &'static str {
+    CLAUDE_MODELS.iter().find(|(id, _)| Some(*id) == setting).map_or(DEFAULT_CLAUDE_MODEL, |(id, _)| id)
+}
 
 const CLAUDE_SYSTEM: &str = "You write notes for a meeting from its transcript, for the person who recorded it. \
 Lines are labelled \"You\" (that person); other people are labelled by name, \"Speaker 2\" and so on, or \
@@ -127,9 +139,9 @@ fn claude_schema() -> Value {
 }
 
 /// The Messages API request body for one meeting.
-pub fn claude_request(title: &str, transcript: &str) -> Value {
+pub fn claude_request(model: &str, title: &str, transcript: &str) -> Value {
     json!({
-        "model": CLAUDE_MODEL,
+        "model": model,
         "max_tokens": 16000,
         "system": CLAUDE_SYSTEM,
         "output_config": {"format": {"type": "json_schema", "schema": claude_schema()}},
@@ -157,14 +169,14 @@ pub fn parse_claude_response(v: &Value) -> Result<Summary> {
     serde_json::from_str(text).context("Claude's summary wasn't in the expected shape")
 }
 
-pub async fn with_claude(api_key: &str, title: &str, transcript: &str) -> Result<Summary> {
+pub async fn with_claude(api_key: &str, model: &str, title: &str, transcript: &str) -> Result<Summary> {
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600)).build()?;
     let res = http
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&claude_request(title, transcript))
+        .json(&claude_request(model, title, transcript))
         .send()
         .await
         .context("Couldn't reach Anthropic")?;
@@ -191,11 +203,12 @@ pub fn set_status(conn: &Connection, meeting_id: &str, status: Option<&str>, err
     Ok(())
 }
 
-pub fn save(conn: &Connection, meeting_id: &str, summary: &Summary, by: Provider) -> Result<()> {
+/// `by`: "apple", or the Claude model id that wrote it.
+pub fn save(conn: &Connection, meeting_id: &str, summary: &Summary, by: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE meetings SET summary = ?2, summary_by = ?3, summary_status = 'done', summary_error = NULL WHERE id = ?1",
-        params![meeting_id, serde_json::to_string(summary)?, by.id()],
+        params![meeting_id, serde_json::to_string(summary)?, by],
     )?;
     sync_actions(&tx, meeting_id, summary)?;
     crate::search::reindex(&tx, meeting_id)?;
@@ -313,8 +326,11 @@ mod tests {
 
     #[test]
     fn claude_request_and_response() {
-        let req = claude_request("Proration sync", "[0:04] You: hi");
-        assert_eq!(req["model"], CLAUDE_MODEL);
+        let req = claude_request(DEFAULT_CLAUDE_MODEL, "Proration sync", "[0:04] You: hi");
+        assert_eq!(req["model"], "claude-haiku-5-5");
+        assert_eq!(claude_model(Some("claude-opus-5-5")), "claude-opus-5-5");
+        assert_eq!(claude_model(Some("gpt-4")), DEFAULT_CLAUDE_MODEL, "only models we offer");
+        assert_eq!(claude_model(None), DEFAULT_CLAUDE_MODEL);
         assert_eq!(req["output_config"]["format"]["type"], "json_schema");
         assert_eq!(req["output_config"]["format"]["schema"]["additionalProperties"], false);
         assert!(req["messages"][0]["content"].as_str().unwrap().contains("<transcript>\n[0:04] You: hi\n</transcript>"));
@@ -337,7 +353,7 @@ mod tests {
         crate::meetings::create(&conn, "m1", "Proration sync", "2026-10-16T14:00:00Z", &std::env::temp_dir().join(format!("dev-inbox-actions-audio-{}", std::process::id()))).unwrap();
         let item = |owner: &str, text: &str| ActionItem { owner: owner.into(), text: text.into() };
         let notes = |items: Vec<ActionItem>| Summary { overview: "O".into(), decisions: vec![], action_items: items };
-        save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("others", "Check rounding"), item("you", "Email finance")]), Provider::Apple).unwrap();
+        save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("others", "Check rounding"), item("you", "Email finance")]), "apple").unwrap();
 
         let now = "2026-10-16T15:00:00Z";
         let open: Vec<String> = open_actions(&conn, now).unwrap().into_iter().map(|a| a.text).collect();
@@ -351,7 +367,7 @@ mod tests {
         assert_eq!(open_actions(&conn, "2026-10-17T09:30:00Z").unwrap().len(), 1, "back after the snooze");
 
         // Rewritten notes keep what you ticked off, drop what's gone, add what's new.
-        save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("you", "Book the retro")]), Provider::Claude).unwrap();
+        save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("you", "Book the retro")]), "claude-haiku-5-5").unwrap();
         let all = meeting_actions(&conn, "m1").unwrap();
         assert_eq!(all.iter().map(|a| (a.text.as_str(), a.done)).collect::<Vec<_>>(), [("Add credit notes", true), ("Book the retro", false)]);
         let _ = std::fs::remove_file(&path);

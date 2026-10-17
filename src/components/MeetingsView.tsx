@@ -279,6 +279,13 @@ export function MeetingsView({
 
 const OWNER: Record<string, string> = { you: "You", others: "Others", unclear: "—" };
 
+/** "claude-haiku-5-5" → "Claude Haiku 5.5"; "apple" → Apple Intelligence. */
+function writtenBy(by?: string | null): string {
+  if (!by || by === "apple") return "Apple Intelligence on this Mac";
+  const m = by.match(/^claude-([a-z]+)-(\d+)-(\d+)$/);
+  return m ? `Claude ${m[1].charAt(0).toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}` : "Claude";
+}
+
 function notesText(s: MeetingSummary): string {
   const parts = [s.overview];
   if (s.decisions.length) parts.push(`Decisions\n${s.decisions.map((d) => `• ${d}`).join("\n")}`);
@@ -298,7 +305,7 @@ function MeetingNotes({
   hasTranscript: boolean;
 }) {
   const summarise = () => api.summariseMeeting(meeting.id).catch((e) => toast(String(e), true));
-  const who = meeting.summaryBy === "claude" ? "Claude" : "Apple Intelligence on this Mac";
+  const who = writtenBy(meeting.summaryBy);
   if (meeting.summaryStatus === "summarising") {
     return (
       <div className="callout">

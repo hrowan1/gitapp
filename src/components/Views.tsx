@@ -350,9 +350,21 @@ function SummarySettings({ settings, onSave }: { settings: Settings; onSave: (s:
       )}
       {provider === "claude" && (
         <>
+          <label className="field">
+            <span>Model</span>
+            <select value={settings.claudeModel} onChange={(e) => onSave({ ...settings, claudeModel: e.target.value })}>
+              {(status?.claudeModels ?? [{ id: settings.claudeModel, name: settings.claudeModel }]).map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                  {m.id.includes("haiku") ? " — fast and cheapest (recommended)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
           <p className="muted small">
-            After each transcript, it's sent to Anthropic ({status?.claudeModel ?? "Claude"}) to write the notes, using your
-            own API key (billed to your Anthropic account).
+            After each transcript, it's sent to Anthropic to write the notes, using your own API key (billed to your
+            Anthropic account — with Haiku, well under a cent for a 30-minute meeting).
+            {status && !status.claudeKey && " Until a key is saved, notes are written on this Mac with Apple Intelligence."}
           </p>
           {status?.claudeKey ? (
             <p className="small">
