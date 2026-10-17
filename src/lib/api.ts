@@ -152,6 +152,9 @@ export interface Meeting {
   /** summarising | done | failed */
   summaryStatus?: string | null;
   summaryError?: string | null;
+  /** A ticket the AI thinks this unlinked meeting is about. */
+  suggestedTicket?: string | null;
+  suggestedTitle?: string | null;
 }
 
 export interface MeetingSummary {
@@ -451,6 +454,7 @@ export const api = {
     ),
   searchMeetings: (query: string) => invoke<MeetingSearchResult[]>("search_meetings", { query }),
   linkMeeting: (id: string, ticket: string | null) => invoke<void>("link_meeting", { id, ticket }),
+  dismissSuggestion: (id: string) => invoke<void>("dismiss_suggestion", { id }),
   knownVoices: () => invoke<KnownVoice[]>("known_voices"),
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
   getAiSummary: (kind: "day" | "week", day: string) => invoke<AiSummary | null>("get_ai_summary", { kind, day }),

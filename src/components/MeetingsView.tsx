@@ -686,6 +686,28 @@ function MeetingDetail({
           <p className="muted small">The audio has been deleted (Settings → Meetings); the transcript is kept.</p>
         )}
 
+        {meeting.suggestedTicket && !meeting.ticket && (
+          <div className="callout suggestion">
+            <Icon name="sparkle" size={14} />
+            <span className="grow">
+              Looks like <span className="ticket-key">{meeting.suggestedTicket}</span>
+              {meeting.suggestedTitle && <span className="muted"> {meeting.suggestedTitle}</span>}
+            </span>
+            <button
+              className="link"
+              onClick={() => {
+                setTicket(meeting.suggestedTicket!);
+                api.linkMeeting(meeting.id, meeting.suggestedTicket!).catch((e) => toast(String(e), true));
+              }}
+            >
+              Link
+            </button>
+            <button className="link muted" onClick={() => api.dismissSuggestion(meeting.id).catch((e) => toast(String(e), true))}>
+              Not this
+            </button>
+          </div>
+        )}
+
         <MeetingNotes meeting={meeting} actions={actions} hasTranscript={!!segments?.length} />
 
         <div className="timeline">

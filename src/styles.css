@@ -2702,3 +2702,13 @@ a {
   display: inline-block;
   vertical-align: -1px;
 }
+
+.callout.suggestion {
+  margin-top: 12px;
+}
+.callout.suggestion .icon {
+  color: var(--accent);
+}
+.callout.suggestion .ticket-key {
+  margin-right: 2px;
+}

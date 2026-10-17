@@ -10,6 +10,7 @@ mod ai;
 mod ask;
 mod meetings;
 mod search;
+mod suggest;
 mod summary;
 mod sync;
 mod voices;
@@ -1469,7 +1470,44 @@ fn summarise_meeting(app: AppHandle, id: String) {
             };
         }
         let _ = app.emit("meetings-updated", ());
+        // Not linked to a ticket: suggest one from the notes (AI features' engine; never links by itself).
+        if let (Ok(notes), None) = (&result, &meeting.ticket) {
+            suggest_ticket(app, &id, &meeting.title, notes);
+        }
     });
+}
+
+/// Suggest the ticket an unlinked meeting is about. Best effort: no engine, no candidates or no clear
+/// answer leaves it unsuggested.
+fn suggest_ticket(app: &AppHandle, id: &str, title: &str, notes: &summary::Summary) {
+    let state = app.state::<AppState>();
+    let Some(engine) = ai_engine(&state) else { return };
+    let candidates = suggest::candidates(&state.db.relock()).unwrap_or_default();
+    if candidates.is_empty() {
+        return;
+    }
+    let prompt = ai::Prompt {
+        instructions: suggest::INSTRUCTIONS.into(),
+        prompt: ai::fit(&suggest::prompt(title, notes, &candidates), engine.budget()),
+        max_tokens: 1_024,
+    };
+    match ai::complete(&engine, &prompt) {
+        Ok(answer) => {
+            if let Some((key, ticket_title)) = suggest::pick(&answer, &candidates) {
+                let _ = meetings::set_suggestion(&state.db.relock(), id, Some((key, ticket_title)));
+                let _ = app.emit("meetings-updated", ());
+            }
+        }
+        Err(e) => eprintln!("ticket suggestion skipped: {e:#}"),
+    }
+}
+
+/// "Not this": forget the suggested ticket for a meeting.
+#[tauri::command(async)]
+fn dismiss_suggestion(app: AppHandle, id: String) -> CmdResult<()> {
+    meetings::set_suggestion(&app.state::<AppState>().db.relock(), &id, None).map_err(err)?;
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
 }
 
 /// Your open action items from meeting notes, for Today.
@@ -2180,6 +2218,7 @@ pub fn run() {
             get_meeting_actions,
             search_meetings,
             link_meeting,
+            dismiss_suggestion,
             known_voices,
             ask_history,
             get_ai_summary,

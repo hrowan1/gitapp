@@ -327,6 +327,18 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 13 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- A ticket the AI thinks an unlinked meeting is about, until you link it or say "not this".
+            ALTER TABLE meetings ADD COLUMN suggested_ticket TEXT;
+            ALTER TABLE meetings ADD COLUMN suggested_title TEXT;
+            PRAGMA user_version = 13;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 

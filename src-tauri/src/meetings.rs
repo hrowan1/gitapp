@@ -376,6 +376,9 @@ pub struct Meeting {
     /// summarising | done | failed; None when no summary was asked for.
     pub summary_status: Option<String>,
     pub summary_error: Option<String>,
+    /// A ticket the AI thinks this (unlinked) meeting is about: (key, title).
+    pub suggested_ticket: Option<String>,
+    pub suggested_title: Option<String>,
 }
 
 fn row_to_meeting(r: &rusqlite::Row) -> rusqlite::Result<Meeting> {
@@ -397,12 +400,14 @@ fn row_to_meeting(r: &rusqlite::Row) -> rusqlite::Result<Meeting> {
         summary_by: r.get(13)?,
         summary_status: r.get(14)?,
         summary_error: r.get(15)?,
+        suggested_ticket: r.get(16)?,
+        suggested_title: r.get(17)?,
     })
 }
 
 const MEETING_COLUMNS: &str = "m.id, m.title, m.started_at, m.ended_at, m.seconds, m.status, m.error, m.ticket, m.audio_deleted, m.audio_dir, m.sources,
     (SELECT group_concat(text, ' ') FROM (SELECT text FROM meeting_segments s WHERE s.meeting_id = m.id ORDER BY start LIMIT 3)),
-    m.summary, m.summary_by, m.summary_status, m.summary_error";
+    m.summary, m.summary_by, m.summary_status, m.summary_error, m.suggested_ticket, m.suggested_title";
 
 pub fn list(conn: &Connection) -> Result<Vec<Meeting>> {
     let mut stmt = conn.prepare(&format!("SELECT {MEETING_COLUMNS} FROM meetings m ORDER BY m.started_at DESC"))?;
@@ -428,11 +433,20 @@ pub fn recent_unlinked(conn: &Connection, since: &str) -> Result<Vec<Meeting>> {
     Ok(rows)
 }
 
-/// Link a meeting to a ticket (or unlink it with None), keeping its title.
+/// Link a meeting to a ticket (or unlink it with None), keeping its title. Clears any suggestion.
 pub fn set_ticket(conn: &Connection, id: &str, ticket: Option<&str>) -> Result<()> {
     conn.execute(
-        "UPDATE meetings SET ticket = ?2 WHERE id = ?1",
+        "UPDATE meetings SET ticket = ?2, suggested_ticket = NULL, suggested_title = NULL WHERE id = ?1",
         params![id, ticket.map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty())],
+    )?;
+    Ok(())
+}
+
+/// Remember (or clear) the ticket the AI suggests for a meeting.
+pub fn set_suggestion(conn: &Connection, id: &str, suggestion: Option<(&str, &str)>) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET suggested_ticket = ?2, suggested_title = ?3 WHERE id = ?1 AND ticket IS NULL",
+        params![id, suggestion.map(|s| s.0), suggestion.map(|s| s.1)],
     )?;
     Ok(())
 }
