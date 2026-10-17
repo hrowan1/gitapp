@@ -32,7 +32,7 @@ export default function App() {
   /** A date to show in the Day view (e.g. from a ticket's history). */
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
   const [ticketTarget, setTicketTarget] = useState<{ key: string } | null>(null);
-  const [meetingTarget, setMeetingTarget] = useState<{ id: string } | null>(null);
+  const [meetingTarget, setMeetingTarget] = useState<{ id?: string; query?: string } | null>(null);
   /** Jira tickets that need you, for Today and its count. */
   const [attention, setAttention] = useState<TicketAttention[]>([]);
   /** Action items of yours from meeting notes, for Today and its count. */
@@ -269,6 +269,11 @@ export default function App() {
           onSync={sync}
           onOpenTicket={(key) => {
             openTicket(key);
+            setPalette(false);
+          }}
+          onSearchMeetings={(query) => {
+            setMeetingTarget({ query });
+            setView("meetings");
             setPalette(false);
           }}
         />

@@ -177,6 +177,24 @@ export interface Segment {
   end: number;
   speaker: "you" | "others";
   text: string;
+  /** For "others": which voice on the call ("1", "2"…), when they could be told apart. */
+  voice?: string | null;
+}
+
+/** A meeting that matches a search, with its best matching lines. */
+export interface MeetingSearchResult {
+  meetingId: string;
+  title: string;
+  startedAt: string;
+  ticket?: string | null;
+  hits: {
+    /** title | line | notes */
+    kind: string;
+    start?: number | null;
+    speaker: string;
+    /** Matches are wrapped in \u0002 … \u0003. */
+    snippet: string;
+  }[];
 }
 
 export interface TimeBlock {
@@ -360,7 +378,12 @@ export const api = {
   stopRecording: () => invoke<void>("stop_recording"),
   listMeetings: () => invoke<Meeting[]>("list_meetings"),
   getMeeting: (id: string) =>
-    invoke<{ meeting: Meeting; segments: Segment[]; actions: MeetingAction[] }>("get_meeting", { id }),
+    invoke<{ meeting: Meeting; segments: Segment[]; actions: MeetingAction[]; speakers: Record<string, string> }>(
+      "get_meeting",
+      { id },
+    ),
+  searchMeetings: (query: string) => invoke<MeetingSearchResult[]>("search_meetings", { query }),
+  nameSpeaker: (id: string, voice: string, name: string) => invoke<void>("name_speaker", { id, voice, name }),
   getMeetingActions: () => invoke<MeetingAction[]>("get_meeting_actions"),
   setActionDone: (id: number, done: boolean) => invoke<void>("set_action_done", { id, done }),
   snoozeAction: (id: number, until: string | null) => invoke<void>("snooze_action", { id, until }),

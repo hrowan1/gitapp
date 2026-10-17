@@ -7,6 +7,7 @@ mod github;
 mod intent;
 mod jira;
 mod meetings;
+mod search;
 mod summary;
 mod sync;
 
@@ -1315,7 +1316,8 @@ fn summarise_meeting(app: AppHandle, id: String) {
             let _ = summary::set_status(&state.db.relock(), &id, None, None);
             return;
         };
-        let transcript = summary::transcript_text(&segments);
+        let names = meetings::speaker_names(&state.db.relock(), &id).unwrap_or_default();
+        let transcript = summary::transcript_text(&segments, &names);
         let result = match provider {
             summary::Provider::Off => {
                 let _ = summary::set_status(&state.db.relock(), &id, None, None);
@@ -1556,6 +1558,8 @@ struct MeetingDetail {
     segments: Vec<meetings::Segment>,
     /// The notes' action items, with your progress on them.
     actions: Vec<summary::Action>,
+    /// Names you gave the voices on the call: voice → name.
+    speakers: std::collections::HashMap<String, String>,
 }
 
 #[tauri::command(async)]
@@ -1563,7 +1567,22 @@ fn get_meeting(state: State<AppState>, id: String) -> CmdResult<MeetingDetail> {
     let conn = state.db.relock();
     let (meeting, segments) = meetings::get(&conn, &id).map_err(err)?.ok_or("Unknown meeting")?;
     let actions = summary::meeting_actions(&conn, &id).map_err(err)?;
-    Ok(MeetingDetail { meeting, segments, actions })
+    let speakers = meetings::speaker_names(&conn, &id).map_err(err)?;
+    Ok(MeetingDetail { meeting, segments, actions, speakers })
+}
+
+/// Search every meeting's title, transcript and notes.
+#[tauri::command(async)]
+fn search_meetings(state: State<AppState>, query: String) -> CmdResult<Vec<search::Result_>> {
+    search::search(&state.db.relock(), &query).map_err(err)
+}
+
+/// Give a voice on the call a name ("Sam"); empty puts it back to "Speaker N".
+#[tauri::command(async)]
+fn name_speaker(app: AppHandle, id: String, voice: String, name: String) -> CmdResult<()> {
+    meetings::name_speaker(&app.state::<AppState>().db.relock(), &id, &voice, &name).map_err(err)?;
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -1821,6 +1840,8 @@ pub fn run() {
             get_ticket_attention,
             summarise_meeting_now,
             get_meeting_actions,
+            search_meetings,
+            name_speaker,
             set_action_done,
             snooze_action,
             summary_status,

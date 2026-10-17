@@ -50,13 +50,13 @@ impl Provider {
     }
 }
 
-/// The transcript as the models read it: "[12:03] You: …" lines.
-pub fn transcript_text(segments: &[Segment]) -> String {
+/// The transcript as the models read it: "[12:03] You: …", "[12:09] Sam: …" lines.
+pub fn transcript_text(segments: &[Segment], names: &std::collections::HashMap<String, String>) -> String {
     segments
         .iter()
         .map(|s| {
             let t = s.start.max(0.0) as u64;
-            let who = if s.speaker == "you" { "You" } else { "Others" };
+            let who = crate::meetings::speaker_label(s, names);
             format!("[{}:{:02}] {who}: {}", t / 60, t % 60, s.text)
         })
         .collect::<Vec<_>>()
@@ -94,7 +94,8 @@ fn parse_helper_output(stdout: &str) -> Result<Summary> {
 pub const CLAUDE_MODEL: &str = "claude-opus-5-5";
 
 const CLAUDE_SYSTEM: &str = "You write notes for a meeting from its transcript, for the person who recorded it. \
-Lines are labelled \"You\" (that person) or \"Others\" (everyone else on the call); the transcript comes from \
+Lines are labelled \"You\" (that person); other people are labelled by name, \"Speaker 2\" and so on, or \
+\"Others\" when voices couldn't be told apart. Use names where the transcript gives them. The transcript comes from \
 speech recognition, so expect misheard words and fix obvious ones from context. Only use what is in the \
 transcript: don't invent names, numbers or decisions. The overview is two to four plain sentences on what the \
 meeting was about and where it ended up. Decisions are things the group settled on. Action items are things \
@@ -197,6 +198,7 @@ pub fn save(conn: &Connection, meeting_id: &str, summary: &Summary, by: Provider
         params![meeting_id, serde_json::to_string(summary)?, by.id()],
     )?;
     sync_actions(&tx, meeting_id, summary)?;
+    crate::search::reindex(&tx, meeting_id)?;
     tx.commit()?;
     Ok(())
 }
@@ -302,9 +304,9 @@ mod tests {
 
     #[test]
     fn transcript_lines() {
-        let s = |start: f64, speaker: &str, text: &str| Segment { start, end: start + 2.0, speaker: speaker.into(), text: text.into() };
+        let s = |start: f64, speaker: &str, text: &str| Segment { start, end: start + 2.0, speaker: speaker.into(), text: text.into(), voice: None };
         assert_eq!(
-            transcript_text(&[s(4.2, "others", "Where does proration happen?"), s(725.0, "you", "On the day.")]),
+            transcript_text(&[s(4.2, "others", "Where does proration happen?"), s(725.0, "you", "On the day.")], &Default::default()),
             "[0:04] Others: Where does proration happen?\n[12:05] You: On the day."
         );
     }
@@ -332,7 +334,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dev-inbox-actions-{}.sqlite3", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let conn = crate::db::open(&path).unwrap();
-        crate::meetings::create(&conn, "m1", "Proration sync", "2026-10-16T14:00:00Z", std::path::Path::new("/tmp/x")).unwrap();
+        crate::meetings::create(&conn, "m1", "Proration sync", "2026-10-16T14:00:00Z", &std::env::temp_dir().join(format!("dev-inbox-actions-audio-{}", std::process::id()))).unwrap();
         let item = |owner: &str, text: &str| ActionItem { owner: owner.into(), text: text.into() };
         let notes = |items: Vec<ActionItem>| Summary { overview: "O".into(), decisions: vec![], action_items: items };
         save(&conn, "m1", &notes(vec![item("you", "Add credit notes"), item("others", "Check rounding"), item("you", "Email finance")]), Provider::Apple).unwrap();

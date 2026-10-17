@@ -101,12 +101,14 @@ export function CommandPalette({
   onNavigate,
   onSync,
   onOpenTicket,
+  onSearchMeetings,
 }: {
   items: Item[];
   onClose: () => void;
   onNavigate: (v: View) => void;
   onSync: () => void;
   onOpenTicket: (key: string) => void;
+  onSearchMeetings: (query: string) => void;
 }) {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   useEffect(() => {
@@ -168,7 +170,13 @@ export function CommandPalette({
     // "ES-310" is clearly a ticket: list it first.
     const byKey = /^[a-z][a-z0-9]*-\d*$/i.test(q.trim());
     const prEntries = prs.map((item) => ({ kind: "pr" as const, item }));
-    return byKey ? [...ticketHits, ...cmds, ...prEntries] : [...cmds, ...ticketHits, ...prEntries];
+    const searchMeetings: Entry = {
+      kind: "command",
+      command: { id: "search-meetings", label: `Search meetings for “${q.trim()}”`, run: () => onSearchMeetings(q.trim()) },
+    };
+    return byKey
+      ? [...ticketHits, ...cmds, ...prEntries, searchMeetings]
+      : [...cmds, ...ticketHits, ...prEntries, searchMeetings];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q, items, tickets, parsed, action, focus]);
 

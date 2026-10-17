@@ -2414,3 +2414,82 @@ a {
   text-decoration: line-through;
   color: var(--muted);
 }
+
+/* ---------- meeting search & speakers ---------- */
+
+.meeting-search {
+  margin: 10px 0 0;
+}
+.meeting-search .search-box {
+  flex: 1;
+}
+.search-result {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.search-result.selected > .row {
+  background: var(--selected, var(--hover));
+}
+.search-hit {
+  display: grid;
+  grid-template-columns: 44px auto 1fr;
+  gap: 8px;
+  margin: 0 8px 0 40px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.search-hit:hover {
+  background: var(--hover);
+}
+.hit-who {
+  font-weight: 650;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.hit-text {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.search-hit mark,
+.line mark {
+  background: color-mix(in srgb, var(--orange) 30%, transparent);
+  color: var(--text);
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.line {
+  grid-template-columns: 44px minmax(52px, auto) 1fr;
+}
+.line.flash {
+  animation: flash 2s ease-out;
+}
+@keyframes flash {
+  0%,
+  40% {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.line-who.renamable {
+  cursor: text;
+  border-bottom: 1px dashed transparent;
+}
+.line-who.renamable:hover {
+  border-bottom-color: currentColor;
+}
+.line-rename {
+  width: 90px;
+  padding: 0 4px;
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.voice-0 .line-who { color: var(--blue); }
+.voice-1 .line-who { color: var(--orange); }
+.voice-2 .line-who { color: var(--green); }
+.voice-3 .line-who { color: var(--violet); }
+.voice-4 .line-who { color: var(--red); }
+.voice-5 .line-who { color: var(--muted); }

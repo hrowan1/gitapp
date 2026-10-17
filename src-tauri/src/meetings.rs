@@ -124,6 +124,41 @@ pub struct Segment {
     /// you | others
     pub speaker: String,
     pub text: String,
+    /// For "others": which voice on the call ("1", "2"…), when they could be told apart.
+    pub voice: Option<String>,
+}
+
+/// How a line's speaker reads: "You", the name you gave a voice, "Speaker 2", or "Others".
+pub fn speaker_label(s: &Segment, names: &std::collections::HashMap<String, String>) -> String {
+    if s.speaker == "you" {
+        return "You".into();
+    }
+    match &s.voice {
+        Some(v) => names.get(v).cloned().unwrap_or_else(|| format!("Speaker {v}")),
+        None => "Others".into(),
+    }
+}
+
+/// The names you gave a meeting's voices: voice → name.
+pub fn speaker_names(conn: &Connection, id: &str) -> Result<std::collections::HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT voice, name FROM meeting_speakers WHERE meeting_id = ?1")?;
+    let rows = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Name a voice (empty name: back to "Speaker N").
+pub fn name_speaker(conn: &Connection, id: &str, voice: &str, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?1 AND voice = ?2", params![id, voice])?;
+    } else {
+        conn.execute(
+            "INSERT INTO meeting_speakers (meeting_id, voice, name) VALUES (?1, ?2, ?3)
+             ON CONFLICT(meeting_id, voice) DO UPDATE SET name = excluded.name",
+            params![id, voice, name],
+        )?;
+    }
+    crate::search::reindex(conn, id)
 }
 
 /// Transcribe one audio file with the helper (on-device).
@@ -141,7 +176,7 @@ pub fn transcribe_file(path: &Path, speaker: &str, locale: &str, timeout: std::t
             error = v["message"].as_str().map(String::from);
         }
         if let (Some(start), Some(end), Some(text)) = (v["start"].as_f64(), v["end"].as_f64(), v["text"].as_str()) {
-            segments.push(Segment { start, end, speaker: speaker.into(), text: text.into() });
+            segments.push(Segment { start, end, speaker: speaker.into(), text: text.into(), voice: None });
         }
     }
     match error {
@@ -212,8 +247,8 @@ pub fn save_transcript(conn: &Connection, id: &str, segments: &[Segment]) -> Res
     tx.execute("DELETE FROM meeting_segments WHERE meeting_id = ?1", [id])?;
     for s in segments {
         tx.execute(
-            "INSERT INTO meeting_segments (meeting_id, start, end, speaker, text) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, s.start, s.end, s.speaker, s.text],
+            "INSERT INTO meeting_segments (meeting_id, start, end, speaker, text, voice) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, s.start, s.end, s.speaker, s.text, s.voice],
         )?;
     }
     // Only fill the ticket in if the user hasn't chosen one.
@@ -222,6 +257,7 @@ pub fn save_transcript(conn: &Connection, id: &str, segments: &[Segment]) -> Res
         tx.execute("UPDATE meetings SET ticket = COALESCE(ticket, ?2) WHERE id = ?1", params![id, t])?;
     }
     tx.execute("UPDATE meetings SET status = 'done', error = NULL WHERE id = ?1", [id])?;
+    crate::search::reindex(&tx, id)?;
     tx.commit()?;
     Ok(())
 }
@@ -336,9 +372,9 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<(Meeting, Vec<Segment>)
     else {
         return Ok(None);
     };
-    let mut stmt = conn.prepare("SELECT start, end, speaker, text FROM meeting_segments WHERE meeting_id = ?1 ORDER BY start")?;
+    let mut stmt = conn.prepare("SELECT start, end, speaker, text, voice FROM meeting_segments WHERE meeting_id = ?1 ORDER BY start")?;
     let segments = stmt
-        .query_map([id], |r| Ok(Segment { start: r.get(0)?, end: r.get(1)?, speaker: r.get(2)?, text: r.get(3)? }))?
+        .query_map([id], |r| Ok(Segment { start: r.get(0)?, end: r.get(1)?, speaker: r.get(2)?, text: r.get(3)?, voice: r.get(4)? }))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some((m, segments)))
 }
@@ -348,7 +384,7 @@ pub fn update(conn: &Connection, id: &str, title: &str, ticket: Option<&str>) ->
         "UPDATE meetings SET title = ?2, ticket = ?3 WHERE id = ?1",
         params![id, title.trim(), ticket.map(str::trim).filter(|t| !t.is_empty())],
     )?;
-    Ok(())
+    crate::search::reindex(conn, id)
 }
 
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
@@ -361,6 +397,8 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     }
     conn.execute("DELETE FROM meeting_segments WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meeting_actions WHERE meeting_id = ?1", [id])?;
+    conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?1", [id])?;
+    conn.execute("DELETE FROM meeting_search WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meetings WHERE id = ?1", [id])?;
     Ok(())
 }
@@ -415,7 +453,7 @@ mod tests {
     use super::*;
 
     fn seg(start: f64, end: f64, speaker: &str, text: &str) -> Segment {
-        Segment { start, end, speaker: speaker.into(), text: text.into() }
+        Segment { start, end, speaker: speaker.into(), text: text.into(), voice: None }
     }
 
     #[test]

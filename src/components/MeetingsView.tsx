@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Meeting, type MeetingAction, type MeetingSummary, type RecordingStatus, type Segment } from "../lib/api";
+import {
+  api,
+  type Meeting,
+  type MeetingAction,
+  type MeetingSearchResult,
+  type MeetingSummary,
+  type RecordingStatus,
+  type Segment,
+} from "../lib/api";
 import { setActionDone } from "./MeetingActions";
 import { dayKey } from "../lib/day";
 import { clock, friendlyDate } from "../lib/time";
@@ -36,8 +44,8 @@ export function MeetingsView({
 }: {
   version: number;
   recording: RecordingStatus;
-  /** Open this meeting (e.g. clicked in the Day view). */
-  target?: { id: string } | null;
+  /** Open this meeting (e.g. clicked in the Day view), or search for something (from ⌘K). */
+  target?: { id?: string; query?: string } | null;
   onOpenDay: (day: string) => void;
 }) {
   const [meetings, setMeetings] = useState<Meeting[] | null>(null);
@@ -47,8 +55,25 @@ export function MeetingsView({
   const [levels, setLevels] = useState({ mic: 0, system: 0, seconds: 0 });
   const [warnings, setWarnings] = useState<string[]>([]);
   useEffect(() => {
-    if (target) setSelected(target.id);
+    if (target?.id) setSelected(target.id);
+    if (target?.query !== undefined) setQuery(target.query);
   }, [target]);
+
+  // Search: debounced, results replace the list while there's a query.
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<MeetingSearchResult[] | null>(null);
+  const [jump, setJump] = useState<{ at: number; n: number } | null>(null);
+  useEffect(() => {
+    if (!query.trim()) return setResults(null);
+    const t = setTimeout(() => {
+      api.searchMeetings(query).then(setResults, (e) => toast(String(e), true));
+    }, 180);
+    return () => clearTimeout(t);
+  }, [query, version]);
+  const openHit = (id: string, at?: number | null) => {
+    setSelected(id);
+    setJump(at == null ? null : { at, n: Date.now() });
+  };
 
   useEffect(() => {
     api.listMeetings().then(setMeetings).catch((e) => toast(String(e), true));
@@ -158,13 +183,30 @@ export function MeetingsView({
               </>
             )}
           </div>
+          <div className="filters meeting-search">
+            <div className="search-box">
+              <Icon name="search" size={14} />
+              <input
+                placeholder="Search transcripts and notes"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+              />
+              {query && (
+                <button className="ghost icon-only" title="Clear" onClick={() => setQuery("")}>
+                  <Icon name="x" size={12} />
+                </button>
+              )}
+            </div>
+          </div>
         </div>
 
         <div className="pane-scroll">
-          {meetings?.length === 0 && (
+          {results && <SearchResults results={results} selected={selected} onOpen={openHit} />}
+          {!results && meetings?.length === 0 && (
             <div className="empty">No meetings yet. Press Record when one starts — your mic and the call's audio are saved.</div>
           )}
-          {meetings?.map((m) => (
+          {!results && meetings?.map((m) => (
             <div
               key={m.id}
               className={`row${selected === m.id ? " selected" : ""}`}
@@ -207,7 +249,14 @@ export function MeetingsView({
       </section>
 
       {meeting ? (
-        <MeetingDetail key={meeting.id} meeting={meeting} version={version} onClose={() => setSelected(null)} onOpenDay={onOpenDay} />
+        <MeetingDetail
+          key={meeting.id}
+          meeting={meeting}
+          version={version}
+          jump={jump}
+          onClose={() => setSelected(null)}
+          onOpenDay={onOpenDay}
+        />
       ) : (
         <aside className="detail empty-detail">
           <div className="empty-art">
@@ -346,18 +395,95 @@ function Meter({ label, value }: { label: string; value: number }) {
   );
 }
 
+/** Snippet text with the search matches (\u0002 … \u0003) highlighted. */
+function Highlighted({ text }: { text: string }) {
+  return (
+    <>
+      {text.split(/(\u0002[^\u0003]*\u0003)/).map((part, i) =>
+        part.startsWith("\u0002") ? <mark key={i}>{part.slice(1, -1)}</mark> : part,
+      )}
+    </>
+  );
+}
+
+function SearchResults({
+  results,
+  selected,
+  onOpen,
+}: {
+  results: MeetingSearchResult[];
+  selected: string | null;
+  onOpen: (id: string, at?: number | null) => void;
+}) {
+  if (results.length === 0) return <div className="empty">No meeting mentions that.</div>;
+  return (
+    <>
+      {results.map((r) => (
+        <div key={r.meetingId} className={`search-result${selected === r.meetingId ? " selected" : ""}`}>
+          <div className="row" role="button" onClick={() => onOpen(r.meetingId)}>
+            <span className="state-icon tone-violet">
+              <Icon name="mic" size={14} />
+            </span>
+            <div className="row-main">
+              <div className="row-title">
+                {r.ticket && !r.title.toUpperCase().includes(r.ticket) && <span className="ticket-key">{r.ticket}</span>}
+                <span className="title">{r.title}</span>
+              </div>
+              <div className="row-sub">
+                <span>
+                  {friendlyDate(r.startedAt)} {clock(r.startedAt)}
+                </span>
+              </div>
+            </div>
+          </div>
+          {r.hits
+            .filter((h) => h.kind !== "title")
+            .map((h, i) => (
+              <div
+                key={i}
+                className="search-hit"
+                role="button"
+                onClick={() => onOpen(r.meetingId, h.start)}
+                title={h.kind === "line" ? "Open at this line" : "Open the notes"}
+              >
+                <span className="line-time">{h.kind === "line" && h.start != null ? mmss(h.start) : "notes"}</span>
+                {h.kind === "line" && <span className="hit-who">{h.speaker}</span>}
+                <span className="hit-text">
+                  <Highlighted text={h.snippet} />
+                </span>
+              </div>
+            ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** "You", the name you gave a voice, "Speaker 2", or "Others". */
+function speakerLabel(s: Segment, names: Record<string, string>): string {
+  if (s.speaker === "you") return "You";
+  if (s.voice) return names[s.voice] ?? `Speaker ${s.voice}`;
+  return "Others";
+}
+
 function MeetingDetail({
   meeting,
   version,
+  jump,
   onClose,
   onOpenDay,
 }: {
   meeting: Meeting;
   version: number;
+  /** Scroll to (and flash) the transcript line starting at `at`, e.g. from a search result. */
+  jump?: { at: number; n: number } | null;
   onClose: () => void;
   onOpenDay: (day: string) => void;
 }) {
   const [segments, setSegments] = useState<Segment[] | null>(null);
+  const [speakers, setSpeakers] = useState<Record<string, string>>({});
+  const [renaming, setRenaming] = useState<{ voice: string; name: string } | null>(null);
+  const body = useRef<HTMLDivElement>(null);
   const [actions, setActions] = useState<MeetingAction[]>([]);
   const [title, setTitle] = useState(meeting.title);
   const [ticket, setTicket] = useState(meeting.ticket ?? "");
@@ -367,12 +493,24 @@ function MeetingDetail({
   const mic = useRef<HTMLAudioElement>(null);
   const system = useRef<HTMLAudioElement>(null);
 
+  // Jump to a line (from search) once the transcript is there.
+  useEffect(() => {
+    if (!jump || !segments) return;
+    const line = body.current?.querySelector<HTMLElement>(`[data-start="${jump.at}"]`);
+    if (!line) return;
+    line.scrollIntoView({ block: "center", behavior: "smooth" });
+    line.classList.add("flash");
+    const t = setTimeout(() => line.classList.remove("flash"), 2000);
+    return () => clearTimeout(t);
+  }, [jump, segments]);
+
   useEffect(() => {
     api
       .getMeeting(meeting.id)
       .then((d) => {
         setSegments(d.segments);
         setActions(d.actions);
+        setSpeakers(d.speakers);
       })
       .catch((e) => toast(String(e), true));
   }, [meeting.id, meeting.status, version]);
@@ -406,7 +544,7 @@ function MeetingDetail({
   };
   const copyTranscript = async () => {
     if (!segments) return;
-    const text = segments.map((s) => `[${mmss(s.start)}] ${s.speaker === "you" ? "You" : "Others"}: ${s.text}`).join("\n");
+    const text = segments.map((s) => `[${mmss(s.start)}] ${speakerLabel(s, speakers)}: ${s.text}`).join("\n");
     const notes = meeting.summary ? `${notesText(meeting.summary)}\n\nTranscript\n\n` : "";
     await navigator.clipboard.writeText(`${meeting.title}\n\n${notes}${text}\n`).catch(() => {});
     toast("Transcript copied");
@@ -423,7 +561,7 @@ function MeetingDetail({
       <button className="detail-close ghost" onClick={onClose} title="Close">
         <Icon name="x" />
       </button>
-      <div className="detail-body">
+      <div className="detail-body" ref={body}>
         <div className="detail-meta">
           <Icon name="mic" size={14} />
           <span>
@@ -515,12 +653,49 @@ function MeetingDetail({
           {shown.map((s, i) => (
             <div
               key={i}
-              className={`line speaker-${s.speaker}`}
+              data-start={s.start}
+              className={`line speaker-${s.speaker}${s.voice ? ` voice-${(Number(s.voice) - 1) % 6}` : ""}`}
               onClick={() => meeting.hasAudio && seek(s.start)}
               title={meeting.hasAudio ? "Play from here" : undefined}
             >
               <span className="line-time">{mmss(s.start)}</span>
-              <span className="line-who">{s.speaker === "you" ? "You" : "Others"}</span>
+              {renaming && s.voice === renaming.voice ? (
+                <input
+                  className="line-rename"
+                  autoFocus
+                  value={renaming.name}
+                  placeholder={`Speaker ${s.voice}`}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => setRenaming({ ...renaming, name: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setRenaming(null);
+                    if (e.key === "Enter") e.currentTarget.blur();
+                  }}
+                  onBlur={() => {
+                    const r = renaming;
+                    setRenaming(null);
+                    const name = r.name.trim();
+                    if ((speakers[r.voice] ?? "") === name) return;
+                    const next = { ...speakers };
+                    if (name) next[r.voice] = name;
+                    else delete next[r.voice];
+                    setSpeakers(next);
+                    api.nameSpeaker(meeting.id, r.voice, name).catch((err) => toast(String(err), true));
+                  }}
+                />
+              ) : (
+                <span
+                  className={`line-who${s.voice ? " renamable" : ""}`}
+                  title={s.voice ? "Name this speaker" : undefined}
+                  onClick={(e) => {
+                    if (!s.voice) return;
+                    e.stopPropagation();
+                    setRenaming({ voice: s.voice, name: speakers[s.voice] ?? "" });
+                  }}
+                >
+                  {speakerLabel(s, speakers)}
+                </span>
+              )}
               <span className="line-text">{s.text}</span>
             </div>
           ))}

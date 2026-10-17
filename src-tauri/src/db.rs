@@ -258,6 +258,33 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
         }
     }
+    if version < 10 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Which voice on the call said a line ("1", "2"…; diarization of the meeting audio), and
+            -- the names you gave them.
+            ALTER TABLE meeting_segments ADD COLUMN voice TEXT;
+            CREATE TABLE IF NOT EXISTS meeting_speakers (
+                meeting_id TEXT NOT NULL,
+                voice TEXT NOT NULL,
+                name TEXT NOT NULL,
+                PRIMARY KEY (meeting_id, voice)
+            );
+            -- Full-text search over meetings: titles, transcript lines and notes.
+            CREATE VIRTUAL TABLE IF NOT EXISTS meeting_search USING fts5(
+                meeting_id UNINDEXED, kind UNINDEXED, start UNINDEXED, speaker, text,
+                tokenize = 'porter unicode61'
+            );
+            PRAGMA user_version = 10;
+            COMMIT;
+            "#,
+        )?;
+        let ids: Vec<String> = conn.prepare("SELECT id FROM meetings")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for id in ids {
+            crate::search::reindex(conn, &id)?;
+        }
+    }
     Ok(())
 }
 
@@ -869,7 +896,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search;",
     )?;
     Ok(())
 }

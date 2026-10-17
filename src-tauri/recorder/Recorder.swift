@@ -347,8 +347,9 @@ func summaryUnavailableReason() -> String? {
 
 let summaryInstructions = """
     You write notes for a meeting from its transcript. Lines are labelled "You" (the person who recorded the \
-    meeting) or "Others" (everyone else on the call). Only use what is in the transcript; don't invent names, \
-    numbers or decisions. Transcripts come from speech recognition, so expect misheard words.
+    meeting); other people are labelled by name, "Speaker 2" and so on, or "Others". Only use what is in the \
+    transcript; don't invent names, numbers or decisions. Transcripts come from speech recognition, so expect \
+    misheard words.
     """
 
 /// Split lines into chunks of at most `limit` characters.

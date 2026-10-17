@@ -369,6 +369,7 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
                 end: i as f64 * 6.0 + 5.0,
                 speaker: who.to_string(),
                 text: text.to_string(),
+                voice: (*who == "others").then(|| "1".to_string()),
             })
             .collect();
         crate::meetings::save_transcript(conn, id, &segments)?;
