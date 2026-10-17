@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, type JiraStatus, type Ticket, type TicketDetail, type TicketEvent } from "../lib/api";
+import { setActionDone } from "./MeetingActions";
 import { dayKey } from "../lib/day";
 import { clock, friendlyDate } from "../lib/time";
 import { toast } from "../lib/toast";
@@ -49,6 +50,61 @@ const INVOLVEMENT: Record<string, string> = {
   reported: "you reported it",
   updated: "you worked on it",
 };
+
+/** Meetings linked to the ticket in this app (Jira isn't touched), with their notes and your action items. */
+function TicketMeetings({ ticketKey, detail, onOpen }: { ticketKey: string; detail: TicketDetail; onOpen: (id: string) => void }) {
+  const link = (id: string, ticket: string | null) => api.linkMeeting(id, ticket).catch((e) => toast(String(e), true));
+  if (detail.meetings.length === 0 && detail.linkable.length === 0) return null;
+  return (
+    <div className="timeline">
+      <div className="group-label">Meetings</div>
+      {detail.meetings.map((m) => {
+        const mine = detail.actions.filter((a) => a.meetingId === m.id && a.owner === "you");
+        return (
+          <div key={m.id} className="ticket-meeting">
+            <div className="tl-row link-row" onClick={() => onOpen(m.id)} title="Open the meeting">
+              <Icon name="mic" size={13} />
+              <span className="tl-text">{m.title}</span>
+              <span className="tl-time">{friendlyDate(m.startedAt)}</span>
+              <button
+                className="ghost icon-only row-action"
+                title="Unlink from this ticket"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void link(m.id, null);
+                }}
+              >
+                <Icon name="x" size={12} />
+              </button>
+            </div>
+            {m.summary?.overview && <p className="ticket-meeting-notes">{m.summary.overview}</p>}
+            {mine.map((a) => (
+              <label key={a.id} className={`ticket-meeting-action${a.done ? " done" : ""}`}>
+                <input type="checkbox" checked={a.done} onChange={(e) => void setActionDone(a, e.target.checked)} />
+                <span>{a.text}</span>
+              </label>
+            ))}
+          </div>
+        );
+      })}
+      {detail.linkable.length > 0 && (
+        <select
+          className="link-meeting"
+          value=""
+          onChange={(e) => e.target.value && void link(e.target.value, ticketKey)}
+          title="Link a recent meeting to this ticket (only in Dev Inbox; nothing is added to Jira)"
+        >
+          <option value="">Link a recent meeting…</option>
+          {detail.linkable.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.title} · {friendlyDate(m.startedAt)}
+            </option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+}
 
 const DESCRIPTION_OPEN = "ticket-description-open";
 
@@ -116,6 +172,7 @@ export function TicketsView({
   now,
   target,
   onOpenDay,
+  onOpenMeeting,
   onSettings,
 }: {
   version: number;
@@ -123,6 +180,7 @@ export function TicketsView({
   /** Open this ticket (e.g. clicked in the Day view). */
   target?: { key: string } | null;
   onOpenDay: (day: string) => void;
+  onOpenMeeting: (id: string) => void;
   onSettings: () => void;
 }) {
   const [status, setStatus] = useState<JiraStatus | null>(null);
@@ -312,6 +370,8 @@ export function TicketsView({
             </div>
 
             {detail?.description && <Description text={detail.description} />}
+
+            {detail && <TicketMeetings ticketKey={ticket.key} detail={detail} onOpen={onOpenMeeting} />}
 
             {detail && detail.prs.length > 0 && (
               <div className="timeline">

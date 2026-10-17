@@ -116,6 +116,8 @@ export interface Settings {
   liveCaptions: boolean;
   /** Tell the voices on the call apart after recording (on this Mac). */
   separateSpeakers: boolean;
+  /** Remember voices you name and recognise them in later meetings. */
+  recogniseVoices: boolean;
 }
 
 export interface RecordingStatus {
@@ -183,6 +185,15 @@ export interface Segment {
   text: string;
   /** For "others": which voice on the call ("1", "2"…), when they could be told apart. */
   voice?: string | null;
+}
+
+/** Someone whose voice the app recognises (you named them in a meeting). */
+export interface KnownVoice {
+  id: number;
+  name: string;
+  /** How many meetings you've named them in. */
+  samples: number;
+  updatedAt: string;
 }
 
 /** A meeting that matches a search, with its best matching lines. */
@@ -332,6 +343,11 @@ export interface TicketEvent {
 export interface TicketDetail {
   /** Plain text: paragraphs separated by blank lines, list items as "• " lines. */
   description?: string | null;
+  /** Meetings linked to this ticket in the app (not in Jira), newest first, and their action items. */
+  meetings: Meeting[];
+  actions: MeetingAction[];
+  /** Recent meetings with no ticket, to link one. */
+  linkable: Meeting[];
   events: TicketEvent[];
   prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
 }
@@ -382,11 +398,21 @@ export const api = {
   stopRecording: () => invoke<void>("stop_recording"),
   listMeetings: () => invoke<Meeting[]>("list_meetings"),
   getMeeting: (id: string) =>
-    invoke<{ meeting: Meeting; segments: Segment[]; actions: MeetingAction[]; speakers: Record<string, string> }>(
+    invoke<{
+      meeting: Meeting;
+      segments: Segment[];
+      actions: MeetingAction[];
+      speakers: Record<string, string>;
+      /** Voices named automatically from someone you named before. */
+      recognised: string[];
+    }>(
       "get_meeting",
       { id },
     ),
   searchMeetings: (query: string) => invoke<MeetingSearchResult[]>("search_meetings", { query }),
+  linkMeeting: (id: string, ticket: string | null) => invoke<void>("link_meeting", { id, ticket }),
+  knownVoices: () => invoke<KnownVoice[]>("known_voices"),
+  forgetVoice: (id: number) => invoke<void>("forget_voice", { id }),
   nameSpeaker: (id: string, voice: string, name: string) => invoke<void>("name_speaker", { id, voice, name }),
   getMeetingActions: () => invoke<MeetingAction[]>("get_meeting_actions"),
   setActionDone: (id: number, done: boolean) => invoke<void>("set_action_done", { id, done }),

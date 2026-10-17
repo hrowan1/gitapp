@@ -285,6 +285,32 @@ fn migrate(conn: &Connection) -> Result<()> {
             crate::search::reindex(conn, &id)?;
         }
     }
+    if version < 11 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Voice fingerprints (unit f32 vectors) of each meeting's speakers, from speaker separation.
+            CREATE TABLE IF NOT EXISTS meeting_voices (
+                meeting_id TEXT NOT NULL,
+                voice TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                PRIMARY KEY (meeting_id, voice)
+            );
+            -- People you've named, and what they sound like (averaged over the meetings you named them in).
+            CREATE TABLE IF NOT EXISTS known_voices (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                embedding BLOB NOT NULL,
+                samples INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- Named automatically from a known voice (rather than by you).
+            ALTER TABLE meeting_speakers ADD COLUMN recognised INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 11;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -896,7 +922,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices;",
     )?;
     Ok(())
 }

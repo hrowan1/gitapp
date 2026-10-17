@@ -13,6 +13,7 @@ import {
   type TicketAttention,
   type SummaryStatus,
   type MeetingAction,
+  type KnownVoice,
 } from "../lib/api";
 import { toast } from "../lib/toast";
 import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
@@ -275,6 +276,49 @@ export function History({ version, onOpenDay }: { version: number; onOpenDay: ()
           ))}
         </section>
       ))}
+    </div>
+  );
+}
+
+/** Recognising people you've named before, and the voices the app knows. */
+function KnownVoices({ settings, onSave }: { settings: Settings; onSave: (s: Settings) => void }) {
+  const [voices, setVoices] = useState<KnownVoice[] | null>(null);
+  const refresh = () => api.knownVoices().then(setVoices).catch(() => setVoices([]));
+  useEffect(() => {
+    refresh();
+  }, []);
+  return (
+    <div className="known-voices">
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={settings.recogniseVoices}
+          onChange={(e) => onSave({ ...settings, recogniseVoices: e.target.checked })}
+        />
+        Recognise people you've named before
+      </label>
+      {settings.recogniseVoices && (
+        <p className="muted small">
+          When you name a speaker, a fingerprint of their voice is kept on this Mac so later meetings can name them for you.
+          {voices && voices.length === 0 && " Nobody yet — click a speaker in a transcript to name them."}
+        </p>
+      )}
+      {voices && voices.length > 0 && (
+        <div className="voice-list">
+          {voices.map((v) => (
+            <span key={v.id} className="voice-chip" title={`Learnt from ${v.samples} meeting${v.samples === 1 ? "" : "s"}`}>
+              {v.name}
+              <button
+                className="ghost icon-only"
+                title={`Forget ${v.name}'s voice`}
+                onClick={() => api.forgetVoice(v.id).then(refresh, (e) => toast(String(e), true))}
+              >
+                <Icon name="x" size={11} />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -545,6 +589,7 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
             />
             Tell speakers apart (Speaker 1, 2… — on this Mac; downloads a ~20 MB voice model once)
           </label>
+          {settings.separateSpeakers && <KnownVoices settings={settings} onSave={save} />}
           <SummarySettings settings={settings} onSave={save} />
         </section>
       )}

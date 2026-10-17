@@ -10,6 +10,7 @@ mod meetings;
 mod search;
 mod summary;
 mod sync;
+mod voices;
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -769,6 +770,9 @@ struct Settings {
     /// Tell the voices on the call apart (Speaker 1, 2…) after recording, on this Mac.
     #[serde(default = "yes")]
     separate_speakers: bool,
+    /// Remember voices you name, and name them automatically in later meetings.
+    #[serde(default = "yes")]
+    recognise_voices: bool,
 }
 
 fn apple() -> String {
@@ -810,6 +814,7 @@ fn get_settings(state: State<AppState>) -> Settings {
         summary_provider: summary_provider(&state).id().into(),
         live_captions: state.setting("live_captions").as_deref() != Some("0"),
         separate_speakers: state.setting("separate_speakers").as_deref() != Some("0"),
+        recognise_voices: state.setting("recognise_voices").as_deref() != Some("0"),
     }
 }
 
@@ -827,6 +832,7 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "summary_provider", provider.id()).map_err(err)?;
         db::set_setting(&conn, "live_captions", if settings.live_captions { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "separate_speakers", if settings.separate_speakers { "1" } else { "0" }).map_err(err)?;
+        db::set_setting(&conn, "recognise_voices", if settings.recognise_voices { "1" } else { "0" }).map_err(err)?;
         let ignored = settings.ignored_users.join(",");
         if db::get_setting(&conn, "ignored_users").map_err(err)?.unwrap_or_default() != ignored {
             db::set_setting(&conn, "ignored_users", &ignored).map_err(err)?;
@@ -1107,6 +1113,11 @@ struct TicketDetail {
     description: Option<String>,
     events: Vec<jira::TicketEvent>,
     prs: Vec<PrLink>,
+    /// Meetings linked to this ticket in the app, newest first, and their action items.
+    meetings: Vec<meetings::Meeting>,
+    actions: Vec<summary::Action>,
+    /// Recent meetings with no ticket, to link one.
+    linkable: Vec<meetings::Meeting>,
 }
 
 /// A ticket's movement history, and the PRs that mention it (by branch or title).
@@ -1140,7 +1151,22 @@ fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
         })
         .map(|(p, _)| p)
         .collect();
-    Ok(TicketDetail { description, events, prs })
+    let linked = meetings::for_ticket(&conn, &key).map_err(err)?;
+    let mut actions = Vec::new();
+    for m in &linked {
+        actions.extend(summary::meeting_actions(&conn, &m.id).map_err(err)?);
+    }
+    let fortnight = derive::fmt_ts(chrono::Utc::now() - chrono::Duration::days(14));
+    let linkable = meetings::recent_unlinked(&conn, &fortnight).map_err(err)?;
+    Ok(TicketDetail { description, events, prs, meetings: linked, actions, linkable })
+}
+
+/// Link a meeting to a ticket in this app (nothing is written to Jira); None unlinks it.
+#[tauri::command(async)]
+fn link_meeting(app: AppHandle, id: String, ticket: Option<String>) -> CmdResult<()> {
+    meetings::set_ticket(&app.state::<AppState>().db.relock(), &id, ticket.as_deref()).map_err(err)?;
+    let _ = app.emit("meetings-updated", ());
+    Ok(())
 }
 
 // ---------- Meetings ----------
@@ -1223,6 +1249,7 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
         let locale = state.setting("transcribe_locale").unwrap_or_default();
         let delete_audio = audio_retention_days(&state) < 0;
         let separate_speakers = state.setting("separate_speakers").as_deref() != Some("0");
+        let recognise = state.setting("recognise_voices").as_deref() != Some("0");
         let models = app.path().app_data_dir().map(|d| d.join("models")).ok();
         let seconds = meetings::get(&state.db.relock(), &id).ok().flatten().and_then(|(m, _)| m.seconds).unwrap_or(0);
         // Generous, but never forever: a first run may download the speech model.
@@ -1235,24 +1262,43 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
                 Ok(Vec::new())
             }
         };
-        let result = (|| -> anyhow::Result<Vec<meetings::Segment>> {
+        // Lines, plus each voice's fingerprint (voice "1", "2"… → vector) when speakers were told apart.
+        type Voices = std::collections::HashMap<String, Vec<f32>>;
+        let result = (|| -> anyhow::Result<(Vec<meetings::Segment>, Option<Voices>)> {
             let you = track("mic.m4a", "you")?;
             let mut others = track("system.m4a", "others")?;
+            let mut voices = None;
             // Tell the voices on the call apart. Best effort: without it they're all "Others".
             if let (true, false, Some(models)) = (separate_speakers, others.is_empty(), &models) {
                 match meetings::diarize_file(&dir.join("system.m4a"), models, timeout) {
-                    Ok(turns) => meetings::assign_voices(&mut others, &turns),
+                    Ok(found) => {
+                        let numbering = meetings::assign_voices(&mut others, &found.turns);
+                        voices = Some(
+                            found
+                                .voices
+                                .into_iter()
+                                .filter_map(|(speaker, v)| Some((numbering.get(&speaker)?.clone(), v)))
+                                .collect(),
+                        );
+                    }
                     Err(e) => eprintln!("speaker separation skipped: {e:#}"),
                 }
             }
-            Ok(meetings::merge(you, others))
+            Ok((meetings::merge(you, others), voices))
         })();
         let transcribed = result.is_ok();
         {
             let conn = state.db.relock();
             match result {
-                Ok(segments) => {
+                Ok((segments, voices)) => {
                     let _ = meetings::save_transcript(&conn, &id, &segments);
+                    if let Some(voices) = voices {
+                        let _ = voices::save_meeting_voices(&conn, &id, &voices);
+                        if recognise {
+                            let _ = voices::recognise(&conn, &id);
+                            let _ = search::reindex(&conn, &id);
+                        }
+                    }
                     if delete_audio {
                         let _ = std::fs::remove_dir_all(&dir);
                         let _ = conn.execute("UPDATE meetings SET audio_deleted = 1 WHERE id = ?1", [&id]);
@@ -1589,8 +1635,10 @@ struct MeetingDetail {
     segments: Vec<meetings::Segment>,
     /// The notes' action items, with your progress on them.
     actions: Vec<summary::Action>,
-    /// Names you gave the voices on the call: voice → name.
+    /// Names of the voices on the call: voice → name.
     speakers: std::collections::HashMap<String, String>,
+    /// Voices named automatically from someone you named before (not by you).
+    recognised: Vec<String>,
 }
 
 #[tauri::command(async)]
@@ -1599,7 +1647,19 @@ fn get_meeting(state: State<AppState>, id: String) -> CmdResult<MeetingDetail> {
     let (meeting, segments) = meetings::get(&conn, &id).map_err(err)?.ok_or("Unknown meeting")?;
     let actions = summary::meeting_actions(&conn, &id).map_err(err)?;
     let speakers = meetings::speaker_names(&conn, &id).map_err(err)?;
-    Ok(MeetingDetail { meeting, segments, actions, speakers })
+    let recognised = meetings::recognised_voices(&conn, &id).map_err(err)?;
+    Ok(MeetingDetail { meeting, segments, actions, speakers, recognised })
+}
+
+/// People whose voices the app recognises (they were named in a meeting).
+#[tauri::command(async)]
+fn known_voices(state: State<AppState>) -> CmdResult<Vec<voices::KnownVoice>> {
+    voices::known(&state.db.relock()).map_err(err)
+}
+
+#[tauri::command(async)]
+fn forget_voice(state: State<AppState>, id: i64) -> CmdResult<()> {
+    voices::forget(&state.db.relock(), id).map_err(err)
 }
 
 /// Search every meeting's title, transcript and notes.
@@ -1611,7 +1671,9 @@ fn search_meetings(state: State<AppState>, query: String) -> CmdResult<Vec<searc
 /// Give a voice on the call a name ("Sam"); empty puts it back to "Speaker N".
 #[tauri::command(async)]
 fn name_speaker(app: AppHandle, id: String, voice: String, name: String) -> CmdResult<()> {
-    meetings::name_speaker(&app.state::<AppState>().db.relock(), &id, &voice, &name).map_err(err)?;
+    let state = app.state::<AppState>();
+    let learn = state.setting("recognise_voices").as_deref() != Some("0");
+    meetings::name_speaker(&state.db.relock(), &id, &voice, &name, learn).map_err(err)?;
     let _ = app.emit("meetings-updated", ());
     Ok(())
 }
@@ -1872,6 +1934,9 @@ pub fn run() {
             summarise_meeting_now,
             get_meeting_actions,
             search_meetings,
+            link_meeting,
+            known_voices,
+            forget_voice,
             name_speaker,
             set_action_done,
             snooze_action,

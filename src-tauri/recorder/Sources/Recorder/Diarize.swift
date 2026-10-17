@@ -3,7 +3,9 @@
 // with the transcript lines.
 //
 //   dev-inbox-recorder diarize <audio file> <models dir>
-//     -> {"speaker","start","end"} lines, then {"event":"done","speakers":n}
+//     -> {"speaker","start","end"} lines, a {"event":"voice","speaker","embedding"} line per speaker
+//        (a unit-length voice fingerprint, for recognising them in later meetings), then
+//        {"event":"done","speakers":n}
 
 import FluidAudio
 import Foundation
@@ -22,6 +24,11 @@ func diarize(path: String, modelsDir: String) async {
                 "start": Double(segment.startTimeSeconds),
                 "end": Double(segment.endTimeSeconds),
             ])
+        }
+        for (speaker, embedding) in result.speakerDatabase ?? [:] where speakers.contains(speaker) {
+            let norm = sqrt(embedding.reduce(0) { $0 + $1 * $1 })
+            guard norm > 0 else { continue }
+            emit(["event": "voice", "speaker": speaker, "embedding": embedding.map { Double($0 / norm) }])
         }
         emit(["event": "done", "speakers": speakers.count])
     } catch {

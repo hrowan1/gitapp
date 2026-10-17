@@ -148,7 +148,7 @@ mod tests {
         assert!(line.snippet.contains("\u{2}proration\u{3}"), "{}", line.snippet);
 
         // Naming a voice makes it searchable by name.
-        meetings::name_speaker(&conn, "m1", "2", "Sam").unwrap();
+        meetings::name_speaker(&conn, "m1", "2", "Sam", false).unwrap();
         let r = search(&conn, "sam credit").unwrap();
         assert_eq!(r[0].hits[0].speaker, "Sam");
         assert!(search(&conn, "nothing-like-this").unwrap().is_empty());

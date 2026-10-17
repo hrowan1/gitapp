@@ -217,6 +217,7 @@ export default function App() {
                 version={version}
                 now={now}
                 target={ticketTarget}
+                onOpenMeeting={openMeeting}
                 onOpenDay={(day) => {
                   setDayTarget({ day });
                   setView("day");

@@ -159,19 +159,30 @@ pub fn speaker_names(conn: &Connection, id: &str) -> Result<std::collections::Ha
     Ok(rows)
 }
 
-/// Name a voice (empty name: back to "Speaker N").
-pub fn name_speaker(conn: &Connection, id: &str, voice: &str, name: &str) -> Result<()> {
+/// Name a voice (empty name: back to "Speaker N"). With `learn`, also remember what they sound like,
+/// so later meetings recognise them.
+pub fn name_speaker(conn: &Connection, id: &str, voice: &str, name: &str, learn: bool) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
         conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?1 AND voice = ?2", params![id, voice])?;
     } else {
         conn.execute(
-            "INSERT INTO meeting_speakers (meeting_id, voice, name) VALUES (?1, ?2, ?3)
-             ON CONFLICT(meeting_id, voice) DO UPDATE SET name = excluded.name",
+            "INSERT INTO meeting_speakers (meeting_id, voice, name, recognised) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(meeting_id, voice) DO UPDATE SET name = excluded.name, recognised = 0",
             params![id, voice, name],
         )?;
+        if learn {
+            crate::voices::learn(conn, id, voice, name, &fmt_ts(chrono::Utc::now()))?;
+        }
     }
     crate::search::reindex(conn, id)
+}
+
+/// Voices in a meeting that were named automatically from a known voice.
+pub fn recognised_voices(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT voice FROM meeting_speakers WHERE meeting_id = ?1 AND recognised")?;
+    let rows = stmt.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(rows)
 }
 
 /// Transcribe one audio file with the helper (on-device).
@@ -206,26 +217,40 @@ pub struct Turn {
     pub end: f64,
 }
 
-/// Who spoke when in an audio file (on-device; the helper downloads its models into `models` once).
-pub fn diarize_file(path: &Path, models: &Path, timeout: std::time::Duration) -> Result<Vec<Turn>> {
+/// Who spoke when in an audio file, and each speaker's voice fingerprint (on-device; the helper
+/// downloads its models into `models` once).
+pub struct Diarization {
+    pub turns: Vec<Turn>,
+    /// Speaker id → unit-length voice fingerprint.
+    pub voices: std::collections::HashMap<String, Vec<f32>>,
+}
+
+pub fn diarize_file(path: &Path, models: &Path, timeout: std::time::Duration) -> Result<Diarization> {
     let out = run_helper(&[std::ffi::OsStr::new("diarize"), path.as_os_str(), models.as_os_str()], timeout)
         .context("Telling speakers apart")?;
     let mut turns = Vec::new();
+    let mut voices = std::collections::HashMap::new();
     for line in out.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         if v["event"] == "error" {
             bail!("{}", v["message"].as_str().unwrap_or("Telling speakers apart failed"));
         }
+        if v["event"] == "voice" {
+            if let (Some(speaker), Some(e)) = (v["speaker"].as_str(), v["embedding"].as_array()) {
+                voices.insert(speaker.to_string(), e.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect());
+            }
+            continue;
+        }
         if let (Some(speaker), Some(start), Some(end)) = (v["speaker"].as_str(), v["start"].as_f64(), v["end"].as_f64()) {
             turns.push(Turn { speaker: speaker.into(), start, end });
         }
     }
-    Ok(turns)
+    Ok(Diarization { turns, voices })
 }
 
 /// Give each line the voice that talks most during it. Voices are numbered "1", "2"… in the order
-/// they first speak, so "Speaker 1" is whoever spoke first.
-pub fn assign_voices(lines: &mut [Segment], turns: &[Turn]) {
+/// they first speak, so "Speaker 1" is whoever spoke first. Returns speaker id → voice number.
+pub fn assign_voices(lines: &mut [Segment], turns: &[Turn]) -> std::collections::HashMap<String, String> {
     let mut order: Vec<&str> = Vec::new();
     let mut by_time: Vec<&Turn> = turns.iter().collect();
     by_time.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -248,6 +273,7 @@ pub fn assign_voices(lines: &mut [Segment], turns: &[Turn]) {
         }
         line.voice = talk.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| (i + 1).to_string());
     }
+    order.iter().enumerate().map(|(i, s)| (s.to_string(), (i + 1).to_string())).collect()
 }
 
 fn words(s: &str) -> std::collections::HashSet<String> {
@@ -384,6 +410,33 @@ pub fn list(conn: &Connection) -> Result<Vec<Meeting>> {
     Ok(rows)
 }
 
+/// Meetings linked to a ticket (in this app; nothing is written to Jira), newest first.
+pub fn for_ticket(conn: &Connection, key: &str) -> Result<Vec<Meeting>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEETING_COLUMNS} FROM meetings m WHERE upper(m.ticket) = upper(?1) ORDER BY m.started_at DESC"
+    ))?;
+    let rows = stmt.query_map([key], row_to_meeting)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Recent meetings not linked to any ticket, newest first: candidates to link one to.
+pub fn recent_unlinked(conn: &Connection, since: &str) -> Result<Vec<Meeting>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEETING_COLUMNS} FROM meetings m WHERE m.ticket IS NULL AND m.started_at >= ?1 ORDER BY m.started_at DESC LIMIT 20"
+    ))?;
+    let rows = stmt.query_map([since], row_to_meeting)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Link a meeting to a ticket (or unlink it with None), keeping its title.
+pub fn set_ticket(conn: &Connection, id: &str, ticket: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE meetings SET ticket = ?2 WHERE id = ?1",
+        params![id, ticket.map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty())],
+    )?;
+    Ok(())
+}
+
 /// Meetings that started in `[start, end)`, oldest first.
 pub fn started_between(conn: &Connection, start: &str, end: &str) -> Result<Vec<Meeting>> {
     let mut stmt = conn.prepare(&format!(
@@ -463,6 +516,7 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM meeting_segments WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meeting_actions WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?1", [id])?;
+    conn.execute("DELETE FROM meeting_voices WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meeting_search WHERE meeting_id = ?1", [id])?;
     conn.execute("DELETE FROM meetings WHERE id = ?1", [id])?;
     Ok(())
@@ -607,8 +661,8 @@ mod live_tests {
         let models = std::path::PathBuf::from(std::env::var("MODELS").expect("MODELS"));
         let minutes = std::time::Duration::from_secs(600);
         let mut lines = super::transcribe_file(&audio, "others", "en_GB", minutes).unwrap();
-        let turns = super::diarize_file(&audio, &models, minutes).unwrap();
-        super::assign_voices(&mut lines, &turns);
+        let found = super::diarize_file(&audio, &models, minutes).unwrap();
+        super::assign_voices(&mut lines, &found.turns);
         for l in &lines {
             println!("{:>5.1}s  Speaker {}  {}", l.start, l.voice.as_deref().unwrap_or("?"), l.text);
         }

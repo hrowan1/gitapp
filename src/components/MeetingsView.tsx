@@ -528,6 +528,7 @@ function MeetingDetail({
 }) {
   const [segments, setSegments] = useState<Segment[] | null>(null);
   const [speakers, setSpeakers] = useState<Record<string, string>>({});
+  const [recognised, setRecognised] = useState<string[]>([]);
   const [renaming, setRenaming] = useState<{ voice: string; name: string } | null>(null);
   const body = useRef<HTMLDivElement>(null);
   const [actions, setActions] = useState<MeetingAction[]>([]);
@@ -557,6 +558,7 @@ function MeetingDetail({
         setSegments(d.segments);
         setActions(d.actions);
         setSpeakers(d.speakers);
+        setRecognised(d.recognised);
       })
       .catch((e) => toast(String(e), true));
   }, [meeting.id, meeting.status, version]);
@@ -726,13 +728,20 @@ function MeetingDetail({
                     if (name) next[r.voice] = name;
                     else delete next[r.voice];
                     setSpeakers(next);
+                    setRecognised(recognised.filter((v) => v !== r.voice));
                     api.nameSpeaker(meeting.id, r.voice, name).catch((err) => toast(String(err), true));
                   }}
                 />
               ) : (
                 <span
-                  className={`line-who${s.voice ? " renamable" : ""}`}
-                  title={s.voice ? "Name this speaker" : undefined}
+                  className={`line-who${s.voice ? " renamable" : ""}${s.voice && recognised.includes(s.voice) ? " recognised" : ""}`}
+                  title={
+                    s.voice && recognised.includes(s.voice)
+                      ? "Recognised from an earlier meeting — click to change"
+                      : s.voice
+                        ? "Name this speaker (they'll be recognised in later meetings)"
+                        : undefined
+                  }
                   onClick={(e) => {
                     if (!s.voice) return;
                     e.stopPropagation();

@@ -434,6 +434,8 @@ mod tests {
         assert_eq!(involvement["MOB-77"], "assigned");
         assert_eq!(involvement["ES-298"], "was_assigned");
         assert_eq!(involvement["ES-305"], "reported");
+        let linked: Vec<String> = crate::meetings::for_ticket(&conn, "bill-142").unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(linked, ["demo-proration"], "meetings show on their ticket (case-insensitive key)");
         let meetings = crate::meetings::started_between(&conn, &s, &e).unwrap();
         assert_eq!(meetings.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["Standup", "BILL-142 proration sync"]);
         let since = crate::db::get_setting(&conn, "jira_attention_since").unwrap().unwrap();
