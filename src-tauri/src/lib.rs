@@ -1222,6 +1222,8 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
         // re-entrant, so calling it while holding `conn` deadlocks.
         let locale = state.setting("transcribe_locale").unwrap_or_default();
         let delete_audio = audio_retention_days(&state) < 0;
+        let separate_speakers = state.setting("separate_speakers").as_deref() != Some("0");
+        let models = app.path().app_data_dir().map(|d| d.join("models")).ok();
         let seconds = meetings::get(&state.db.relock(), &id).ok().flatten().and_then(|(m, _)| m.seconds).unwrap_or(0);
         // Generous, but never forever: a first run may download the speech model.
         let timeout = std::time::Duration::from_secs((seconds.max(0) as u64 * 3).max(10 * 60));
@@ -1233,7 +1235,18 @@ fn transcribe_meeting(app: AppHandle, id: String, dir: std::path::PathBuf) {
                 Ok(Vec::new())
             }
         };
-        let result = track("mic.m4a", "you").and_then(|you| Ok(meetings::merge(you, track("system.m4a", "others")?)));
+        let result = (|| -> anyhow::Result<Vec<meetings::Segment>> {
+            let you = track("mic.m4a", "you")?;
+            let mut others = track("system.m4a", "others")?;
+            // Tell the voices on the call apart. Best effort: without it they're all "Others".
+            if let (true, false, Some(models)) = (separate_speakers, others.is_empty(), &models) {
+                match meetings::diarize_file(&dir.join("system.m4a"), models, timeout) {
+                    Ok(turns) => meetings::assign_voices(&mut others, &turns),
+                    Err(e) => eprintln!("speaker separation skipped: {e:#}"),
+                }
+            }
+            Ok(meetings::merge(you, others))
+        })();
         let transcribed = result.is_ok();
         {
             let conn = state.db.relock();

@@ -198,6 +198,58 @@ pub fn transcribe_file(path: &Path, speaker: &str, locale: &str, timeout: std::t
     }
 }
 
+/// One stretch of one voice talking, from speaker separation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    pub speaker: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Who spoke when in an audio file (on-device; the helper downloads its models into `models` once).
+pub fn diarize_file(path: &Path, models: &Path, timeout: std::time::Duration) -> Result<Vec<Turn>> {
+    let out = run_helper(&[std::ffi::OsStr::new("diarize"), path.as_os_str(), models.as_os_str()], timeout)
+        .context("Telling speakers apart")?;
+    let mut turns = Vec::new();
+    for line in out.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v["event"] == "error" {
+            bail!("{}", v["message"].as_str().unwrap_or("Telling speakers apart failed"));
+        }
+        if let (Some(speaker), Some(start), Some(end)) = (v["speaker"].as_str(), v["start"].as_f64(), v["end"].as_f64()) {
+            turns.push(Turn { speaker: speaker.into(), start, end });
+        }
+    }
+    Ok(turns)
+}
+
+/// Give each line the voice that talks most during it. Voices are numbered "1", "2"… in the order
+/// they first speak, so "Speaker 1" is whoever spoke first.
+pub fn assign_voices(lines: &mut [Segment], turns: &[Turn]) {
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_time: Vec<&Turn> = turns.iter().collect();
+    by_time.sort_by(|a, b| a.start.total_cmp(&b.start));
+    for t in &by_time {
+        if !order.contains(&t.speaker.as_str()) {
+            order.push(&t.speaker);
+        }
+    }
+    for line in lines.iter_mut() {
+        let mut talk: Vec<(usize, f64)> = Vec::new();
+        for t in &by_time {
+            let overlap = line.end.min(t.end) - line.start.max(t.start);
+            if overlap > 0.0 {
+                let i = order.iter().position(|s| *s == t.speaker).unwrap_or(0);
+                match talk.iter_mut().find(|(v, _)| *v == i) {
+                    Some((_, secs)) => *secs += overlap,
+                    None => talk.push((i, overlap)),
+                }
+            }
+        }
+        line.voice = talk.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| (i + 1).to_string());
+    }
+}
+
 fn words(s: &str) -> std::collections::HashSet<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -470,6 +522,22 @@ mod tests {
     }
 
     #[test]
+    fn lines_get_the_voice_that_talks_most() {
+        let turn = |speaker: &str, start: f64, end: f64| Turn { speaker: speaker.into(), start, end };
+        // pyannote's ids don't follow speaking order; ours do.
+        let turns = [turn("S7", 0.0, 7.5), turn("S2", 8.3, 13.9), turn("S7", 14.5, 19.9), turn("S2", 20.5, 25.7)];
+        let mut lines = vec![
+            seg(0.2, 7.0, "others", "Where does proration happen?"),
+            seg(8.4, 13.8, "others", "On the day the plan changes."),
+            seg(13.0, 18.0, "others", "Mostly the first speaker"),
+            seg(30.0, 32.0, "others", "After everyone stopped"),
+        ];
+        assign_voices(&mut lines, &turns);
+        let voices: Vec<Option<&str>> = lines.iter().map(|l| l.voice.as_deref()).collect();
+        assert_eq!(voices, [Some("1"), Some("2"), Some("1"), None]);
+    }
+
+    #[test]
     fn helper_runs_are_bounded() {
         let mut echo = Command::new("sh");
         echo.args(["-c", "echo '{\"event\":\"done\"}'"]);
@@ -530,6 +598,23 @@ mod tests {
 
 #[cfg(test)]
 mod live_tests {
+    /// Real helper: transcribe a call track and tell its speakers apart.
+    /// `MEETING_AUDIO=system.m4a MODELS=… cargo test speakers_pipeline -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn speakers_pipeline() {
+        let audio = std::path::PathBuf::from(std::env::var("MEETING_AUDIO").expect("MEETING_AUDIO"));
+        let models = std::path::PathBuf::from(std::env::var("MODELS").expect("MODELS"));
+        let minutes = std::time::Duration::from_secs(600);
+        let mut lines = super::transcribe_file(&audio, "others", "en_GB", minutes).unwrap();
+        let turns = super::diarize_file(&audio, &models, minutes).unwrap();
+        super::assign_voices(&mut lines, &turns);
+        for l in &lines {
+            println!("{:>5.1}s  Speaker {}  {}", l.start, l.voice.as_deref().unwrap_or("?"), l.text);
+        }
+        assert!(lines.iter().filter_map(|l| l.voice.as_deref()).collect::<std::collections::HashSet<_>>().len() >= 2);
+    }
+
     /// Real helper, real on-device transcription: `MEETING_DIR=... cargo test meeting_pipeline -- --ignored --nocapture`
     #[test]
     #[ignore]

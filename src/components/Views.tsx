@@ -543,7 +543,7 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
               checked={settings.separateSpeakers}
               onChange={(e) => save({ ...settings, separateSpeakers: e.target.checked })}
             />
-            Tell speakers apart (Speaker 1, 2… — on this Mac; downloads a ~50 MB voice model once)
+            Tell speakers apart (Speaker 1, 2… — on this Mac; downloads a ~20 MB voice model once)
           </label>
           <SummarySettings settings={settings} onSave={save} />
         </section>

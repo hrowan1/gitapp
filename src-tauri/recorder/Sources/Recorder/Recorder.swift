@@ -7,6 +7,7 @@
 //                                                   ends it; with --captions, live {"event":"caption"} lines too
 //   dev-inbox-recorder transcribe <file> [locale] -> {"start","end","text"} lines, then {"event":"done"}
 //   dev-inbox-recorder summarise <transcript.txt> -> {"event":"summary","overview","decisions","actionItems"}
+//   dev-inbox-recorder diarize <file> <models dir>     -> who spoke when (see Diarize.swift)
 //   dev-inbox-recorder check [locale]             -> {"speech":bool,"locale":...,"summary":bool,"summaryReason":...}
 
 import AVFAudio
@@ -574,6 +575,8 @@ struct Main {
             } else {
                 fail("Summarising on this Mac needs macOS 26 or later")
             }
+        case "diarize" where args.count >= 4:
+            await diarize(path: args[2], modelsDir: args[3])
         case "caption-file" where args.count >= 3:
             // Test aid: run a file through the live captioner in real-time-sized chunks.
             if #available(macOS 26, *) {

@@ -23,5 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# Built from src-tauri/recorder/Recorder.swift
+# Built from src-tauri/recorder (SwiftPM)
 src-tauri/binaries/
+src-tauri/recorder/.build/
