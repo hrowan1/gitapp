@@ -46,4 +46,8 @@ strip = true
 tokio = { version = "1.53.2", features = ["rt", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mac-notification-sys = "0.6"
+# Notifications through UNUserNotificationCenter (macOS 27 refuses the legacy API).
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDictionary", "NSError", "NSBundle", "NSURL", "NSObject", "block2"] }
+objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotification", "UNNotificationSound", "UNNotificationSettings", "UNNotificationTrigger", "block2"] }

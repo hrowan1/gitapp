@@ -65,8 +65,8 @@ Build a release `.app`/`.dmg`: `npm run tauri build`.
 - **Smarter reminders**: your own comments the reminder rules don't recognise but that might be a promise ("I'll look at this once Sam's PR is in", "will check tomorrow") are read once by the AI after each sync; real ones park the PR until then (default 3 days) with the same note and notification as rule-based reminders.
 - **CI failure explainer** (a PR with failing checks → "Explain the failure"): fetches the failed checks on the latest commit — failing step, annotations, and for GitHub Actions the job log cut down to the error lines with what led up to them plus the end — and the AI says what broke, where, the likely cause and fix. Other CI providers get the check's own output.
 - **Day view** (`3` or `s`): pick any date to see what you worked on and for how long, the meetings you recorded (click for the transcript), and every **ticket move** that day on tickets that involve you — yours and other people's — a timeline of blocks grouped by **ticket** (Jira keys from branch names, PR titles or commit messages; otherwise PR, branch or repo), a week strip with daily totals, and per-ticket breakdowns. Time is estimated from your PR commits (authored time), pushes (captured every sync), reviews, comments, your own Jira moves and comments (tickets moved by others are shown but add no time), local `git log`, and — optionally — local editing activity sampled every 5 minutes from your clones (repo, branch and time only; never leaves your Mac). Edit, add or delete blocks (a day you edit stops auto-updating; reset any time), and copy a readable summary. Blocks are shaped like Jira worklogs, ready for a Jira integration.
-- **Menu bar / tray** with a monochrome icon and needs-you count; closing the window keeps it running. Global shortcut **⌥⌘K** (Ctrl+Alt+K elsewhere).
-- **Desktop notifications** when something new needs you (bursts are collapsed); on macOS, clicking one opens the PR/issue. Optional **morning summary** on weekdays.
+- **Menu bar**: a monochrome inbox icon that gets a dot when something needs you (the number too, if you turn it on in Settings), "REC" while recording, and a menu listing what needs you — PRs, Jira tickets and your meeting action items, each opening straight to it — plus Record a meeting, Sync now and Quit. Closing the window keeps it running. Global shortcut **⌥⌘K** (Ctrl+Alt+K elsewhere).
+- **Desktop notifications** when something new needs you (bursts are collapsed), through macOS's current notification API (UNUserNotificationCenter — macOS 27 refuses the old one): they show as Dev Inbox, appear even while the app is in front, and clicking one opens the PR, issue or ticket. Optional **morning summary** on weekdays.
 - **Filters** (All tab) by repo/org, author, state, CI, mine/others; hide repos in Settings.
 
 Mouse: click a row for its actions menu (open, reply, approve, merge, editor, come back later, mark as…) · double-click opens it on GitHub · right-click also opens the menu.
@@ -102,6 +102,7 @@ src-tauri/src/
   ci.rs       CI log excerpts (errors with context, the end) and the failure-explainer prompt
   suggest.rs  suggesting a ticket for an unlinked meeting
   reminders.rs AI reading of "I'll come back to this" comments the keyword rules miss
+  notifications.rs macOS notifications: UNUserNotificationCenter in the app bundle, AppleScript in dev
 src-tauri/recorder/                 the dev-inbox-recorder sidecar, a SwiftPM package built by build.rs: mic (AVAudioEngine)
                                     + system audio (Core Audio process tap) to AAC, live captions and transcription
                                     (SpeechAnalyzer), FoundationModels summaries, FluidAudio speaker separation
@@ -126,7 +127,7 @@ GITHUB_TOKEN=$(gh auth token) cargo test live -- --ignored --nocapture    # read
 
 ## Known limitations / next steps
 
-- Notifications in `tauri dev` are attributed to Terminal on macOS (so Terminal's notification settings apply); a built `.app` uses its own identity. Settings → "send a test" checks they arrive.
+- Notifications need a real, signed `.app` to show as Dev Inbox (the first one asks for permission). `tauri dev` runs a bare binary, so there they go through AppleScript instead: they show as Script Editor and clicking them doesn't open the item. Settings → "send a test" says which way it went, and whether notifications are turned off for Dev Inbox in System Settings.
 - In `tauri dev`, the Microphone and **Screen & System Audio Recording** prompts are attributed to Terminal (or your editor's terminal). If meeting audio stays silent, allow it in System Settings → Privacy & Security and restart the app. Transcription needs macOS 26+; on first use it downloads the speech model for your language.
 - Speaker labels are per track, not per person: everyone on the call is "Others". Spoken ticket keys rarely transcribe cleanly, so set the ticket from the title or by hand.
 - Each `cargo` rebuild changes the binary signature, so macOS may ask again for keychain access in development.

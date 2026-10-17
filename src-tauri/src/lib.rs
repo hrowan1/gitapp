@@ -10,6 +10,8 @@ mod ai;
 mod ask;
 mod ci;
 mod meetings;
+#[cfg(target_os = "macos")]
+mod notifications;
 mod reminders;
 mod search;
 mod suggest;
@@ -22,7 +24,7 @@ use serde::Serialize;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 #[cfg(not(target_os = "macos"))]
@@ -92,21 +94,134 @@ fn now() -> String {
 
 // ---------- sync ----------
 
-fn update_tray(app: &AppHandle, needs_you: usize) {
-    if let Some(tray) = app.tray_by_id("main") {
-        let title = (needs_you > 0).then(|| needs_you.to_string());
-        let _ = tray.set_title(title);
-        let _ = tray.set_tooltip(Some(format!("Dev Inbox — {needs_you} need you")));
+/// One thing in the menu bar's list: (menu id, label).
+fn tray_entries(state: &AppState) -> (usize, Vec<(String, String)>) {
+    let clip = |s: &str, n: usize| -> String {
+        let s = s.trim();
+        if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n - 1).collect::<String>()) }
+    };
+    let mut prs: Vec<db::Item> = db::list_items(&state.db.relock())
+        .map(|items| items.into_iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).collect())
+        .unwrap_or_default();
+    prs.sort_by(|a, b| b.since.cmp(&a.since));
+    let tickets = ticket_attention(state);
+    let actions = open_actions(state);
+    let total = prs.len() + tickets.len() + actions.len();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for i in prs.iter().take(5) {
+        let repo = i.repo.split('/').nth(1).unwrap_or(&i.repo);
+        let what = if i.kind == "run" { format!("{repo} — {}", clip(&i.title, 46)) } else { format!("{repo}#{} {}", i.number, clip(&i.title, 46)) };
+        entries.push((format!("pr:{}", i.id), what));
+    }
+    for t in tickets.iter().take(3) {
+        entries.push((format!("ticket:{}", t.key), format!("{} {}", t.key, clip(&t.reason, 48))));
+    }
+    for a in actions.iter().take(3) {
+        entries.push((format!("meeting:{}", a.meeting_id), format!("☐ {}", clip(&a.text, 52))));
+    }
+    (total, entries)
+}
+
+/// The menu bar: a monochrome inbox icon (with a dot when something needs you, and the number too if
+/// Settings asks for it), "REC" while recording, and a menu listing what needs you.
+fn refresh_tray(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let show_count = state.setting("menu_bar_count").as_deref() == Some("1");
+    let recording = state.recorder.relock().is_some();
+    let (total, entries) = tray_entries(&state);
+    let Some(tray) = app.tray_by_id("main") else { return };
+    #[cfg(target_os = "macos")]
+    {
+        let bytes: &[u8] = if total > 0 { include_bytes!("../icons/tray-dot.png") } else { include_bytes!("../icons/tray.png") };
+        if let Ok(icon) = tauri::image::Image::from_bytes(bytes) {
+            let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_icon_as_template(true);
+        }
+    }
+    let title = if recording {
+        Some("REC".to_string())
+    } else {
+        (show_count && total > 0).then(|| total.to_string())
+    };
+    let _ = tray.set_title(title);
+    let tooltip = match total {
+        0 => "Dev Inbox — all caught up".to_string(),
+        1 => "Dev Inbox — 1 thing needs you".to_string(),
+        n => format!("Dev Inbox — {n} things need you"),
+    };
+    let _ = tray.set_tooltip(Some(tooltip));
+    if let Ok(menu) = tray_menu(app, total, &entries, recording) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+fn tray_menu(app: &AppHandle, total: usize, entries: &[(String, String)], recording: bool) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    let header = match total {
+        0 => "You're all caught up".to_string(),
+        1 => "1 thing needs you".to_string(),
+        n => format!("{n} things need you"),
+    };
+    menu.append(&MenuItem::with_id(app, "today", header, true, None::<&str>)?)?;
+    for (id, label) in entries {
+        menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
+    }
+    if total > entries.len() {
+        menu.append(&MenuItem::with_id(app, "today", format!("…and {} more", total - entries.len()), true, None::<&str>)?)?;
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(app, "open", "Open Dev Inbox", true, None::<&str>)?)?;
+    if recording {
+        menu.append(&MenuItem::with_id(app, "stop-recording", "Stop recording", true, None::<&str>)?)?;
+    } else {
+        menu.append(&MenuItem::with_id(app, "record", "Record a meeting", true, None::<&str>)?)?;
+    }
+    menu.append(&MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(app, "quit", "Quit Dev Inbox", true, None::<&str>)?)?;
+    Ok(menu)
+}
+
+/// A menu bar item was chosen.
+fn tray_action(app: &AppHandle, id: &str) {
+    match id {
+        "open" | "today" => {
+            show_main(app);
+            let _ = app.emit("navigate", "today");
+        }
+        "sync" => app.state::<AppState>().wake.notify_one(),
+        "quit" => app.exit(0),
+        "record" => {
+            show_main(app);
+            let _ = app.emit("navigate", "meetings");
+            if let Err(e) = start_recording(app.clone(), None) {
+                let _ = app.emit("recording-event", serde_json::json!({"event": "error", "message": e}));
+            }
+        }
+        "stop-recording" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = stop_recording(app).await;
+            });
+        }
+        _ => {
+            if let Some(pr) = id.strip_prefix("pr:") {
+                let state = app.state::<AppState>();
+                let url = db::PrRef::load(&state.db.relock(), pr).ok().flatten().map(|p| p.url);
+                notification_clicked(app, url, Some(pr.to_string()));
+            } else if let Some(key) = id.strip_prefix("ticket:") {
+                show_main(app);
+                let _ = app.emit("open-ticket", key);
+            } else if let Some(meeting) = id.strip_prefix("meeting:") {
+                show_main(app);
+                let _ = app.emit("open-meeting", meeting);
+            }
+        }
     }
 }
 
 fn refresh_count(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let tickets = ticket_attention(&state).len() + open_actions(&state).len();
-    let n = db::list_items(&state.db.relock())
-        .map(|items| items.iter().filter(|i| i.reminder_due || derive::is_actionable(&i.state)).count())
-        .unwrap_or(0);
-    update_tray(app, n + tickets);
+    refresh_tray(app);
     let _ = app.emit("inbox-updated", ());
 }
 
@@ -131,7 +246,8 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
                     notify(app, n);
                 }
             }
-            update_tray(app, out.needs_you + ticket_attention(&state).len() + open_actions(&state).len());
+            let _ = out.needs_you;
+            refresh_tray(app);
             let _ = app.emit("inbox-updated", ());
             read_intents(app);
             Ok(())
@@ -149,49 +265,9 @@ async fn run_sync(app: &AppHandle) -> CmdResult<()> {
 fn notify(app: &AppHandle, n: sync::Notice) {
     #[cfg(target_os = "macos")]
     {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        // Each clickable notification parks a thread until it's clicked or cleared; cap how many.
-        static WAITING: AtomicUsize = AtomicUsize::new(0);
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            // Unbundled dev builds have no identity of their own; borrow Terminal's like the plugin does.
-            let id = if tauri::is_dev() { "com.apple.Terminal".to_string() } else { app.config().identifier.clone() };
-            let _ = mac_notification_sys::set_application(&id);
-        });
-        let app = app.clone();
-        let wait = WAITING.fetch_add(1, Ordering::SeqCst) < 12;
-        if !wait {
-            WAITING.fetch_sub(1, Ordering::SeqCst);
-        }
-        std::thread::spawn(move || {
-            let (subtitle, message) = n.body.split_once('\n').unwrap_or(("", n.body.as_str()));
-            let mut opts = mac_notification_sys::Notification::new();
-            opts.wait_for_click(wait);
-            let res = mac_notification_sys::send_notification(
-                &n.title,
-                (!subtitle.is_empty()).then_some(subtitle),
-                message,
-                Some(&opts),
-            );
-            if wait {
-                WAITING.fetch_sub(1, Ordering::SeqCst);
-            }
-            if let Ok(mac_notification_sys::NotificationResponse::Click) = res {
-                if let Some(key) = n.item_id.as_deref().and_then(|id| id.strip_prefix("jira:")) {
-                    seen_ticket(&app, key);
-                } else if let Some(id) = &n.item_id {
-                    let state = app.state::<AppState>();
-                    let _ = db::mark_seen(&state.db.relock(), id, &now());
-                    let _ = app.emit("inbox-updated", ());
-                }
-                match &n.url {
-                    Some(url) => {
-                        let _ = app.opener().open_url(url, None::<&str>);
-                    }
-                    None => show_main(&app),
-                }
-            }
-        });
+        let _ = app;
+        let (subtitle, message) = n.body.split_once('\n').unwrap_or(("", n.body.as_str()));
+        notifications::send(&n.title, subtitle, message, n.url.as_deref(), n.item_id.as_deref());
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -412,7 +488,7 @@ fn set_state(
 
 /// Sends a sample notification; clicking it opens GitHub notifications (checks permissions work).
 #[tauri::command(async)]
-fn test_notification(app: AppHandle) {
+fn test_notification(app: AppHandle) -> String {
     notify(
         &app,
         sync::Notice {
@@ -422,6 +498,35 @@ fn test_notification(app: AppHandle) {
             item_id: None,
         },
     );
+    #[cfg(target_os = "macos")]
+    return match notifications::route() {
+        notifications::Route::App => "Sent — it should appear as Dev Inbox.".into(),
+        notifications::Route::Denied => {
+            "Notifications are turned off for Dev Inbox: System Settings → Notifications → Dev Inbox → Allow notifications.".into()
+        }
+        notifications::Route::Dev => {
+            "Sent the development way (shows as Script Editor; clicking it won't open the item). The built app sends them as Dev Inbox.".into()
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    "Sent.".into()
+}
+
+/// A notification was clicked: mark its item seen and open it (or bring the app forward).
+fn notification_clicked(app: &AppHandle, url: Option<String>, item: Option<String>) {
+    if let Some(key) = item.as_deref().and_then(|id| id.strip_prefix("jira:")) {
+        seen_ticket(app, key);
+    } else if let Some(id) = &item {
+        let state = app.state::<AppState>();
+        let _ = db::mark_seen(&state.db.relock(), id, &now());
+        let _ = app.emit("inbox-updated", ());
+    }
+    match &url {
+        Some(url) => {
+            let _ = app.opener().open_url(url, None::<&str>);
+        }
+        None => show_main(app),
+    }
 }
 
 #[tauri::command(async)]
@@ -788,6 +893,9 @@ struct Settings {
     /// Remember voices you name, and name them automatically in later meetings.
     #[serde(default = "yes")]
     recognise_voices: bool,
+    /// Show the number of things that need you next to the menu bar icon (otherwise just a dot).
+    #[serde(default)]
+    menu_bar_count: bool,
 }
 
 fn apple() -> String {
@@ -837,11 +945,13 @@ fn get_settings(state: State<AppState>) -> Settings {
         live_captions: state.setting("live_captions").as_deref() != Some("0"),
         separate_speakers: state.setting("separate_speakers").as_deref() != Some("0"),
         recognise_voices: state.setting("recognise_voices").as_deref() != Some("0"),
+        menu_bar_count: state.setting("menu_bar_count").as_deref() == Some("1"),
     }
 }
 
 #[tauri::command(async)]
-fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> {
+fn update_settings(app: AppHandle, settings: Settings) -> CmdResult<()> {
+    let state = app.state::<AppState>();
     {
         let conn = state.db.relock();
         db::set_setting(&conn, "poll_seconds", &settings.poll_seconds.max(30).to_string()).map_err(err)?;
@@ -859,6 +969,7 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         db::set_setting(&conn, "live_captions", if settings.live_captions { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "separate_speakers", if settings.separate_speakers { "1" } else { "0" }).map_err(err)?;
         db::set_setting(&conn, "recognise_voices", if settings.recognise_voices { "1" } else { "0" }).map_err(err)?;
+        db::set_setting(&conn, "menu_bar_count", if settings.menu_bar_count { "1" } else { "0" }).map_err(err)?;
         let ignored = settings.ignored_users.join(",");
         if db::get_setting(&conn, "ignored_users").map_err(err)?.unwrap_or_default() != ignored {
             db::set_setting(&conn, "ignored_users", &ignored).map_err(err)?;
@@ -867,6 +978,7 @@ fn update_settings(state: State<AppState>, settings: Settings) -> CmdResult<()> 
         }
     }
     state.wake.notify_one();
+    refresh_tray(&app);
     Ok(())
 }
 
@@ -1751,14 +1863,8 @@ fn clear_anthropic_key(state: State<AppState>) {
     *state.anthropic_key.relock() = None;
 }
 
-fn set_recording_tray(app: &AppHandle, on: bool) {
-    if let Some(tray) = app.tray_by_id("main") {
-        if on {
-            let _ = tray.set_title(Some("● REC"));
-        } else {
-            refresh_count(app);
-        }
-    }
+fn set_recording_tray(app: &AppHandle, _on: bool) {
+    refresh_tray(app);
 }
 
 /// Start recording a meeting (mic + meeting audio). Only ever started by the user.
@@ -2220,19 +2326,12 @@ mod summary_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod notify_tests {
-    /// Shows a real notification through the same macOS path the app uses (no click wait):
-    /// `cargo test notify_smoke -- --ignored`
+    /// Shows a real notification through the path an unbundled build uses: `cargo test notify_smoke -- --ignored`
     #[test]
     #[ignore]
     fn notify_smoke() {
-        let _ = mac_notification_sys::set_application("com.apple.Terminal");
-        let res = mac_notification_sys::send_notification(
-            "🔔 Dev Inbox test",
-            Some("acme/web#482 Checkout refactor"),
-            "sarah replied in your thread",
-            None,
-        );
-        assert!(res.is_ok(), "{res:?}");
+        assert!(!super::notifications::bundled(), "tests run as a bare binary");
+        super::notifications::send("🔔 Dev Inbox test", "acme/web#482 Checkout refactor", "sarah replied in your thread", None, None);
     }
 }
 
@@ -2275,11 +2374,22 @@ pub fn run() {
             if !demo {
                 resume_meeting_jobs(app.handle());
             }
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                notifications::init(move |url, item| notification_clicked(&handle, url, item));
+                // Test aid: DEV_INBOX_NOTIFY_TEST=1 sends one notification at launch.
+                if std::env::var("DEV_INBOX_NOTIFY_TEST").is_ok_and(|v| v == "1") {
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let message = test_notification(handle);
+                        eprintln!("notification test: {message}");
+                    });
+                }
+            }
 
-            let open = MenuItem::with_id(app, "open", "Open Dev Inbox", true, None::<&str>)?;
-            let sync = MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &sync, &PredefinedMenuItem::separator(app)?, &quit])?;
+            let menu = tray_menu(app.handle(), 0, &[], false)?;
             // macOS: a monochrome template icon that adapts to light/dark menu bars.
             #[cfg(target_os = "macos")]
             let (icon, template) = (tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?, true);
@@ -2290,19 +2400,10 @@ pub fn run() {
                 .icon_as_template(template)
                 .tooltip("Dev Inbox")
                 .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => show_main(app),
-                    "sync" => app.state::<AppState>().wake.notify_one(),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                        show_main(tray.app_handle());
-                    }
-                })
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| tray_action(app, event.id.as_ref()))
                 .build(app)?;
+            refresh_tray(app.handle());
 
             if let Err(e) = app.global_shortcut().register(palette_shortcut()) {
                 eprintln!("couldn't register global shortcut: {e}");

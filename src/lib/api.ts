@@ -123,6 +123,8 @@ export interface Settings {
   separateSpeakers: boolean;
   /** Remember voices you name and recognise them in later meetings. */
   recogniseVoices: boolean;
+  /** Show the number of things that need you in the menu bar (otherwise just a dot on the icon). */
+  menuBarCount: boolean;
 }
 
 export interface RecordingStatus {
@@ -420,7 +422,7 @@ export const api = {
     invoke<void>("set_state", { prIds, state, until: until ?? null, note: note ?? null }),
   markSeen: (prIds: string[]) => invoke<void>("mark_seen", { prIds }),
   rerunChecks: (prId: string) => invoke<string>("rerun_checks", { prId }),
-  testNotification: () => invoke<void>("test_notification"),
+  testNotification: () => invoke<string>("test_notification"),
   submitReview: (prId: string, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body?: string) =>
     invoke<string>("submit_review", { prId, event, body: body ?? null }),
   sendComment: (itemId: string, body: string, threadId?: string | null) =>

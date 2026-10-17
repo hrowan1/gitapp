@@ -97,6 +97,10 @@ export default function App() {
       listen("sync-started", () => setSyncing(true)),
       listen("open-palette", () => setPalette(true)),
       listen("jira-updated", () => setVersion((v) => v + 1)),
+      // The menu bar's list: open what was picked.
+      listen<string>("navigate", (e) => go(e.payload as View)),
+      listen<string>("open-ticket", (e) => openTicket(e.payload)),
+      listen<string>("open-meeting", (e) => openMeeting(e.payload)),
       listen("meetings-updated", () => {
         refreshRecording();
         setVersion((v) => v + 1);
@@ -108,7 +112,7 @@ export default function App() {
       unlisten.forEach((p) => p.then((f) => f()));
       clearInterval(tick);
     };
-  }, [session, reload, refreshRecording]);
+  }, [session, reload, refreshRecording, go, openTicket, openMeeting]);
 
   useEffect(() => {
     if (session) refreshRecording();

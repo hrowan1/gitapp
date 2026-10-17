@@ -546,9 +546,17 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
               onChange={(e) => save({ ...settings, notifications: e.target.checked })}
             />
             Desktop notifications when something new needs me
-            <button className="link small" onClick={() => api.testNotification()}>
+            <button className="link small" onClick={() => api.testNotification().then((m) => toast(m), (e) => toast(String(e), true))}>
               send a test
             </button>
+          </label>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={settings.menuBarCount}
+              onChange={(e) => save({ ...settings, menuBarCount: e.target.checked })}
+            />
+            Show the number in the menu bar (otherwise a dot on the icon when something needs you)
           </label>
           <label className="check">
             <input
