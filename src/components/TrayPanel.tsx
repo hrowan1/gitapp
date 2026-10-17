@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { api, type Inbox, type Item, type MeetingAction, type RecordingStatus, type TicketAttention } from "../lib/api";
-import { openItem } from "../lib/actions";
 import { groupItems, shortRef } from "../lib/states";
 import { age } from "../lib/time";
 import { Icon } from "./Icon";
@@ -17,7 +16,7 @@ function mmss(total: number): string {
 }
 
 /** Open something in the main window and put the panel away. */
-const openInMain = (kind: "view" | "ticket" | "meeting" | "palette", target?: string) =>
+const openInMain = (kind: "view" | "item" | "ticket" | "meeting" | "palette", target?: string) =>
   invoke("open_in_main", { kind, target: target ?? null });
 const hide = () => invoke("hide_panel");
 
@@ -113,11 +112,8 @@ export function TrayPanel() {
               <button
                 key={i.id}
                 className="panel-row"
-                onClick={() => {
-                  openItem(i);
-                  void hide();
-                }}
-                title="Open on GitHub"
+                onClick={() => void openInMain("item", i.id)}
+                title="Open in Dev Inbox"
               >
                 <StateIcon state={i.state} size={13} />
                 <span className="panel-row-main">

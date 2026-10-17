@@ -34,6 +34,8 @@ export default function App() {
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
   const [ticketTarget, setTicketTarget] = useState<{ key: string } | null>(null);
   const [meetingTarget, setMeetingTarget] = useState<{ id?: string; query?: string; at?: number | null } | null>(null);
+  /** A PR or issue to open in Today (from a notification or the menu bar panel). */
+  const [itemTarget, setItemTarget] = useState<{ id: string; n: number } | null>(null);
   /** A question being asked about your history (⌘K → Ask). */
   const [asking, setAsking] = useState<string | null>(null);
   /** Jira tickets that need you, for Today and its count. */
@@ -53,6 +55,7 @@ export default function App() {
     setDayTarget(null);
     setTicketTarget(null);
     setMeetingTarget(null);
+    setItemTarget(null);
     setView(v);
   }, []);
   const [recording, setRecording] = useState<RecordingStatus>({ recording: false });
@@ -101,6 +104,11 @@ export default function App() {
       listen<string>("navigate", (e) => go(e.payload as View)),
       listen<string>("open-ticket", (e) => openTicket(e.payload)),
       listen<string>("open-meeting", (e) => openMeeting(e.payload)),
+      listen<string>("open-item", (e) => {
+        setItemTarget({ id: e.payload, n: Date.now() });
+        setView("today");
+        api.markSeen([e.payload]).catch(() => {});
+      }),
       listen("meetings-updated", () => {
         refreshRecording();
         setVersion((v) => v + 1);
@@ -197,6 +205,7 @@ export default function App() {
                 active={!overlay}
                 onOpenTicket={openTicket}
                 onOpenMeeting={openMeeting}
+                focus={itemTarget}
               />
             )}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}

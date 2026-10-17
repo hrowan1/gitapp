@@ -30,6 +30,7 @@ export function Today({
   tickets,
   actions,
   onOpenMeeting,
+  focus,
   now,
   active,
   onOpenTicket,
@@ -43,6 +44,8 @@ export function Today({
   active: boolean;
   onOpenTicket: (key: string) => void;
   onOpenMeeting: (id: string) => void;
+  /** Open this item (from a notification or the menu bar panel). */
+  focus?: { id: string; n: number } | null;
 }) {
   const groups = useMemo(() => groupItems(items), [items]);
   const sections = useMemo(
@@ -54,7 +57,7 @@ export function Today({
       })),
     [groups],
   );
-  const { selectedId, selection, onSelect, clear } = useSelection(items);
+  const { selectedId, selection, onSelect, clear } = useSelection(items, focus);
   const needs = groups.needs.length + tickets.length + actions.length;
   const fresh = items.filter((i) => i.isNew);
   const header = (

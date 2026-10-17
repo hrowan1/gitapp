@@ -29,7 +29,6 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
-use tauri_plugin_opener::OpenerExt;
 
 const KEYRING_SERVICE: &str = "dev-inbox";
 const KEYRING_USER: &str = "github-token";
@@ -220,6 +219,7 @@ fn open_in_main(app: AppHandle, kind: String, target: Option<String>) {
     show_main(&app);
     let target = target.unwrap_or_default();
     let _ = match kind.as_str() {
+        "item" => app.emit_to("main", "open-item", target),
         "ticket" => app.emit_to("main", "open-ticket", target),
         "meeting" => app.emit_to("main", "open-meeting", target),
         "palette" => app.emit_to("main", "open-palette", ()),
@@ -512,7 +512,7 @@ fn test_notification(app: AppHandle) -> String {
         &app,
         sync::Notice {
             title: "🔔 Dev Inbox notifications work".into(),
-            body: "Click me\nThis would open the PR or issue that changed".into(),
+            body: "Click me\nThis opens Dev Inbox, the way a real one opens its PR or ticket".into(),
             url: Some("https://github.com/notifications".into()),
             item_id: None,
         },
@@ -531,20 +531,26 @@ fn test_notification(app: AppHandle) -> String {
     "Sent.".into()
 }
 
-/// A notification was clicked: mark its item seen and open it (or bring the app forward).
-fn notification_clicked(app: &AppHandle, url: Option<String>, item: Option<String>) {
-    if let Some(key) = item.as_deref().and_then(|id| id.strip_prefix("jira:")) {
-        seen_ticket(app, key);
-    } else if let Some(id) = &item {
-        let state = app.state::<AppState>();
-        let _ = db::mark_seen(&state.db.relock(), id, &now());
-        let _ = app.emit("inbox-updated", ());
-    }
-    match &url {
-        Some(url) => {
-            let _ = app.opener().open_url(url, None::<&str>);
+/// A notification was clicked: bring Dev Inbox forward and open the item in it (a PR or issue in
+/// Today with its details, a ticket in Tickets), marking it seen. "Open on GitHub" is one click away
+/// from there. Notifications without an item (a burst summary, the morning digest) open Today.
+fn notification_clicked(app: &AppHandle, _url: Option<String>, item: Option<String>) {
+    show_main(app);
+    match item.as_deref() {
+        Some(id) if id.starts_with("jira:") => {
+            let key = &id["jira:".len()..];
+            seen_ticket(app, key);
+            let _ = app.emit_to("main", "open-ticket", key);
         }
-        None => show_main(app),
+        Some(id) => {
+            let state = app.state::<AppState>();
+            let _ = db::mark_seen(&state.db.relock(), id, &now());
+            let _ = app.emit("inbox-updated", ());
+            let _ = app.emit_to("main", "open-item", id);
+        }
+        None => {
+            let _ = app.emit_to("main", "navigate", "today");
+        }
     }
 }
 

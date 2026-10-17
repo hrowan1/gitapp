@@ -58,6 +58,7 @@ export function PrRow({
   return (
     <div
       ref={ref}
+      data-item-id={item.id}
       className={`row${selected ? " selected" : ""}${nested ? " nested" : ""}${item.isNew ? " is-new" : ""}`}
       // Click: select (details on the right). Double-click: open on GitHub. Right-click: quick menu.
       onClick={onSelect}
