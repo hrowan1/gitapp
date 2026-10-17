@@ -2712,3 +2712,19 @@ a {
 .callout.suggestion .ticket-key {
   margin-right: 2px;
 }
+
+/* ---------- CI explainer ---------- */
+
+.ci-explain {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.ci-explain-by {
+  margin-top: 8px;
+}
+.ci-explain-by .icon {
+  display: inline-block;
+  vertical-align: -1px;
+}

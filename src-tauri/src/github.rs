@@ -321,6 +321,23 @@ impl std::fmt::Display for Transient {
 
 impl std::error::Error for Transient {}
 
+/// One failed check on a PR, with what's needed to explain it.
+#[derive(Debug, Clone)]
+pub struct FailedCheck {
+    pub repo: String,
+    pub name: String,
+    /// The CI app ("GitHub Actions", "CircleCI"…).
+    pub app: String,
+    pub url: Option<String>,
+    /// GitHub Actions job id (its log can be fetched); None for other CI.
+    pub job_id: Option<i64>,
+    pub failed_step: Option<String>,
+    /// The check's own title/summary/text.
+    pub details: String,
+    /// "path:line level: message"
+    pub annotations: Vec<String>,
+}
+
 pub struct Client {
     http: reqwest::Client,
     token: String,
@@ -482,6 +499,87 @@ impl Client {
             }
         }
         Ok(out)
+    }
+
+    /// The failed checks on a PR's latest commit: what failed, the failing step, annotations, and (for
+    /// GitHub Actions) the job to fetch logs from.
+    pub async fn failed_checks(&self, pr_id: &str) -> Result<Vec<FailedCheck>> {
+        let data = self
+            .graphql(
+                "query($id: ID!) { node(id: $id) { ... on PullRequest {
+                    repository { nameWithOwner }
+                    commits(last: 1) { nodes { commit { checkSuites(first: 30) { nodes {
+                      app { name } workflowRun { databaseId }
+                      checkRuns(first: 20, filterBy: { conclusions: [FAILURE, TIMED_OUT, STARTUP_FAILURE] }) { nodes {
+                        name databaseId conclusion detailsUrl title summary text
+                        steps(first: 60) { nodes { name conclusion } }
+                        annotations(first: 20) { nodes { path message annotationLevel location { start { line } } } }
+                      } }
+                    } } } } }
+                } } }",
+                json!({ "id": pr_id }),
+            )
+            .await?;
+        let node = &data["node"];
+        let repo = node["repository"]["nameWithOwner"].as_str().ok_or_else(|| anyhow!("PR not found"))?.to_string();
+        let mut out = Vec::new();
+        for suite in node["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"].as_array().into_iter().flatten() {
+            let actions = suite["workflowRun"]["databaseId"].is_i64();
+            for run in suite["checkRuns"]["nodes"].as_array().into_iter().flatten() {
+                let text = |k: &str| run[k].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
+                out.push(FailedCheck {
+                    repo: repo.clone(),
+                    name: run["name"].as_str().unwrap_or("check").to_string(),
+                    app: suite["app"]["name"].as_str().unwrap_or_default().to_string(),
+                    url: text("detailsUrl"),
+                    job_id: if actions { run["databaseId"].as_i64() } else { None },
+                    failed_step: run["steps"]["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|s| matches!(s["conclusion"].as_str(), Some("FAILURE" | "TIMED_OUT")))
+                        .and_then(|s| s["name"].as_str())
+                        .map(String::from),
+                    details: [text("title"), text("summary"), text("text")].into_iter().flatten().collect::<Vec<_>>().join("\n"),
+                    annotations: run["annotations"]["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        // Notices are runner housekeeping ("ubuntu-latest will migrate…"), not the failure.
+                        .filter(|a| a["annotationLevel"].as_str() != Some("NOTICE"))
+                        .map(|a| {
+                            format!(
+                                "{}:{} {}: {}",
+                                a["path"].as_str().unwrap_or("?"),
+                                a["location"]["start"]["line"].as_i64().unwrap_or(0),
+                                a["annotationLevel"].as_str().unwrap_or("").to_lowercase(),
+                                a["message"].as_str().unwrap_or("").trim()
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// A GitHub Actions job's log (the last ~1.5 MB of it).
+    pub async fn job_log(&self, repo: &str, job_id: i64) -> Result<String> {
+        let res = self
+            .http
+            .get(format!("https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"))
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("GitHub request failed")?;
+        if !res.status().is_success() {
+            bail!("GitHub wouldn't give the job log ({})", res.status());
+        }
+        let bytes = res.bytes().await?;
+        let tail = &bytes[bytes.len().saturating_sub(1_500_000)..];
+        Ok(String::from_utf8_lossy(tail).into_owned())
     }
 
     /// Run a mutation; unlike queries, any GraphQL error means it didn't happen.

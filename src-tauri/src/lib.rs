@@ -8,6 +8,7 @@ mod intent;
 mod jira;
 mod ai;
 mod ask;
+mod ci;
 mod meetings;
 mod search;
 mod suggest;
@@ -1502,6 +1503,72 @@ fn suggest_ticket(app: &AppHandle, id: &str, title: &str, notes: &summary::Summa
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CiExplanation {
+    text: String,
+    /// "apple" or the Claude model.
+    by: String,
+    /// The failed checks it looked at: (name, link).
+    checks: Vec<(String, Option<String>)>,
+}
+
+/// Explain why a PR's checks failed, from the failing step, annotations and log (Settings → AI).
+#[tauri::command]
+async fn explain_ci(app: AppHandle, pr_id: String) -> CmdResult<CiExplanation> {
+    let (engine, token) = {
+        let state = app.state::<AppState>();
+        (ai_engine(&state).ok_or("AI features are off (Settings → AI)")?, state.token().ok_or("Not signed in")?)
+    };
+    let client = github::Client::new(&token);
+    let failed = client.failed_checks(&pr_id).await.map_err(|e| format!("{e:#}"))?;
+    if failed.is_empty() {
+        return Err("No failed checks on the latest commit — they may have been re-run or fixed.".into());
+    }
+    let shown = &failed[..failed.len().min(3)];
+    let per_check = engine.budget().saturating_sub(1_500) / shown.len();
+    let mut facts = String::new();
+    for c in shown {
+        let mut block = format!("## Check: {}{}\n", c.name, if c.app.is_empty() { String::new() } else { format!(" ({})", c.app) });
+        if let Some(step) = &c.failed_step {
+            block.push_str(&format!("Failed step: {step}\n"));
+        }
+        for a in c.annotations.iter().take(10) {
+            block.push_str(&format!("Annotation: {a}\n"));
+        }
+        if !c.details.trim().is_empty() {
+            block.push_str(&format!("Check output: {}\n", ai::fit(&c.details, 800)));
+        }
+        if let Some(job) = c.job_id {
+            match client.job_log(&c.repo, job).await {
+                Ok(log) => {
+                    let room = per_check.saturating_sub(block.chars().count() + 40);
+                    block.push_str(&format!("Log excerpt:\n{}\n", ci::excerpt(&log, room)));
+                }
+                Err(e) => block.push_str(&format!("(Couldn't fetch the log: {e:#})\n")),
+            }
+        } else {
+            block.push_str("(Not GitHub Actions: only the check's own output is available.)\n");
+        }
+        facts.push_str(&ai::fit(&block, per_check));
+        facts.push('\n');
+    }
+    if failed.len() > shown.len() {
+        facts.push_str(&format!("({} more checks also failed.)\n", failed.len() - shown.len()));
+    }
+    let prompt = ai::Prompt {
+        instructions: ci::INSTRUCTIONS.into(),
+        prompt: format!("Why did these checks fail?\n\n{facts}"),
+        max_tokens: 2_000,
+    };
+    let by = engine.id().to_string();
+    let text = tauri::async_runtime::spawn_blocking(move || ai::complete(&engine, &prompt))
+        .await
+        .map_err(err)?
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(CiExplanation { text, by, checks: failed.into_iter().map(|c| (c.name, c.url)).collect() })
+}
+
 /// "Not this": forget the suggested ticket for a meeting.
 #[tauri::command(async)]
 fn dismiss_suggestion(app: AppHandle, id: String) -> CmdResult<()> {
@@ -2219,6 +2286,7 @@ pub fn run() {
             search_meetings,
             link_meeting,
             dismiss_suggestion,
+            explain_ci,
             known_voices,
             ask_history,
             get_ai_summary,

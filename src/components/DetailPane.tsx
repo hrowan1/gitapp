@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { api, type Activity, type Item, type StateId } from "../lib/api";
+import { api, type Activity, type CiExplanation, type Item, type StateId } from "../lib/api";
 import { copyCheckout, openInEditor, openItem, rerunChecks, setStates, unfollow } from "../lib/actions";
 import { openDialog } from "../lib/dialog";
 import { on } from "../lib/events";
@@ -102,6 +102,71 @@ function stateNote(item: Item): string | null {
   return `You marked this “${STATES[p.state as StateId]?.label ?? p.state}”`;
 }
 
+/** "claude-haiku-5-5" → "Claude Haiku 5.5"; "apple" → Apple Intelligence. */
+function engineName(by: string): string {
+  if (by === "apple") return "Apple Intelligence";
+  const m = by.match(/^claude-([a-z]+)-(\d+)-(\d+)$/);
+  return m ? `Claude ${m[1].charAt(0).toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}` : by;
+}
+
+/** "Explain the failure": what broke, where, and the likely fix, from the failing checks' logs. */
+function CiExplainer({ item }: { item: Item }) {
+  const [state, setState] = useState<{ busy: boolean; result?: CiExplanation; error?: string }>({ busy: false });
+  useEffect(() => setState({ busy: false }), [item.id]);
+  const explain = async () => {
+    setState({ busy: true });
+    try {
+      setState({ busy: false, result: await api.explainCi(item.id) });
+    } catch (e) {
+      setState({ busy: false, error: String(e) });
+    }
+  };
+  if (!state.busy && !state.result && !state.error) {
+    return <Action icon="sparkle" label="Explain the failure" onClick={explain} />;
+  }
+  return (
+    <div className="ci-explain">
+      {state.busy && (
+        <div className="muted small ask-thinking">
+          <Icon name="loader" size={13} className="spin" /> Reading the failed checks' logs…
+        </div>
+      )}
+      {state.error && (
+        <div className="error small">
+          {state.error}{" "}
+          <button className="link small" onClick={explain}>
+            Try again
+          </button>
+        </div>
+      )}
+      {state.result && (
+        <>
+          <div className="ai-summary-text">{state.result.text}</div>
+          <div className="muted small ci-explain-by">
+            <Icon name="sparkle" size={12} /> {engineName(state.result.by)} ·{" "}
+            {state.result.checks.map(([name, url], i) => (
+              <span key={i}>
+                {i > 0 && ", "}
+                {url ? (
+                  <button className="link small" onClick={() => openUrl(url)}>
+                    {name}
+                  </button>
+                ) : (
+                  name
+                )}
+              </span>
+            ))}{" "}
+            ·{" "}
+            <button className="link small" onClick={explain}>
+              Again
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function ItemDetail({ item, now }: { item: Item; now: number }) {
   const [timeline, setTimeline] = useState<Activity[] | null>(null);
   const [snoozing, setSnoozing] = useState(false);
@@ -178,6 +243,12 @@ function ItemDetail({ item, now }: { item: Item; now: number }) {
       )}
 
       {primary.length > 0 && <div className="action-group">{primary}</div>}
+
+      {isPr && item.ci === "failure" && (
+        <div className="action-group">
+          <CiExplainer item={item} />
+        </div>
+      )}
 
       <div className="action-group">
         <div className="group-label">On GitHub</div>

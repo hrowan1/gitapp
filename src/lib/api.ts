@@ -198,6 +198,15 @@ export interface Segment {
   voice?: string | null;
 }
 
+/** Why a PR's checks failed, in words. */
+export interface CiExplanation {
+  text: string;
+  /** "apple" or the Claude model id. */
+  by: string;
+  /** The failed checks looked at: [name, link]. */
+  checks: [string, string | null][];
+}
+
 /** An AI-written summary of a day or a week. */
 export interface AiSummary {
   text: string;
@@ -457,6 +466,7 @@ export const api = {
   dismissSuggestion: (id: string) => invoke<void>("dismiss_suggestion", { id }),
   knownVoices: () => invoke<KnownVoice[]>("known_voices"),
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
+  explainCi: (prId: string) => invoke<CiExplanation>("explain_ci", { prId }),
   getAiSummary: (kind: "day" | "week", day: string) => invoke<AiSummary | null>("get_ai_summary", { kind, day }),
   writeAiSummary: (kind: "day" | "week", day: string) => invoke<AiSummary>("write_ai_summary", { kind, day }),
   forgetVoice: (id: number) => invoke<void>("forget_voice", { id }),
