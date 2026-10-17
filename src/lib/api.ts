@@ -195,6 +195,14 @@ export interface Segment {
   voice?: string | null;
 }
 
+/** An AI-written summary of a day or a week. */
+export interface AiSummary {
+  text: string;
+  /** "apple" or the Claude model id. */
+  by: string;
+  createdAt: string;
+}
+
 /** Something an answer can cite. */
 export interface AskSource {
   /** "S1", "S2"… as cited in the answer */
@@ -445,6 +453,8 @@ export const api = {
   linkMeeting: (id: string, ticket: string | null) => invoke<void>("link_meeting", { id, ticket }),
   knownVoices: () => invoke<KnownVoice[]>("known_voices"),
   askHistory: (question: string) => invoke<AskAnswer>("ask_history", { question }),
+  getAiSummary: (kind: "day" | "week", day: string) => invoke<AiSummary | null>("get_ai_summary", { kind, day }),
+  writeAiSummary: (kind: "day" | "week", day: string) => invoke<AiSummary>("write_ai_summary", { kind, day }),
   forgetVoice: (id: number) => invoke<void>("forget_voice", { id }),
   nameSpeaker: (id: string, voice: string, name: string) => invoke<void>("name_speaker", { id, voice, name }),
   getMeetingActions: () => invoke<MeetingAction[]>("get_meeting_actions"),

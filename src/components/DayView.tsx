@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { api, type DayEvent, type DayReport, type Meeting, type TicketMove, type TimeBlock } from "../lib/api";
+import { api, type AiSummary, type DayEvent, type DayReport, type Meeting, type TicketMove, type TimeBlock } from "../lib/api";
 import {
   addDays,
   dayBounds,
@@ -96,6 +96,7 @@ export function DayView({
   const [reports, setReports] = useState<Record<string, DayReport>>({});
   const [editing, setEditing] = useState<{ block: TimeBlock; index: number | null } | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [weekOpen, setWeekOpen] = useState(false);
   const week = useMemo(() => weekOf(day), [day]);
 
   const load = useCallback(async (days: string[]) => {
@@ -241,7 +242,13 @@ export function DayView({
         <button onClick={copy} disabled={!report}>
           <Icon name="copy" size={14} /> Copy summary
         </button>
+        <button onClick={() => setWeekOpen(true)} title="An AI review of this week">
+          <Icon name="sparkle" size={14} /> Week review
+        </button>
       </div>
+
+      <AiDaySummary day={day} version={version} />
+      {weekOpen && <WeekReview day={day} onClose={() => setWeekOpen(false)} />}
 
       {report &&
       report.blocks.length === 0 &&
@@ -334,6 +341,139 @@ export function DayView({
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** "claude-haiku-5-5" → "Claude Haiku 5.5"; "apple" → Apple Intelligence. */
+function engineName(by: string): string {
+  if (by === "apple") return "Apple Intelligence";
+  const m = by.match(/^claude-([a-z]+)-(\d+)-(\d+)$/);
+  return m ? `Claude ${m[1].charAt(0).toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}` : by;
+}
+
+/** Load, write and rewrite an AI summary of a day or week. */
+function useAiSummary(kind: "day" | "week", day: string, version: number) {
+  const [summary, setSummary] = useState<AiSummary | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setSummary(null);
+    setError(null);
+    setLoaded(false);
+    api
+      .getAiSummary(kind, day)
+      .then(setSummary)
+      .catch(() => {})
+      .finally(() => setLoaded(true));
+  }, [kind, day, version]);
+  const write = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setSummary(await api.writeAiSummary(kind, day));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { summary, loaded, busy, error, write };
+}
+
+/** An AI summary of the day, written when asked and kept. */
+function AiDaySummary({ day, version }: { day: string; version: number }) {
+  const { summary, busy, error, write } = useAiSummary("day", day, version);
+  if (!summary && !busy && !error) {
+    return (
+      <div className="ai-summary-empty">
+        <button className="link small" onClick={write}>
+          <Icon name="sparkle" size={13} /> Summarise this day
+        </button>
+      </div>
+    );
+  }
+  return (
+    <section className="ai-summary">
+      {busy && (
+        <div className="muted small ask-thinking">
+          <Icon name="loader" size={13} className="spin" /> Writing the summary…
+        </div>
+      )}
+      {error && <div className="error small">{error}</div>}
+      {summary && !busy && (
+        <>
+          <div className="ai-summary-text">{summary.text}</div>
+          <div className="muted small ai-summary-by">
+            <Icon name="sparkle" size={12} /> {engineName(summary.by)} · {hhmm(summary.createdAt)} ·{" "}
+            <button className="link small" onClick={write}>
+              Rewrite
+            </button>{" "}
+            ·{" "}
+            <button
+              className="link small"
+              onClick={() => navigator.clipboard.writeText(summary.text).then(() => toast("Summary copied"))}
+            >
+              Copy
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+/** An AI review of the week the day is in: shipped, time, decided, still open. */
+function WeekReview({ day, onClose }: { day: string; onClose: () => void }) {
+  const { summary, loaded, busy, error, write } = useAiSummary("week", day, 0);
+  // No review yet for this week: write one (once — effects can run twice in development).
+  const wrote = useRef(false);
+  useEffect(() => {
+    if (loaded && !summary && !wrote.current) {
+      wrote.current = true;
+      void write();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+  const monday = weekOf(day)[0];
+  return (
+    <div className="overlay" onMouseDown={onClose}>
+      <div className="dialog ask" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="dialog-head">
+          <Icon name="sparkle" size={15} />
+          <span className="strong">Week of {longDate(monday)}</span>
+          <span className="grow" />
+          <button className="ghost icon-only" onClick={onClose} title="Close">
+            <Icon name="x" size={14} />
+          </button>
+        </div>
+        <div className="ask-turns">
+          {busy && (
+            <div className="muted small ask-thinking">
+              <Icon name="loader" size={13} className="spin" /> Looking back over the week…
+            </div>
+          )}
+          {error && <div className="error small">{error}</div>}
+          {summary && !busy && <div className="ai-summary-text">{summary.text}</div>}
+        </div>
+        {summary && !busy && (
+          <div className="muted small ai-summary-by">
+            <Icon name="sparkle" size={12} /> {engineName(summary.by)} · written {hhmm(summary.createdAt)} ·{" "}
+            <button className="link small" onClick={write}>
+              Rewrite
+            </button>{" "}
+            ·{" "}
+            <button
+              className="link small"
+              onClick={() => navigator.clipboard.writeText(summary.text).then(() => toast("Week review copied"))}
+            >
+              Copy
+            </button>{" "}
+            · AI can be wrong — check the Day view.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

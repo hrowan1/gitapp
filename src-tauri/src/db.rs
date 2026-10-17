@@ -311,6 +311,22 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 12 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- AI-written summaries of a day ("day:2026-10-16") or week ("week:2026-10-12", its Monday).
+            CREATE TABLE IF NOT EXISTS ai_summaries (
+                key TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                written_by TEXT NOT NULL,      -- apple | the Claude model id
+                created_at TEXT NOT NULL
+            );
+            PRAGMA user_version = 12;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -922,7 +938,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries;",
     )?;
     Ok(())
 }

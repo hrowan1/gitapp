@@ -14,7 +14,7 @@ mod summary;
 mod sync;
 mod voices;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -1846,11 +1846,17 @@ fn start_local_tracker(app: AppHandle) {
 /// A day's time report. `start`/`end` are the local day's bounds as ISO instants.
 #[tauri::command]
 async fn get_day(app: AppHandle, day: String, start: String, end: String) -> CmdResult<day::DayReport> {
-    let state = app.state::<AppState>();
-    let me = state.setting("jira_account").unwrap_or_default();
     let (Some(s), Some(e)) = (derive::parse_ts(&start), derive::parse_ts(&end)) else {
         return Err("Bad day bounds".into());
     };
+    day_report(&app, &day, s, e).await
+}
+
+/// The Day view's report for one local day (used by the Day view and the AI summaries).
+async fn day_report(app: &AppHandle, day: &str, s: derive::Ts, e: derive::Ts) -> CmdResult<day::DayReport> {
+    let state = app.state::<AppState>();
+    let me = state.setting("jira_account").unwrap_or_default();
+    let (start, end) = (derive::fmt_ts(s), derive::fmt_ts(e));
     let clones = clones(&state);
     let (since, until) = (start.clone(), end.clone());
     // Local git log runs outside the database lock.
@@ -1868,11 +1874,131 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
     events.extend(day::local_events(&conn, local).map_err(err)?);
     events.extend(day::jira_events(&conn, &start, &end, &titles).map_err(err)?);
     let meeting_spans = meetings::day_spans(&conn, &start, &end).map_err(err)?;
-    let manual = day::manual_blocks(&conn, &day).map_err(err)?;
-    let mut report = day::build(&day, events, manual, s, e, &titles, &meeting_spans);
+    let manual = day::manual_blocks(&conn, day).map_err(err)?;
+    let mut report = day::build(day, events, manual, s, e, &titles, &meeting_spans);
     report.ticket_moves = jira::moves_between(&conn, &start, &end, &me).map_err(err)?;
     report.meetings = meetings::started_between(&conn, &start, &end).map_err(err)?;
     Ok(report)
+}
+
+/// A local calendar day's bounds as instants.
+fn local_day(d: chrono::NaiveDate) -> (derive::Ts, derive::Ts) {
+    use chrono::TimeZone;
+    let at = |d: chrono::NaiveDate| chrono::Local.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().to_utc();
+    (at(d), at(d + chrono::Duration::days(1)))
+}
+
+fn hours(minutes: i64) -> String {
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// "Fri 16 Oct: 6h 48m — BILL-142 Prorate… 2h 45m; MOB-77 … 2h 31m; …"
+fn time_line(date: chrono::NaiveDate, r: &day::DayReport) -> String {
+    let top: Vec<String> = r.groups.iter().filter(|g| g.minutes > 0).take(6).map(|g| format!("{} {}", g.label, hours(g.minutes))).collect();
+    format!("{}: {} tracked{}", date.format("%a %-d %b"), hours(r.total_minutes), if top.is_empty() { String::new() } else { format!(" — {}", top.join("; ")) })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiSummary {
+    text: String,
+    /// "apple" or the Claude model that wrote it.
+    by: String,
+    created_at: String,
+}
+
+/// "day:2026-10-16", or "week:<its Monday>".
+fn summary_key(kind: &str, day: &str) -> CmdResult<(String, chrono::NaiveDate)> {
+    use chrono::Datelike;
+    let date = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| "Bad date")?;
+    match kind {
+        "day" => Ok((format!("day:{date}"), date)),
+        "week" => {
+            let monday = date - chrono::Duration::days(date.weekday().num_days_from_monday() as i64);
+            Ok((format!("week:{monday}"), monday))
+        }
+        _ => Err("Unknown summary".into()),
+    }
+}
+
+/// A day or week summary written earlier, if any.
+#[tauri::command(async)]
+fn get_ai_summary(state: State<AppState>, kind: String, day: String) -> CmdResult<Option<AiSummary>> {
+    let (key, _) = summary_key(&kind, &day)?;
+    state
+        .db
+        .relock()
+        .query_row("SELECT text, written_by, created_at FROM ai_summaries WHERE key = ?1", [&key], |r| {
+            Ok(AiSummary { text: r.get(0)?, by: r.get(1)?, created_at: r.get(2)? })
+        })
+        .optional()
+        .map_err(err)
+}
+
+const DAY_INSTRUCTIONS: &str = "You write a short, readable summary of the user's work day for their own records and timesheet, from the facts given (\"You\" is the user). 3 to 6 bullet points starting with \"- \", the most time first: say what was worked on (with ticket keys), roughly how long (from the time-spent lines), what moved, and what meetings decided. Plain words, no headings, no preamble, no [S] tags. Only use the facts; don't invent.";
+
+const WEEK_INSTRUCTIONS: &str = "You write the user's weekly review from the facts given (\"You\" is the user). Four short sections, each a heading line then bullets starting with \"- \": \"Shipped\" (merged or opened PRs, tickets moved to done), \"Time\" (where the hours went, by day and by ticket, from the time-spent lines), \"Decided\" (from meeting notes) and \"Still open\" (action items, things in progress). Skip a section with nothing in it. Be concise; no preamble, no [S] tags. Only use the facts; don't invent.";
+
+/// Write (or rewrite) the AI summary of a day or a week (Settings → AI picks the engine).
+#[tauri::command]
+async fn write_ai_summary(app: AppHandle, kind: String, day: String) -> CmdResult<AiSummary> {
+    use chrono::Datelike;
+    let (key, first) = summary_key(&kind, &day)?;
+    let engine = {
+        let state = app.state::<AppState>();
+        ai_engine(&state).ok_or("AI features are off (Settings → AI)")?
+    };
+    let today = chrono::Local::now().date_naive();
+    let days: Vec<chrono::NaiveDate> = if kind == "week" {
+        (0..7).map(|i| first + chrono::Duration::days(i)).filter(|d| *d <= today).collect()
+    } else {
+        vec![first]
+    };
+    let mut time = String::new();
+    for d in &days {
+        let (s, e) = local_day(*d);
+        let r = day_report(&app, &d.to_string(), s, e).await?;
+        time.push_str(&time_line(*d, &r));
+        time.push('\n');
+    }
+    let (start, _) = local_day(days[0]);
+    let (_, end) = local_day(*days.last().unwrap());
+    let words = if kind == "week" {
+        format!("the week of {}", first.format("%-d %b"))
+    } else {
+        first.format("%A %-d %B").to_string()
+    };
+    let facts = {
+        let state = app.state::<AppState>();
+        let me = state.setting("jira_account").unwrap_or_default();
+        let conn = state.db.relock();
+        ask::period_facts(&conn, &derive::fmt_ts(start), &derive::fmt_ts(end), &words, &me, &time, engine.budget().saturating_sub(1_200))
+            .map_err(err)?
+    };
+    let prompt = ai::Prompt {
+        instructions: if kind == "week" { WEEK_INSTRUCTIONS } else { DAY_INSTRUCTIONS }.into(),
+        prompt: format!("Summarise {words}{}.\n\n{facts}", if first.weekday() == today.weekday() && days.last() == Some(&today) { " (so far — it isn't over)" } else { "" }),
+        max_tokens: 2_000,
+    };
+    let by = engine.id().to_string();
+    let text = tauri::async_runtime::spawn_blocking(move || ai::complete(&engine, &prompt))
+        .await
+        .map_err(err)?
+        .map_err(|e| format!("{e:#}"))?;
+    let created_at = now();
+    app.state::<AppState>()
+        .db
+        .relock()
+        .execute(
+            "INSERT OR REPLACE INTO ai_summaries (key, text, written_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![key, text, by, created_at],
+        )
+        .map_err(err)?;
+    Ok(AiSummary { text, by, created_at })
 }
 
 /// Save corrected blocks for a day (freezes it).
@@ -1909,6 +2035,22 @@ fn palette_shortcut() -> Shortcut {
     #[cfg(not(target_os = "macos"))]
     let mods = Modifiers::CONTROL | Modifiers::ALT;
     Shortcut::new(Some(mods), Code::KeyK)
+}
+
+#[cfg(test)]
+mod summary_tests {
+    #[test]
+    fn day_and_week_keys() {
+        assert_eq!(super::summary_key("day", "2026-10-16").unwrap().0, "day:2026-10-16");
+        // Friday 16 Oct → its Monday.
+        let (key, monday) = super::summary_key("week", "2026-10-16").unwrap();
+        assert_eq!((key.as_str(), monday.to_string().as_str()), ("week:2026-10-12", "2026-10-12"));
+        assert!(super::summary_key("year", "2026-10-16").is_err());
+        assert!(super::summary_key("day", "16/10/2026").is_err());
+        assert_eq!(super::hours(165), "2h 45m");
+        assert_eq!(super::hours(45), "45m");
+        assert_eq!(super::hours(120), "2h");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -2040,6 +2182,8 @@ pub fn run() {
             link_meeting,
             known_voices,
             ask_history,
+            get_ai_summary,
+            write_ai_summary,
             forget_voice,
             name_speaker,
             set_action_done,

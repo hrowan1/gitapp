@@ -262,17 +262,37 @@ pub fn gather(conn: &Connection, question: &str, me: &str, budget: usize) -> Res
     }
 
     // 3. The period: meetings, ticket moves, PR activity.
+    if !period_blocks(conn, &mut f, &start_s, &end_s, &period_words, me)? {
+        return Ok((f.text, f.sources, period_words));
+    }
+
+    // 4. What's open right now.
     let mut body = String::new();
-    for m in crate::meetings::started_between(conn, &start_s, &end_s)? {
-        meeting_lines(conn, &mut f, &mut body, &m)?;
+    for a in crate::summary::open_actions(conn, &fmt_ts(chrono::Utc::now()))?.into_iter().take(10) {
+        let s = f.source("meeting", &format!("{} ({})", a.meeting_title, when(&a.meeting_at)), None, Some(a.meeting_id.clone()), None).unwrap();
+        body.push_str(&format!("[{s}] Open action item for you from \"{}\": {}\n", a.meeting_title, a.text));
+    }
+    for item in crate::db::list_items(conn)?.into_iter().filter(|i| crate::derive::is_actionable(&i.state)).take(10) {
+        let s = f.source("pr", &format!("{}#{} {}", item.repo, item.number, item.title), Some(item.url.clone()), None, None).unwrap();
+        body.push_str(&format!("[{s}] Needs you: {}#{} \"{}\" — {}\n", item.repo, item.number, item.title, item.reason));
+    }
+    f.block("Open right now", &body);
+    Ok((f.text, f.sources, period_words))
+}
+
+/// Meetings, ticket moves and PR activity in a period, as tagged blocks. False once the budget is spent.
+fn period_blocks(conn: &Connection, f: &mut Facts, start_s: &str, end_s: &str, period_words: &str, me: &str) -> Result<bool> {
+    let mut body = String::new();
+    for m in crate::meetings::started_between(conn, start_s, end_s)? {
+        meeting_lines(conn, f, &mut body, &m)?;
     }
     if !f.block(&format!("Meetings — {period_words}"), &body) {
-        return Ok((f.text, f.sources, period_words));
+        return Ok(false);
     }
 
     let mut body = String::new();
     let mut by_ticket: BTreeMap<String, Vec<crate::jira::DayMove>> = BTreeMap::new();
-    for m in crate::jira::moves_between(conn, &start_s, &end_s, me)? {
+    for m in crate::jira::moves_between(conn, start_s, end_s, me)? {
         by_ticket.entry(m.key.clone()).or_default().push(m);
     }
     for (key, moves) in by_ticket {
@@ -286,7 +306,7 @@ pub fn gather(conn: &Connection, question: &str, me: &str, budget: usize) -> Res
         body.push('\n');
     }
     if !f.block(&format!("Jira ticket moves — {period_words}"), &body) {
-        return Ok((f.text, f.sources, period_words));
+        return Ok(false);
     }
 
     let mut body = String::new();
@@ -298,7 +318,7 @@ pub fn gather(conn: &Connection, question: &str, me: &str, budget: usize) -> Res
         edits: usize,
     }
     let mut by_pr: BTreeMap<String, Work> = BTreeMap::new();
-    for e in crate::day::gather(conn, &start_s, &end_s)? {
+    for e in crate::day::gather(conn, start_s, end_s)? {
         let (key, title, url) = match &e.pr {
             Some((key, title, url)) => (key.clone(), title.clone(), Some(url.clone())),
             None => (format!("{} {}", e.repo, e.branch.clone().unwrap_or_default()).trim().to_string(), String::new(), e.url.clone()),
@@ -326,21 +346,28 @@ pub fn gather(conn: &Connection, question: &str, me: &str, budget: usize) -> Res
         body.push_str(&format!("[{s}] {key}{title}: {}\n", parts.join("; ")));
     }
     if !f.block(&format!("Your GitHub activity — {period_words}"), &body) {
-        return Ok((f.text, f.sources, period_words));
+        return Ok(false);
     }
 
-    // 4. What's open right now.
+    Ok(true)
+}
+
+/// Facts for summarising a period (a day or a week): time spent first (`time` lines from the Day
+/// view), then meetings, ticket moves, PR activity, and what's still open.
+pub fn period_facts(conn: &Connection, start: &str, end: &str, period_words: &str, me: &str, time: &str, budget: usize) -> Result<String> {
+    let mut f = Facts { text: String::new(), sources: Vec::new(), budget };
+    if !f.block(&format!("Time spent — {period_words} (estimated by the app)"), time) {
+        return Ok(f.text);
+    }
+    if !period_blocks(conn, &mut f, start, end, period_words, me)? {
+        return Ok(f.text);
+    }
     let mut body = String::new();
     for a in crate::summary::open_actions(conn, &fmt_ts(chrono::Utc::now()))?.into_iter().take(10) {
-        let s = f.source("meeting", &format!("{} ({})", a.meeting_title, when(&a.meeting_at)), None, Some(a.meeting_id.clone()), None).unwrap();
-        body.push_str(&format!("[{s}] Open action item for you from \"{}\": {}\n", a.meeting_title, a.text));
+        body.push_str(&format!("Open action item for you from \"{}\": {}\n", a.meeting_title, a.text));
     }
-    for item in crate::db::list_items(conn)?.into_iter().filter(|i| crate::derive::is_actionable(&i.state)).take(10) {
-        let s = f.source("pr", &format!("{}#{} {}", item.repo, item.number, item.title), Some(item.url.clone()), None, None).unwrap();
-        body.push_str(&format!("[{s}] Needs you: {}#{} \"{}\" — {}\n", item.repo, item.number, item.title, item.reason));
-    }
-    f.block("Open right now", &body);
-    Ok((f.text, f.sources, period_words))
+    f.block("Still open", &body);
+    Ok(f.text)
 }
 
 fn meeting_lines(conn: &Connection, f: &mut Facts, body: &mut String, m: &crate::meetings::Meeting) -> Result<()> {

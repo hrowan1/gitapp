@@ -2671,3 +2671,34 @@ a {
 .ask-input input {
   width: 100%;
 }
+
+/* ---------- AI day & week summaries ---------- */
+
+.ai-summary-empty {
+  margin: 4px 0 8px;
+}
+.ai-summary-empty .link,
+.ai-summary-by .link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ai-summary {
+  margin: 4px 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.ai-summary-text {
+  font-size: 13.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.ai-summary-by {
+  margin-top: 8px;
+}
+.ai-summary-by .icon {
+  display: inline-block;
+  vertical-align: -1px;
+}
