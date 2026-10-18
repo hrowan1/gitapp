@@ -188,6 +188,34 @@ fn union_minutes(mut spans: Vec<(Ts, Ts)>) -> i64 {
     total.num_minutes()
 }
 
+/// Minutes per key with overlapping time shared out: while several keys' blocks overlap, each
+/// gets an equal part of that stretch. The keys then add up to the day's total — counting each
+/// key's own blocks separately made fifteen PR reviews in one sitting fifteen sittings.
+fn shared_minutes(spans: &[(&str, Ts, Ts)], total: i64) -> HashMap<String, i64> {
+    let mut edges: Vec<Ts> = spans.iter().flat_map(|(_, s, e)| [*s, *e]).collect();
+    edges.sort();
+    edges.dedup();
+    let mut seconds: BTreeMap<&str, f64> = BTreeMap::new();
+    for w in edges.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let mut active: Vec<&str> = spans.iter().filter(|(_, s, e)| *s <= a && *e >= b).map(|(k, _, _)| *k).collect();
+        active.sort();
+        active.dedup();
+        for k in &active {
+            *seconds.entry(k).or_default() += (b - a).num_seconds() as f64 / active.len() as f64;
+        }
+    }
+    // Whole minutes that still add up to `total` (largest remainders get the spare minutes).
+    let mut out: Vec<(&str, i64, f64)> =
+        seconds.iter().map(|(k, s)| (*k, (s / 60.0).floor() as i64, s / 60.0 - (s / 60.0).floor())).collect();
+    let spare = total - out.iter().map(|o| o.1).sum::<i64>();
+    out.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    for o in out.iter_mut().take(spare.max(0) as usize) {
+        o.1 += 1;
+    }
+    out.into_iter().map(|(k, m, _)| (k.to_string(), m)).collect()
+}
+
 /// Ticket key → (Jira summary, url, status), to label ticket groups with their real titles.
 pub type Titles = HashMap<String, (String, String, String)>;
 
@@ -293,13 +321,9 @@ pub fn build(
     let frozen = manual.is_some();
     let blocks = manual.unwrap_or(blocks);
     let span = |b: &Block| Some((parse_ts(&b.start)?, parse_ts(&b.end)?));
-    let mut minutes_by_key: HashMap<&str, Vec<(Ts, Ts)>> = HashMap::new();
-    for b in &blocks {
-        if let Some(sp) = span(b) {
-            minutes_by_key.entry(b.key.as_str()).or_default().push(sp);
-        }
-    }
     let total_minutes = union_minutes(blocks.iter().filter_map(span).collect());
+    let keyed: Vec<(&str, Ts, Ts)> = blocks.iter().filter_map(|b| span(b).map(|(s, e)| (b.key.as_str(), s, e))).collect();
+    let minutes_by_key = shared_minutes(&keyed, total_minutes);
 
     let mut groups: Vec<Group> = by_key
         .iter()
@@ -308,7 +332,7 @@ pub fn build(
             label: label.clone(),
             url: url.clone(),
             status: key.strip_prefix("T:").and_then(|t| titles.get(t)).map(|t| t.2.clone()),
-            minutes: minutes_by_key.get(key.as_str()).map_or(0, |s| union_minutes(s.clone())),
+            minutes: minutes_by_key.get(key.as_str()).copied().unwrap_or(0),
             events: evs
                 .iter()
                 .map(|e| EventOut {
@@ -330,7 +354,7 @@ pub fn build(
                 label: b.label.clone(),
                 url: None,
                 status: None,
-                minutes: minutes_by_key.get(b.key.as_str()).map_or(0, |s| union_minutes(s.clone())),
+                minutes: minutes_by_key.get(b.key.as_str()).copied().unwrap_or(0),
                 events: Vec::new(),
             });
         }
@@ -592,6 +616,32 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_groups_share_time() {
+        // Three PR reviews in one sitting, overlapping a ticket session: the groups add up to
+        // the day's total rather than counting the shared stretch three or four times.
+        let events = vec![
+            ev("10:00", "reviewed", None, "review a"),
+            ev("10:02", "reviewed", None, "review b"),
+            ev("10:04", "reviewed", None, "review c"),
+            ev("10:05", "committed", Some("io-1-thing"), "work"),
+        ];
+        let events: Vec<_> = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut e)| {
+                if e.kind == "reviewed" {
+                    e.pr = Some((format!("acme/web#{i}"), format!("Review {i}"), format!("https://x/{i}")));
+                }
+                e
+            })
+            .collect();
+        let r = build("2026-10-14", events, None, t("00:00"), t("23:59"), &Titles::new(), &[]);
+        let sum: i64 = r.groups.iter().map(|g| g.minutes).sum();
+        assert_eq!(sum, r.total_minutes, "{:?}", r.groups.iter().map(|g| (&g.key, g.minutes)).collect::<Vec<_>>());
+        assert!(r.groups.iter().all(|g| g.minutes < r.total_minutes));
+    }
+
+    #[test]
     fn overlaps_count_once_and_dedupe() {
         let mut a = ev("09:30", "committed", Some("abc-1-x"), "one");
         a.dedupe = Some("sha1".into());
@@ -686,3 +736,4 @@ mod tests {
         assert_eq!(r.groups[0].events.len(), 1, "events still listed for context");
     }
 }
+

@@ -202,6 +202,25 @@ pub fn propose(report: &crate::day::DayReport) -> DayProposal {
     out
 }
 
+/// A day's proposals in quarter hours that add up to the day's own total (rounded to 15 minutes):
+/// each row gets its whole quarters, and the spare quarters go to the rows closest to the next one.
+/// Rounding every row on its own made a day of many small things far longer than it was.
+pub fn quarters(day: &DayProposal) -> HashMap<String, i64> {
+    let target = round15(day.values().map(|(_, m)| *m).sum());
+    let mut rows: Vec<(&String, i64, i64)> = day.iter().map(|(k, (_, m))| (k, (m / 15) * 15, m % 15)).collect();
+    let mut spare = (target - rows.iter().map(|r| r.1).sum::<i64>()) / 15;
+    // Largest remainder first; ties to the bigger row, then by key so it's stable.
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(b.0)));
+    for r in rows.iter_mut() {
+        if spare <= 0 {
+            break;
+        }
+        r.1 += 15;
+        spare -= 1;
+    }
+    rows.into_iter().map(|(k, m, _)| (k.clone(), m)).collect()
+}
+
 /// The week: rows for every ticket with time (proposed, entered or logged), each with a cell per day.
 pub fn week(
     days: &[String],
@@ -228,12 +247,13 @@ pub fn week(
     }
     // Tickets alphabetically, "Other work" last.
     keys.sort_by(|a, b| (a == OTHER).cmp(&(b == OTHER)).then(a.cmp(b)));
+    let rounded: HashMap<&String, HashMap<String, i64>> = proposals.iter().map(|(d, p)| (d, quarters(p))).collect();
     keys.into_iter()
         .map(|key| {
-            let cells = days
+            let cells: Vec<Cell> = days
                 .iter()
                 .map(|d| {
-                    let proposed = round15(proposals.get(d).and_then(|p| p.get(&key)).map_or(0, |p| p.1));
+                    let proposed = rounded.get(d).and_then(|p| p.get(&key)).copied().unwrap_or(0);
                     let logged = round15(logged.get(&(d.clone(), key.clone())).copied().unwrap_or(0));
                     let s = stored.get(&(d.clone(), key.clone())).cloned().unwrap_or_default();
                     let minutes = s.minutes.unwrap_or_else(|| (proposed - logged).max(0));
@@ -246,6 +266,8 @@ pub fn week(
             let first = days.first().map(String::as_str).unwrap_or_default();
             Row { bucket: bucket(&key, first), key, label, cells }
         })
+        // A few minutes that rounded to nothing all week isn't worth a row.
+        .filter(|r| r.cells.iter().any(|c| c.minutes > 0 || c.proposed > 0 || c.logged > 0 || c.edited))
         .collect()
 }
 
@@ -263,6 +285,21 @@ pub fn stored_row(conn: &Connection, day: &str, row: &str) -> Result<Option<Stor
 mod tests {
     use super::*;
     use crate::harvest::Task;
+
+    #[test]
+    fn a_day_rounds_as_a_whole() {
+        let p = |rows: &[(&str, i64)]| -> DayProposal { rows.iter().map(|(k, m)| (k.to_string(), (String::new(), *m))).collect() };
+        // Six 10-minute things are an hour, not an hour and a half.
+        let q = quarters(&p(&[("A-1", 10), ("A-2", 10), ("A-3", 10), ("A-4", 10), ("A-5", 10), ("A-6", 10)]));
+        assert_eq!(q.values().sum::<i64>(), 60);
+        assert!(q.values().all(|m| m % 15 == 0));
+        // 175 minutes is three hours; the spare quarters go to the rows nearest their next one.
+        let q = quarters(&p(&[("A-1", 128), ("A-2", 44), ("A-3", 3)]));
+        assert_eq!(q.values().sum::<i64>(), 180);
+        assert_eq!(q["A-1"], 135);
+        assert_eq!(q["A-2"], 45);
+        assert_eq!(q["A-3"], 0);
+    }
 
     /// Edit a cell, submit it, edit it again: it's waiting again, and going back to the proposal
     /// after submitting still counts as a change.

@@ -75,6 +75,9 @@ function movesByTicket(moves: TicketMove[]): TicketMove[][] {
   return [...groups.values()];
 }
 
+/** Reports loaded this session: coming back to Day shows them at once, then refreshes quietly. */
+const reportCache: Record<string, DayReport> = {};
+
 /** What you worked on, for how long, on any day; editable, and shaped for Jira worklogs. */
 export function DayView({
   version,
@@ -93,7 +96,7 @@ export function DayView({
   useEffect(() => {
     if (target) setDay(target.day);
   }, [target]);
-  const [reports, setReports] = useState<Record<string, DayReport>>({});
+  const [reports, setReports] = useState<Record<string, DayReport>>(() => ({ ...reportCache }));
   const [editing, setEditing] = useState<{ block: TimeBlock; index: number | null } | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [weekOpen, setWeekOpen] = useState(false);
@@ -113,7 +116,11 @@ export function DayView({
     );
     setReports((prev) => {
       const next = { ...prev };
-      for (const r of loaded) if (r) next[r[0]] = r[1];
+      for (const r of loaded) {
+        if (!r) continue;
+        next[r[0]] = r[1];
+        reportCache[r[0]] = r[1];
+      }
       return next;
     });
   }, []);

@@ -237,8 +237,31 @@ pub struct LocalCommit {
     pub message: String,
 }
 
-/// The user's own commits in a clone between two instants, on any branch.
+type CommitCache = std::collections::HashMap<(String, String, String), (std::time::Instant, Vec<LocalCommit>)>;
+
+/// Recent answers, so switching to Day or the Timesheet (each runs this for every clone and every
+/// day of a week — hundreds of `git` calls) doesn't redo them all.
+static COMMITS: LazyLock<std::sync::Mutex<CommitCache>> = LazyLock::new(Default::default);
+
+/// The user's own commits in a clone between two instants, on any branch. Cached briefly: a minute
+/// while the range includes now (new commits land), ten for ranges in the past.
 pub fn local_commits(path: &str, since: &str, until: &str) -> Vec<LocalCommit> {
+    let key = (path.to_string(), since.to_string(), until.to_string());
+    let past = crate::derive::parse_ts(until).is_some_and(|u| u < chrono::Utc::now());
+    let fresh_for = std::time::Duration::from_secs(if past { 600 } else { 60 });
+    if let Some((at, commits)) = COMMITS.lock().unwrap().get(&key) {
+        if at.elapsed() < fresh_for {
+            return commits.clone();
+        }
+    }
+    let commits = read_local_commits(path, since, until);
+    let mut cache = COMMITS.lock().unwrap();
+    cache.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+    cache.insert(key, (std::time::Instant::now(), commits.clone()));
+    commits
+}
+
+fn read_local_commits(path: &str, since: &str, until: &str) -> Vec<LocalCommit> {
     let Ok(email) = git(path, &["config", "user.email"]) else { return Vec::new() };
     if email.is_empty() {
         return Vec::new();

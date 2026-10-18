@@ -2472,14 +2472,31 @@ fn harvest_disconnect(state: State<AppState>) -> CmdResult<()> {
     Ok(())
 }
 
+/// Harvest's projects change rarely: fetched at most every 15 minutes (per Harvest user), rather
+/// than every time the Timesheet loads.
+async fn cached_projects(state: &AppState, client: &harvest::Client) -> anyhow::Result<Vec<harvest::Project>> {
+    type Cached = Option<(String, std::time::Instant, Vec<harvest::Project>)>;
+    static CACHE: Mutex<Cached> = Mutex::new(None);
+    let who = state.setting("harvest_user_id").unwrap_or_default();
+    if let Some((w, at, projects)) = CACHE.lock().unwrap().as_ref() {
+        if *w == who && at.elapsed() < Duration::from_secs(15 * 60) {
+            return Ok(projects.clone());
+        }
+    }
+    let projects = client.projects().await?;
+    *CACHE.lock().unwrap() = Some((who, std::time::Instant::now(), projects.clone()));
+    Ok(projects)
+}
+
 /// The Harvest projects (and tasks) you can log to.
 #[tauri::command]
 async fn harvest_projects(app: AppHandle) -> CmdResult<Vec<harvest::Project>> {
-    if app.state::<AppState>().demo {
+    let state = app.state::<AppState>();
+    if state.demo {
         return Ok(demo::harvest_projects());
     }
-    let client = harvest_client(&app.state::<AppState>()).ok_or("Connect Harvest in Settings first")?;
-    client.projects().await.map_err(|e| format!("{e:#}"))
+    let client = harvest_client(&state).ok_or("Connect Harvest in Settings first")?;
+    cached_projects(&state, &client).await.map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command(async)]
@@ -2537,7 +2554,7 @@ async fn compute_week(app: &AppHandle, day: &str) -> CmdResult<(TimesheetWeek, V
             }
             Err(e) => harvest_error = Some(format!("{e:#}")),
         }
-        projects = client.projects().await.unwrap_or_default();
+        projects = cached_projects(&app.state::<AppState>(), client).await.unwrap_or_default();
     }
     let demo = app.state::<AppState>().demo;
     if demo {

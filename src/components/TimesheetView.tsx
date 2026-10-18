@@ -8,7 +8,7 @@ import {
   type TimesheetRow,
   type TimesheetWeek,
 } from "../lib/api";
-import { addDays, dayKey, parseDay } from "../lib/day";
+import { addDays, dayKey, parseDay, weekOf } from "../lib/day";
 import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 
@@ -58,6 +58,11 @@ function weekLabel(days: string[]): string {
  * The week's hours per ticket, from the Day view, ready for Harvest: adjust any cell, choose each
  * ticket's Harvest bucket once (remembered for its Jira project), then submit a day or the week.
  */
+/** Weeks loaded this session (by Monday), and Harvest's connection and projects: coming back to
+ * the Timesheet shows them at once, then refreshes quietly. */
+const weekCache = new Map<string, TimesheetWeek>();
+let harvestCache: { status: HarvestStatus; projects: HarvestProject[] | null } | null = null;
+
 export function TimesheetView({
   version,
   onSettings,
@@ -69,24 +74,43 @@ export function TimesheetView({
 }) {
   const today = dayKey(new Date());
   const [day, setDay] = useState(today);
-  const [week, setWeek] = useState<TimesheetWeek | null>(null);
-  const [status, setStatus] = useState<HarvestStatus | null>(null);
-  const [projects, setProjects] = useState<HarvestProject[] | null>(null);
+  const [week, setWeek] = useState<TimesheetWeek | null>(() => weekCache.get(weekOf(today)[0]) ?? null);
+  const [status, setStatus] = useState<HarvestStatus | null>(harvestCache?.status ?? null);
+  const [projects, setProjects] = useState<HarvestProject[] | null>(harvestCache?.projects ?? null);
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [picking, setPicking] = useState<string | null>(null);
 
+  // The day on screen now, for answers that arrive after you've moved to another week.
+  const shown = useRef(day);
+  shown.current = day;
+
   const load = useCallback(() => {
+    const monday = weekOf(day)[0];
     api
       .timesheetWeek(day)
-      .then(setWeek)
+      .then((w) => {
+        weekCache.set(monday, w);
+        // Only if that's still the week on screen.
+        setWeek((cur) => (weekOf(shown.current)[0] === monday ? w : cur));
+      })
       .catch((e) => toast(String(e), true));
   }, [day]);
 
+  // Another week: show it from the cache straight away if it's been loaded before.
+  useEffect(() => setWeek(weekCache.get(weekOf(day)[0]) ?? null), [day]);
   useEffect(load, [load, version]);
   useEffect(() => {
     api.harvestStatus().then((s) => {
       setStatus(s);
-      if (s.connected) api.harvestProjects().then(setProjects).catch(() => setProjects([]));
+      harvestCache = { status: s, projects: harvestCache?.projects ?? null };
+      if (s.connected)
+        api
+          .harvestProjects()
+          .then((p) => {
+            setProjects(p);
+            harvestCache = { status: s, projects: p };
+          })
+          .catch(() => setProjects([]));
     });
   }, []);
 
