@@ -70,6 +70,8 @@ VERSION_FILES=(package.json package-lock.json src-tauri/Cargo.toml src-tauri/Car
 SAVED=$(mktemp -d)
 for f in "${VERSION_FILES[@]}"; do mkdir -p "$SAVED/$(dirname "$f")"; cp "$f" "$SAVED/$f"; done
 restore() { for f in "${VERSION_FILES[@]}"; do cp "$SAVED/$f" "$f"; done; }
+# Anything failing from here on puts them back too (cleared once the release commit is made).
+trap 'restore; echo "✗ Stopped — nothing was published; version files put back." >&2' ERR
 
 step "Setting the version to $VERSION"
 npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
@@ -89,25 +91,43 @@ step "Building (a few minutes)"
 export TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
-npm run tauri build -- --bundles app,dmg --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$IDENTITY\"}}}"
+npm run tauri build -- --bundles app --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$IDENTITY\"}}}"
 
 BUNDLE="src-tauri/target/release/bundle"
 APP="$BUNDLE/macos/Dev Inbox.app"
 TARBALL="$BUNDLE/macos/Dev Inbox.app.tar.gz"
-DMG=$(ls "$BUNDLE"/dmg/Dev\ Inbox_"$VERSION"_*.dmg | head -1)
-[[ -f "$TARBALL" && -f "$TARBALL.sig" && -f "$DMG" ]] || die "The build didn't produce the app, its update archive and signature, and the .dmg"
+[[ -f "$TARBALL" && -f "$TARBALL.sig" ]] || { restore; die "The build didn't produce the app's update archive and signature"; }
 
 step "Checking the build"
-codesign --verify --deep --strict "$APP" || die "The app's signature doesn't verify"
-for helper in "$APP"/Contents/MacOS/*; do codesign --verify "$helper" || die "$(basename "$helper") isn't signed"; done
+codesign --verify --deep --strict "$APP" || { restore; die "The app's signature doesn't verify"; }
+for helper in "$APP"/Contents/MacOS/*; do codesign --verify "$helper" || { restore; die "$(basename "$helper") isn't signed"; }; done
 BUILT=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
-[[ "$BUILT" == "$VERSION" ]] || die "Built $BUILT, expected $VERSION"
+[[ "$BUILT" == "$VERSION" ]] || { restore; die "Built $BUILT, expected $VERSION"; }
 echo "✓ $VERSION, signature OK"
 
 # ---- Stage ----------------------------------------------------------------------------------------
 # Fixed names, so README links can point at releases/latest/download/<name>.
 rm -rf "$STAGE" && mkdir -p "$STAGE"
-cp "$DMG" "$STAGE/Dev-Inbox-macOS-arm64.dmg"
+
+# The .dmg: the app and a shortcut to Applications to drag it onto. Made with hdiutil directly —
+# Tauri's DMG step scripts Finder, which fails now and then for no visible reason.
+step "Making the .dmg"
+DMG_SRC=$(mktemp -d)
+ditto "$APP" "$DMG_SRC/Dev Inbox.app"
+ln -s /Applications "$DMG_SRC/Applications"
+made=0
+for attempt in 1 2 3; do
+  if hdiutil create -quiet -volname "Dev Inbox" -srcfolder "$DMG_SRC" -fs HFS+ -format UDZO -ov \
+    "$STAGE/Dev-Inbox-macOS-arm64.dmg"; then
+    made=1
+    break
+  fi
+  echo "  hdiutil failed (attempt $attempt), retrying…"
+  sleep 3
+done
+rm -rf "$DMG_SRC"
+[[ $made == 1 ]] || { restore; die "Couldn't make the .dmg"; }
+hdiutil verify -quiet "$STAGE/Dev-Inbox-macOS-arm64.dmg" || { restore; die "The .dmg doesn't verify"; }
 cp "$TARBALL" "$STAGE/Dev-Inbox-macOS-arm64.app.tar.gz"
 cp "$TARBALL.sig" "$STAGE/Dev-Inbox-macOS-arm64.app.tar.gz.sig"
 
@@ -115,7 +135,7 @@ LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
 {
   echo "## What's new"
   echo
-  git log --format='- %s' ${LAST_TAG:+"$LAST_TAG..HEAD"} --no-merges | grep -v "^- Release v" | head -40
+  git log --format='- %s' ${LAST_TAG:+"$LAST_TAG..HEAD"} --no-merges | grep -v "^- Release v" | head -40  || true
 } > "$STAGE/notes.md"
 
 node -e '
@@ -154,7 +174,9 @@ fi
 
 step "Publishing $TAG"
 git add package.json package-lock.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-git commit -q -m "Release $TAG"
+# Releasing the version already in the files (e.g. the first release): nothing to commit.
+git diff --cached --quiet || git commit -q -m "Release $TAG"
+trap - ERR
 git tag -a "$TAG" -m "Dev Inbox $VERSION"
 git push -q origin main "$TAG"
 gh release create "$TAG" -R "$REPO" \
