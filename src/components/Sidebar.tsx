@@ -1,5 +1,7 @@
-import type { Session } from "../lib/api";
+import { api, type Session } from "../lib/api";
 import { age } from "../lib/time";
+import { toast } from "../lib/toast";
+import { useUpdates } from "../lib/updates";
 import type { View } from "./CommandPalette";
 import { Icon, type IconName } from "./Icon";
 
@@ -41,6 +43,7 @@ export function Sidebar({
   /** A meeting is being recorded: show it everywhere. */
   recording: boolean;
 }) {
+  const updates = useUpdates();
   return (
     <nav className="sidebar">
       <div className="brand">
@@ -73,6 +76,18 @@ export function Sidebar({
       </div>
 
       <div className="sidebar-foot">
+        {updates?.installed && (
+          <button
+            className="nav-item update-ready"
+            disabled={recording}
+            title={recording ? "Finish the recording first" : `Dev Inbox ${updates.installed} is installed — restart to use it`}
+            onClick={() => api.restartToUpdate().catch((e) => toast(String(e), true))}
+          >
+            <Icon name="refresh" size={16} />
+            <span className="nav-label">Restart to update</span>
+            <span className="muted small">{updates.installed}</span>
+          </button>
+        )}
         <button className="nav-item" onClick={onShortcuts} title="Keyboard shortcuts (?)">
           <Icon name="keyboard" size={16} />
           <span className="nav-label">Shortcuts</span>

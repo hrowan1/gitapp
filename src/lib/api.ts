@@ -424,6 +424,21 @@ export interface TicketDetail {
   prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
 }
 
+export interface UpdateStatus {
+  current: string;
+  /** A newer version on GitHub. */
+  available: string | null;
+  notes: string | null;
+  /** Installed on disk, waiting for a restart. */
+  installed: string | null;
+  busy: boolean;
+  lastCheck: string | null;
+  error: string | null;
+  automatic: boolean;
+  /** A built app that can replace itself (not `tauri dev`). */
+  canInstall: boolean;
+}
+
 export interface HarvestStatus {
   connected: boolean;
   name: string | null;
@@ -571,6 +586,11 @@ export const api = {
   getItemActivity: (itemId: string) => invoke<Activity[]>("get_item_activity", { itemId }),
   getRepos: () => invoke<RepoInfo[]>("get_repos"),
   setRepoHidden: (repo: string, hidden: boolean) => invoke<void>("set_repo_hidden", { repo, hidden }),
+  updateStatus: () => invoke<UpdateStatus>("update_status"),
+  /** install: download and install even when automatic updates are off. */
+  checkForUpdates: (install: boolean) => invoke<UpdateStatus>("check_for_updates", { install }),
+  setAutoUpdate: (on: boolean) => invoke<void>("set_auto_update", { on }),
+  restartToUpdate: () => invoke<void>("restart_to_update"),
   harvestStatus: () => invoke<HarvestStatus>("harvest_status"),
   harvestConnect: (accountId: string, token: string) => invoke<HarvestStatus>("harvest_connect", { accountId, token }),
   harvestDisconnect: () => invoke<void>("harvest_disconnect"),

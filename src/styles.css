@@ -3202,3 +3202,19 @@ html.panel-window #root {
 .ts-picker > .pad:last-child {
   border-top: 1px solid var(--border);
 }
+
+/* ---------- Updates ---------- */
+
+.nav-item.update-ready {
+  color: var(--accent);
+  background: var(--accent-soft);
+  margin-bottom: 4px;
+}
+.nav-item.update-ready .muted {
+  margin-left: auto;
+}
+.update-notes {
+  white-space: pre-line;
+  max-height: 140px;
+  overflow-y: auto;
+}

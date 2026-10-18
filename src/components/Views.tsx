@@ -21,6 +21,7 @@ import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/sta
 import { setTheme as applyThemeChoice, getTheme, type Theme } from "../lib/theme";
 import { clock, friendlyDate } from "../lib/time";
 import { Icon, type IconName } from "./Icon";
+import { useUpdates } from "../lib/updates";
 import { PrList } from "./PrList";
 import { TicketsNeedingYou } from "./TicketsNeedingYou";
 import { MeetingActions } from "./MeetingActions";
@@ -662,6 +663,8 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
 
       {settings && <AiCard settings={settings} status={aiStatus} onSave={save} onStatus={refreshAi} />}
 
+      <UpdatesCard />
+
       <JiraCard />
 
       <HarvestCard />
@@ -1139,6 +1142,73 @@ function HarvestCard() {
           </button>
         </div>
       </form>
+    </section>
+  );
+}
+
+function UpdatesCard() {
+  const status = useUpdates();
+  const [checking, setChecking] = useState(false);
+  if (!status) return null;
+  const run = async (install: boolean) => {
+    setChecking(true);
+    try {
+      const s = await api.checkForUpdates(install);
+      if (!s.available && !s.error) toast(`Dev Inbox ${s.current} is the latest version`);
+    } catch (e) {
+      toast(String(e), true);
+    } finally {
+      setChecking(false);
+    }
+  };
+  const busy = checking || status.busy;
+  let line: React.ReactNode;
+  if (status.installed) line = <>Version {status.installed} is installed — it opens next time Dev Inbox starts.</>;
+  else if (busy) line = status.available ? <>Downloading {status.available}…</> : <>Checking…</>;
+  else if (status.available) line = <>Version {status.available} is available.</>;
+  else if (status.lastCheck) line = <>Up to date · checked {friendlyDate(status.lastCheck)} {clock(status.lastCheck)}</>;
+  else line = <>Checks GitHub for new versions a minute after launch, then every 6 hours.</>;
+
+  return (
+    <section className="card">
+      <h2>Updates</h2>
+      <div className="account">
+        <span className="state-icon tone-blue">
+          <Icon name="refresh" size={14} className={busy ? "spin" : ""} />
+        </span>
+        <div className="grow">
+          <div className="strong">Dev Inbox {status.current}</div>
+          <div className="muted small">
+            {line}
+            {status.error && <span className="error"> · {status.error}</span>}
+          </div>
+        </div>
+      </div>
+      {status.notes && (status.available || status.installed) && <p className="muted small update-notes">{status.notes}</p>}
+      <label className="check">
+        <input type="checkbox" checked={status.automatic} onChange={(e) => void api.setAutoUpdate(e.target.checked)} />
+        Download and install updates automatically
+      </label>
+      <div className="actions">
+        {status.installed ? (
+          <button className="primary" onClick={() => api.restartToUpdate().catch((e) => toast(String(e), true))}>
+            Restart now
+          </button>
+        ) : status.available && !status.automatic && status.canInstall ? (
+          <button className="primary" disabled={busy} onClick={() => void run(true)}>
+            Download and install {status.available}
+          </button>
+        ) : null}
+        <button disabled={busy} onClick={() => void run(false)}>
+          {busy ? "Checking…" : "Check now"}
+        </button>
+        <button className="link small" onClick={() => openUrl("https://github.com/hrowan1/gitapp/releases")}>
+          Release notes
+        </button>
+      </div>
+      {!status.canInstall && (
+        <p className="muted small">This is a development build: it can see new versions but doesn't install them.</p>
+      )}
     </section>
   );
 }

@@ -19,6 +19,7 @@ mod summary;
 mod sync;
 mod harvest;
 mod timesheet;
+mod updates;
 mod voices;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -89,7 +90,7 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     derive::fmt_ts(chrono::Utc::now())
 }
 
@@ -1409,6 +1410,11 @@ struct RecordingStatus {
     recording: bool,
     meeting_id: Option<String>,
     started_at: Option<String>,
+}
+
+/// A meeting is being recorded right now.
+pub(crate) fn recording_now(app: &AppHandle) -> bool {
+    app.state::<AppState>().recorder.relock().is_some()
 }
 
 fn recording_status_of(state: &AppState) -> RecordingStatus {
@@ -2802,6 +2808,8 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updates::Updates::default())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -2897,6 +2905,7 @@ pub fn run() {
                 });
             }
             refresh_tray(app.handle());
+            updates::start(app.handle().clone());
 
             if let Err(e) = app.global_shortcut().register(palette_shortcut()) {
                 eprintln!("couldn't register global shortcut: {e}");
@@ -2949,6 +2958,10 @@ pub fn run() {
             dismiss_suggestion,
             open_in_main,
             jira_transitions,
+            updates::update_status,
+            updates::check_for_updates,
+            updates::set_auto_update,
+            updates::restart_to_update,
             harvest_status,
             harvest_connect,
             harvest_disconnect,

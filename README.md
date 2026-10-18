@@ -2,7 +2,21 @@
 
 Your engineering inbox: everything that needs your attention across every GitHub repository, plus a personal memory of what you've done and what you meant to come back to. See [VISION.md](VISION.md) for the product idea.
 
-This is the Phase 1 MVP: a Tauri 2 desktop app (Rust + React/TypeScript). It is **local-first**: no backend; the GitHub token lives in the OS keychain and PR metadata (never source code) sits in a local SQLite database.
+A Tauri 2 desktop app (Rust + React/TypeScript) for macOS. It is **local-first**: no backend; your tokens live in the macOS keychain and PR metadata (never source code) sits in a local SQLite database.
+
+## Install
+
+Needs an Apple Silicon Mac with macOS 14.2 or later (meeting transcription and Apple Intelligence features need macOS 26).
+
+**One line** (recommended — installs into Applications and opens it):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hrowan1/gitapp/main/install.sh | bash
+```
+
+**Or download** [Dev-Inbox-macOS-arm64.dmg](https://github.com/hrowan1/gitapp/releases/latest/download/Dev-Inbox-macOS-arm64.dmg) and drag Dev Inbox into Applications. Dev Inbox isn't notarised by Apple yet, so the first time macOS says it can't check it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** (once). Or, in Terminal: `xattr -dr com.apple.quarantine "/Applications/Dev Inbox.app"`.
+
+**Updates** are automatic: Dev Inbox checks GitHub a minute after it starts and every 6 hours, downloads a new version in the background (verified against the release signing key), and installs it — it opens the next time Dev Inbox starts, or click **Restart to update** in the sidebar. Settings → Updates shows the version, checks now, or turns automatic installs off.
 
 ## Run it
 
@@ -19,7 +33,25 @@ Demo data without a GitHub account (separate database, never syncs):
 DEV_INBOX_DEMO=1 npm run tauri dev
 ```
 
-Build a release `.app`/`.dmg`: `npm run tauri build`.
+Build a local `.app`/`.dmg`: `npm run tauri build` (needs the updater key in `TAURI_SIGNING_PRIVATE_KEY`, or pass `--config '{"bundle":{"createUpdaterArtifacts":false}}'`).
+
+## Releasing
+
+From an up-to-date `main` on an Apple Silicon Mac with Xcode:
+
+```bash
+npm run release -- patch        # or minor, major, or an exact version like 0.3.0
+```
+
+It bumps the version, runs the tests, builds and signs the app, checks the signature, then — after you confirm — commits "Release vX", tags it, pushes, and creates the GitHub release with the `.dmg`, the update archive, its signature and `latest.json` (the feed installed apps read). `npm run release -- patch --dry` does everything except publish. Release notes are the commit subjects since the last tag.
+
+Two keys live in `~/.tauri` (never in the repo) — **back them both up**:
+
+- `dev-inbox-updater.key` signs updates; apps only install updates signed with it (its public half is in `tauri.conf.json`). Lose it and installed copies can't update — everyone would have to reinstall.
+- `dev-inbox-signing.*` is the self-signed "Dev Inbox Release" code-signing certificate. Run `npm run release:cert` once to create it (or restore it from the backup on a new Mac). Signing every release with it keeps the app's identity stable, so macOS keeps its microphone, audio-capture and keychain permissions across updates; without it releases are signed ad-hoc and those get asked for again after each update.
+
+Moving to an Apple Developer ID later (notarised, no "Open Anyway") only changes the signing step; installed copies keep updating.
+
 
 ## What it does
 
@@ -136,4 +168,5 @@ GITHUB_TOKEN=$(gh auth token) cargo test live -- --ignored --nocapture    # read
 - Each `cargo` rebuild changes the binary signature, so macOS may ask again for keychain access in development.
 - Re-running checks only works for GitHub Actions; other CI providers are named so you can re-run them from their own dashboards.
 - Reminders from comments only read comments written after you first installed the app, so old history doesn't flood in.
-- Next: OAuth device flow instead of tokens, packaging (signed `.dmg`, auto-update), approve/merge/open-in-editor actions, and AI for intent the keyword rules miss.
+- Not notarised by Apple yet (no Developer ID), so a downloaded `.dmg` needs "Open Anyway" once; the install script avoids that. Apple Silicon only.
+- Next: OAuth device flow instead of tokens, and Apple notarisation.
