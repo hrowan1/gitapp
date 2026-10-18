@@ -2939,3 +2939,266 @@ html.panel-window #root {
   gap: 8px;
   width: 100%;
 }
+
+/* ---------- Timesheet ---------- */
+
+.timesheet-page > * {
+  max-width: 1040px;
+}
+.timesheet-page .day-nav .primary {
+  margin-left: 6px;
+}
+.ts-scroll {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.ts thead th:first-child {
+  border-top-left-radius: var(--radius);
+}
+.ts thead th:last-child {
+  border-top-right-radius: var(--radius);
+}
+.ts tfoot td:first-child {
+  border-bottom-left-radius: var(--radius);
+}
+.ts tfoot td:last-child {
+  border-bottom-right-radius: var(--radius);
+}
+.ts {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ts th,
+.ts td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 6px;
+  vertical-align: middle;
+}
+.ts tbody tr:last-child td {
+  border-bottom: none;
+}
+.ts thead th {
+  font-weight: 500;
+  background: var(--bg);
+}
+.ts tfoot td {
+  border-top: 1px solid var(--border-strong);
+  border-bottom: none;
+  background: var(--bg);
+}
+.ts-what {
+  text-align: left;
+  padding-left: 14px !important;
+  overflow: hidden;
+}
+.ts-day {
+  width: 64px;
+  text-align: center;
+}
+.ts-day .wd-name,
+.ts-day .wd-date {
+  display: block;
+}
+.ts-day.today .wd-date {
+  color: var(--accent);
+  font-weight: 600;
+}
+.ts-sum {
+  width: 76px;
+  text-align: right;
+  padding-right: 14px !important;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ts-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.ts-title .ticket-key.link {
+  padding: 0;
+  flex: none;
+}
+.ts-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  min-width: 0;
+}
+.ts-title .strong {
+  white-space: nowrap;
+  flex: none;
+}
+
+.ts-cell-td {
+  text-align: center;
+}
+.ts-cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.ts-cell input {
+  width: 52px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  padding: 5px 4px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+}
+.ts-cell input:hover:not(:disabled) {
+  border-color: var(--border);
+}
+.ts-cell input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus);
+}
+.ts-cell input:disabled {
+  opacity: 0.4;
+}
+.ts-cell.edited input {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.ts-cell.sent input {
+  color: var(--green);
+}
+.ts-logged {
+  font-size: 10px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+.ts-reset {
+  position: absolute;
+  top: -6px;
+  right: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  box-shadow: none;
+  opacity: 0;
+}
+.ts-cell:hover .ts-reset {
+  opacity: 1;
+}
+.ts-foot {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.ts-foot .small-btn {
+  margin-top: 4px;
+}
+.ts-sent {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--green);
+}
+
+.ts-bucket-wrap {
+  position: relative;
+  margin-top: 4px;
+}
+.ts-bucket {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 2px 6px;
+  font-size: 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.ts-bucket:not(.missing) {
+  margin-left: -6px;
+}
+.ts-bucket:hover {
+  border-color: var(--border);
+  background: var(--hover);
+}
+.ts-bucket-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ts-bucket.missing {
+  color: var(--orange);
+  background: var(--orange-bg);
+}
+.ts-bucket .pill {
+  margin-left: 2px;
+}
+.ts-picker {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 380px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.ts-picker > input {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 10px 12px;
+  background: transparent;
+}
+.ts-picker > input:focus {
+  outline: none;
+  box-shadow: none;
+}
+.ts-picker-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.ts-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.ts-picker-row:hover {
+  background: var(--hover);
+}
+.ts-picker .pad {
+  padding: 8px 12px;
+}
+.ts-picker > .pad:last-child {
+  border-top: 1px solid var(--border);
+}

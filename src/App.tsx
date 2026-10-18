@@ -15,6 +15,7 @@ import { ActionDialog } from "./components/ActionDialog";
 import { DayView } from "./components/DayView";
 import { TicketsView } from "./components/TicketsView";
 import { MeetingsView } from "./components/MeetingsView";
+import { TimesheetView } from "./components/TimesheetView";
 import { AskPanel } from "./components/AskPanel";
 import type { MeetingAction, RecordingStatus, TicketAttention } from "./lib/api";
 import "./styles.css";
@@ -188,7 +189,7 @@ export default function App() {
             </button>
           </div>
         )}
-        {firstLoad && !["settings", "following", "day", "tickets", "meetings"].includes(view) ? (
+        {firstLoad && !["settings", "following", "day", "timesheet", "tickets", "meetings"].includes(view) ? (
           <div className="empty big">
             <Icon name="refresh" size={22} className="spin" />
             <p>Fetching your pull requests and issues from GitHub…</p>
@@ -216,6 +217,9 @@ export default function App() {
                 onOpenTicket={openTicket}
                 onOpenMeeting={openMeeting}
               />
+            )}
+            {view === "timesheet" && (
+              <TimesheetView version={version} onSettings={() => setView("settings")} onOpenTicket={openTicket} />
             )}
             {view === "meetings" && (
               <MeetingsView

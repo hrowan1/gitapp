@@ -10,7 +10,7 @@ import { Icon } from "./Icon";
 import { StateIcon } from "./StateIcon";
 import { SNOOZE_PRESETS, age } from "../lib/time";
 
-export type View = "today" | "all" | "day" | "tickets" | "meetings" | "history" | "following" | "settings";
+export type View = "today" | "all" | "day" | "timesheet" | "tickets" | "meetings" | "history" | "following" | "settings";
 
 interface Command {
   id: string;
@@ -127,13 +127,14 @@ export function CommandPalette({
     { id: "today", label: "Go to Today", hint: "1", run: () => onNavigate("today") },
     { id: "all", label: "Go to All pull requests", hint: "2", run: () => onNavigate("all") },
     { id: "day", label: "Open Day view: what I worked on, and for how long", hint: "3", run: () => onNavigate("day") },
-    { id: "tickets", label: "Go to Tickets: my Jira tickets and how they moved", hint: "4", run: () => onNavigate("tickets") },
-    { id: "meetings", label: "Go to Meetings: record and transcribe", hint: "5", run: () => onNavigate("meetings") },
+    { id: "timesheet", label: "Open Timesheet: this week's hours, for Harvest", hint: "4", run: () => onNavigate("timesheet") },
+    { id: "tickets", label: "Go to Tickets: my Jira tickets and how they moved", hint: "5", run: () => onNavigate("tickets") },
+    { id: "meetings", label: "Go to Meetings: record and transcribe", hint: "6", run: () => onNavigate("meetings") },
     { id: "record", label: "Start recording a meeting", run: () => api.startRecording().then(() => onNavigate("meetings"), (e) => toast(String(e), true)) },
     { id: "stop", label: "Stop recording", run: () => api.stopRecording().catch((e) => toast(String(e), true)) },
-    { id: "history", label: "Go to History", hint: "6", run: () => onNavigate("history") },
-    { id: "following", label: "Choose what to follow", hint: "7", run: () => onNavigate("following") },
-    { id: "settings", label: "Go to Settings", hint: "8", run: () => onNavigate("settings") },
+    { id: "history", label: "Go to History", hint: "7", run: () => onNavigate("history") },
+    { id: "following", label: "Choose what to follow", hint: "8", run: () => onNavigate("following") },
+    { id: "settings", label: "Go to Settings", hint: "9", run: () => onNavigate("settings") },
     { id: "sync", label: "Sync with GitHub now", hint: "r", run: onSync },
   ];
 

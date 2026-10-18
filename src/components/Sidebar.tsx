@@ -7,11 +7,12 @@ export const NAV: { id: View; label: string; icon: IconName; key: string }[] = [
   { id: "today", label: "Today", icon: "today", key: "1" },
   { id: "all", label: "Inbox", icon: "inbox", key: "2" },
   { id: "day", label: "Day", icon: "calendar", key: "3" },
-  { id: "tickets", label: "Tickets", icon: "ticket", key: "4" },
-  { id: "meetings", label: "Meetings", icon: "mic", key: "5" },
-  { id: "history", label: "History", icon: "history", key: "6" },
-  { id: "following", label: "Following", icon: "eye", key: "7" },
-  { id: "settings", label: "Settings", icon: "settings", key: "8" },
+  { id: "timesheet", label: "Timesheet", icon: "clock", key: "4" },
+  { id: "tickets", label: "Tickets", icon: "ticket", key: "5" },
+  { id: "meetings", label: "Meetings", icon: "mic", key: "6" },
+  { id: "history", label: "History", icon: "history", key: "7" },
+  { id: "following", label: "Following", icon: "eye", key: "8" },
+  { id: "settings", label: "Settings", icon: "settings", key: "9" },
 ];
 
 export function Sidebar({

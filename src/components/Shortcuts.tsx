@@ -3,7 +3,7 @@ const GROUPS: { title: string; keys: [string, string][] }[] = [
     title: "Anywhere",
     keys: [
       ["⌘K  /  /", "Ask or act on anything"],
-      ["1 – 8", "Today, Inbox, Day, Tickets, Meetings, History, Following, Settings"],
+      ["1 – 9", "Today, Inbox, Day, Timesheet, Tickets, Meetings, History, Following, Settings"],
       ["r", "Sync with GitHub now"],
       ["s", "Day view (time spent)"],
       ["?", "This sheet"],

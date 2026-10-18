@@ -357,6 +357,35 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 15 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Harvest project + task remembered for "ticket:BILL-142", "project:BILL" and "default".
+            CREATE TABLE IF NOT EXISTS harvest_buckets (
+                scope TEXT PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                project_name TEXT NOT NULL,
+                task_id INTEGER NOT NULL,
+                task_name TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- The timesheet: your hours per row (Jira key or "__other") per day, and what's in Harvest.
+            CREATE TABLE IF NOT EXISTS timesheet_rows (
+                day TEXT NOT NULL,
+                row_key TEXT NOT NULL,
+                minutes INTEGER,               -- NULL: use the proposal
+                notes TEXT,
+                harvest_id INTEGER,            -- the Harvest entry this app created
+                submitted_minutes INTEGER,
+                submitted_at TEXT,
+                PRIMARY KEY (day, row_key)
+            );
+            PRAGMA user_version = 15;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -968,7 +997,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries; DELETE FROM intent_queue;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries; DELETE FROM intent_queue; DELETE FROM harvest_buckets; DELETE FROM timesheet_rows;",
     )?;
     Ok(())
 }

@@ -7,6 +7,7 @@ import {
   type Item,
   type RepoInfo,
   type Session,
+  type HarvestStatus,
   type JiraStatus,
   type Settings,
   type StateId,
@@ -663,6 +664,8 @@ export function SettingsView({ session, onSignedOut }: { session: Session; onSig
 
       <JiraCard />
 
+      <HarvestCard />
+
       {settings && <IgnoredUsers settings={settings} onSave={save} />}
 
       <CodeAndEditor repos={repos.filter((r) => !r.hidden && r.openPrs > 0).map((r) => r.repo)} />
@@ -1015,6 +1018,124 @@ function JiraCard() {
             onClick={() => openUrl("https://id.atlassian.com/manage-profile/security/api-tokens")}
           >
             Create an API token
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function HarvestCard() {
+  const [status, setStatus] = useState<HarvestStatus | null>(null);
+  const [account, setAccount] = useState("");
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [nudge, setNudge] = useState("17:30");
+  useEffect(() => {
+    api.harvestStatus().then((s) => {
+      setStatus(s);
+      setAccount(s.accountId ?? "");
+      if (s.nudge) setNudge(s.nudge);
+    });
+  }, []);
+  if (!status) return null;
+
+  const saveNudge = async (at: string | null) => {
+    try {
+      await api.setTimesheetNudge(at);
+      setStatus(await api.harvestStatus());
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+
+  if (status.connected) {
+    return (
+      <section className="card">
+        <h2>Harvest</h2>
+        <div className="account">
+          <span className="state-icon tone-orange">
+            <Icon name="clock" size={14} />
+          </span>
+          <div>
+            <div className="strong">
+              {status.name} · account {status.accountId}
+            </div>
+            <div className="muted small">
+              {status.linkLearnt
+                ? "Entries are linked to their Jira ticket, the same way Harvest's Jira button does."
+                : "Entries include their Jira link. Log one entry from Jira's Harvest button, then reconnect, to link them exactly as it does."}
+            </div>
+          </div>
+        </div>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={status.nudge !== null}
+            onChange={(e) => void saveNudge(e.target.checked ? nudge : null)}
+          />
+          Remind me on weekdays if today's timesheet hasn't been sent, at
+          <input
+            type="time"
+            value={nudge}
+            disabled={status.nudge === null}
+            onChange={(e) => setNudge(e.target.value)}
+            onBlur={() => status.nudge !== null && nudge && void saveNudge(nudge)}
+          />
+        </label>
+        <div className="actions">
+          <button
+            className="danger-outline"
+            onClick={async () => {
+              await api.harvestDisconnect();
+              setStatus(await api.harvestStatus());
+              setToken("");
+            }}
+          >
+            Disconnect Harvest
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="card">
+      <h2>Harvest</h2>
+      <p className="muted">
+        Turns the Day view into a weekly timesheet and sends it to Harvest: one entry per ticket per day, linked to the
+        Jira ticket, in the project and task you pick (remembered per Jira project). Only entries this app made are
+        ever changed or removed. The token is stored in your system keychain.
+      </p>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          try {
+            setStatus(await api.harvestConnect(account, token));
+            setToken("");
+            toast("Harvest connected");
+          } catch (err) {
+            toast(String(err), true);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <label className="field">
+          <span>Account ID</span>
+          <input className="grow" inputMode="numeric" value={account} onChange={(e) => setAccount(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Personal access token</span>
+          <input className="grow" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+        </label>
+        <div className="actions">
+          <button className="primary" disabled={busy || !account || !token}>
+            {busy ? "Connecting…" : "Connect"}
+          </button>
+          <button type="button" className="link small" onClick={() => openUrl("https://id.getharvest.com/developers")}>
+            Create a token (shows your account ID)
           </button>
         </div>
       </form>

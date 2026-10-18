@@ -2,7 +2,7 @@
 //! can be developed and screenshotted without a GitHub account. Never syncs.
 
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::{Datelike, Duration, Utc};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -387,11 +387,54 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
     };
     crate::summary::save(conn, "demo-proration", &notes, crate::summary::DEFAULT_CLAUDE_MODEL)?;
 
+    // A pretend Harvest account: Esprit's monthly bucket was chosen last month, so it rolls over.
+    db::set_setting(conn, "harvest_account_id", "000000")?;
+    db::set_setting(conn, "harvest_user_id", "1")?;
+    db::set_setting(conn, "harvest_name", "You")?;
+    let last_month = crate::timesheet::MONTHS[(Utc::now().month0() as usize + 11) % 12];
+    let es = crate::timesheet::Bucket {
+        project_id: 900,
+        project_name: format!("Project Esprit {last_month}"),
+        task_id: 2,
+        task_name: "Development".into(),
+        from: String::new(),
+    };
+    crate::timesheet::remember(conn, "ES-310", &es, &fmt_ts(Utc::now()))?;
+
     db::set_setting(conn, "jira_account", "demo-me")?;
     db::set_setting(conn, "jira_site", site)?;
     db::set_setting(conn, "jira_name", "You")?;
     db::set_setting(conn, "jira_last_sync", &fmt_ts(Utc::now()))?;
     Ok(())
+}
+
+/// The demo's Harvest projects (this month's and last month's monthly ones, plus fixed ones).
+pub fn harvest_projects() -> Vec<crate::harvest::Project> {
+    use crate::harvest::{Project, Task};
+    let months = crate::timesheet::MONTHS;
+    let this = months[Utc::now().month0() as usize];
+    let last = months[(Utc::now().month0() as usize + 11) % 12];
+    let tasks = |base: i64| {
+        vec![
+            Task { id: base + 1, name: "Design".into() },
+            Task { id: base + 2, name: "Development".into() },
+            Task { id: base + 3, name: "Project Management".into() },
+        ]
+    };
+    let p = |id: i64, name: String, client: &str| Project { id, name, code: None, client: Some(client.into()), tasks: tasks(id * 10) };
+    vec![
+        p(900, format!("Project Esprit {last}"), "Esprit"),
+        p(901, format!("Project Esprit {this}"), "Esprit"),
+        p(910, "Billing Platform".into(), "Acme"),
+        p(920, "Mobile App Retainer".into(), "Acme"),
+        Project {
+            id: 990,
+            name: "Internal".into(),
+            code: None,
+            client: Some("Full Fat".into()),
+            tasks: vec![Task { id: 9901, name: "Meetings".into() }, Task { id: 9902, name: "Admin".into() }],
+        },
+    ]
 }
 
 #[cfg(test)]

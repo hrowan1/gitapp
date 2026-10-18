@@ -424,6 +424,65 @@ export interface TicketDetail {
   prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
 }
 
+export interface HarvestStatus {
+  connected: boolean;
+  name: string | null;
+  accountId: string | null;
+  /** Entries are linked to Jira the same way Harvest's own Jira integration does. */
+  linkLearnt: boolean;
+  /** "HH:MM", or null when the end-of-day reminder is off. */
+  nudge: string | null;
+}
+
+export interface HarvestProject {
+  id: number;
+  name: string;
+  code: string | null;
+  client: string | null;
+  tasks: { id: number; name: string }[];
+}
+
+export interface HarvestBucket {
+  projectId: number;
+  projectName: string;
+  taskId: number;
+  taskName: string;
+  /** "ticket" | "project" | "default" | "rollover" */
+  from: string;
+}
+
+export interface TimesheetCell {
+  day: string;
+  proposed: number;
+  /** Already in Harvest, logged some other way. */
+  logged: number;
+  minutes: number;
+  edited: boolean;
+  submitted: boolean;
+}
+
+export interface TimesheetRow {
+  /** A Jira key, or "__other". */
+  key: string;
+  label: string;
+  bucket: HarvestBucket | null;
+  cells: TimesheetCell[];
+}
+
+export interface TimesheetWeek {
+  days: string[];
+  rows: TimesheetRow[];
+  harvest: boolean;
+  harvestError: string | null;
+}
+
+export interface SubmitResult {
+  created: number;
+  updated: number;
+  removed: number;
+  skipped: string[];
+}
+
 export interface Session {
   login: string;
   avatarUrl: string;
@@ -512,6 +571,17 @@ export const api = {
   getItemActivity: (itemId: string) => invoke<Activity[]>("get_item_activity", { itemId }),
   getRepos: () => invoke<RepoInfo[]>("get_repos"),
   setRepoHidden: (repo: string, hidden: boolean) => invoke<void>("set_repo_hidden", { repo, hidden }),
+  harvestStatus: () => invoke<HarvestStatus>("harvest_status"),
+  harvestConnect: (accountId: string, token: string) => invoke<HarvestStatus>("harvest_connect", { accountId, token }),
+  harvestDisconnect: () => invoke<void>("harvest_disconnect"),
+  harvestProjects: () => invoke<HarvestProject[]>("harvest_projects"),
+  setTimesheetNudge: (at: string | null) => invoke<void>("set_timesheet_nudge", { at }),
+  timesheetWeek: (day: string) => invoke<TimesheetWeek>("timesheet_week", { day }),
+  /** null goes back to the Day view's estimate. */
+  timesheetSet: (day: string, row: string, minutes: number | null) => invoke<void>("timesheet_set", { day, row, minutes }),
+  timesheetBucket: (row: string, projectId: number, projectName: string, taskId: number, taskName: string) =>
+    invoke<void>("timesheet_bucket", { row, projectId, projectName, taskId, taskName }),
+  timesheetSubmit: (days: string[]) => invoke<SubmitResult>("timesheet_submit", { days }),
   getSettings: () => invoke<Settings>("get_settings"),
   updateSettings: (settings: Settings) => invoke<void>("update_settings", { settings }),
 };

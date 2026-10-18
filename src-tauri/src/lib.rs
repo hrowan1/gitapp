@@ -17,6 +17,8 @@ mod search;
 mod suggest;
 mod summary;
 mod sync;
+mod harvest;
+mod timesheet;
 mod voices;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -303,6 +305,7 @@ fn start_poller(app: AppHandle) {
         loop {
             if run_sync(&app).await.is_ok() {
                 maybe_digest(&app);
+                maybe_timesheet_nudge(&app).await;
             }
             let _ = run_jira_sync(&app).await;
             let state = app.state::<AppState>();
@@ -537,6 +540,9 @@ fn test_notification(app: AppHandle) -> String {
 fn notification_clicked(app: &AppHandle, _url: Option<String>, item: Option<String>) {
     show_main(app);
     match item.as_deref() {
+        Some(id) if id.starts_with("view:") => {
+            let _ = app.emit_to("main", "navigate", &id["view:".len()..]);
+        }
         Some(id) if id.starts_with("jira:") => {
             let key = &id["jira:".len()..];
             seen_ticket(app, key);
@@ -2355,6 +2361,379 @@ async fn write_ai_summary(app: AppHandle, kind: String, day: String) -> CmdResul
     Ok(AiSummary { text, by, created_at })
 }
 
+// ---------- Harvest & the timesheet ----------
+
+const HARVEST_KEYRING_USER: &str = "harvest-token";
+
+fn harvest_client(state: &AppState) -> Option<harvest::Client> {
+    let account = state.setting("harvest_account_id")?;
+    let token = keyring::Entry::new(KEYRING_SERVICE, HARVEST_KEYRING_USER).ok()?.get_password().ok()?;
+    harvest::Client::new(&account, &token).ok()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarvestStatus {
+    connected: bool,
+    name: Option<String>,
+    account_id: Option<String>,
+    /// Entries are linked to Jira the way Harvest's own Jira integration does (learnt from yours).
+    link_learnt: bool,
+    /// When the end-of-day reminder comes ("HH:MM"), or None if off.
+    nudge: Option<String>,
+}
+
+fn harvest_status_of(state: &AppState) -> HarvestStatus {
+    let rule: Option<harvest::LinkRule> = json_setting(state, "harvest_link_rule");
+    let nudge = state.setting("timesheet_nudge").unwrap_or_else(|| "17:30".into());
+    HarvestStatus {
+        connected: state.setting("harvest_user_id").is_some(),
+        name: state.setting("harvest_name"),
+        account_id: state.setting("harvest_account_id"),
+        link_learnt: rule.is_some_and(|r| r.learnt),
+        nudge: (nudge != "off").then_some(nudge),
+    }
+}
+
+#[tauri::command(async)]
+fn harvest_status(state: State<AppState>) -> HarvestStatus {
+    harvest_status_of(&state)
+}
+
+/// Learn how Harvest's Jira integration links entries, from the user's own Jira-linked entries.
+async fn learn_harvest_links(app: &AppHandle, client: &harvest::Client, user_id: i64) {
+    let Ok(entries) = client.recent_linked(user_id).await else { return };
+    let jira = jira_client(&app.state::<AppState>());
+    let mut examples = Vec::new();
+    for e in entries.iter().filter(|e| e.reference.as_ref().is_some_and(|r| r.3.contains("/browse/"))).take(6) {
+        let Some(key) = harvest::ticket_of(e) else { continue };
+        let project_key = key.split('-').next().unwrap_or_default().to_string();
+        let issue_id: Option<String> = app
+            .state::<AppState>()
+            .db
+            .relock()
+            .query_row("SELECT id FROM jira_issues WHERE key = ?1", [&key], |r| r.get(0))
+            .ok();
+        let project_id = match &jira {
+            Some(j) => j.project_id(&project_key).await.ok(),
+            None => None,
+        };
+        examples.push((e.reference.clone().unwrap(), key, issue_id.unwrap_or_default(), project_key, project_id));
+    }
+    let tickets: Vec<_> = examples
+        .iter()
+        .map(|(r, key, issue_id, project_key, project_id)| {
+            (r.clone(), harvest::Ticket { key, issue_id, project_key, project_id: project_id.as_deref(), url: "" })
+        })
+        .collect();
+    let rule = harvest::learn(&tickets);
+    if let Ok(json) = serde_json::to_string(&rule) {
+        let _ = db::set_setting(&app.state::<AppState>().db.relock(), "harvest_link_rule", &json);
+    }
+}
+
+/// Check the account id and token against Harvest, store them (token in the keychain), and learn how
+/// your Jira-linked entries are linked.
+#[tauri::command]
+async fn harvest_connect(app: AppHandle, account_id: String, token: String) -> CmdResult<HarvestStatus> {
+    let client = harvest::Client::new(&account_id, &token).map_err(|e| format!("{e:#}"))?;
+    let me = client.me().await.map_err(|e| format!("{e:#}"))?;
+    keyring::Entry::new(KEYRING_SERVICE, HARVEST_KEYRING_USER)
+        .and_then(|e| e.set_password(token.trim()))
+        .map_err(|e| format!("Couldn't save the token to the keychain: {e}"))?;
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.relock();
+        db::set_setting(&conn, "harvest_account_id", account_id.trim()).map_err(err)?;
+        db::set_setting(&conn, "harvest_user_id", &me.id.to_string()).map_err(err)?;
+        db::set_setting(&conn, "harvest_name", &me.name).map_err(err)?;
+    }
+    learn_harvest_links(&app, &client, me.id).await;
+    Ok(harvest_status_of(&app.state::<AppState>()))
+}
+
+#[tauri::command(async)]
+fn harvest_disconnect(state: State<AppState>) -> CmdResult<()> {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, HARVEST_KEYRING_USER) {
+        let _ = entry.delete_credential();
+    }
+    let conn = state.db.relock();
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('harvest_account_id', 'harvest_user_id', 'harvest_name', 'harvest_link_rule')",
+        [],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// The Harvest projects (and tasks) you can log to.
+#[tauri::command]
+async fn harvest_projects(app: AppHandle) -> CmdResult<Vec<harvest::Project>> {
+    if app.state::<AppState>().demo {
+        return Ok(demo::harvest_projects());
+    }
+    let client = harvest_client(&app.state::<AppState>()).ok_or("Connect Harvest in Settings first")?;
+    client.projects().await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
+fn set_timesheet_nudge(state: State<AppState>, at: Option<String>) -> CmdResult<()> {
+    let value = match at {
+        Some(t) if chrono::NaiveTime::parse_from_str(&t, "%H:%M").is_ok() => t,
+        Some(_) => return Err("Use a time like 17:30".into()),
+        None => "off".into(),
+    };
+    db::set_setting(&state.db.relock(), "timesheet_nudge", &value).map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimesheetWeek {
+    /// Monday to Sunday.
+    days: Vec<String>,
+    rows: Vec<timesheet::Row>,
+    harvest: bool,
+    /// Why Harvest's entries couldn't be read, if they couldn't.
+    harvest_error: Option<String>,
+}
+
+/// The week containing `day`: proposals from the Day view, your edits, and what's already in Harvest.
+async fn compute_week(app: &AppHandle, day: &str) -> CmdResult<(TimesheetWeek, Vec<harvest::Project>)> {
+    use chrono::Datelike;
+    let date = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| "Bad date")?;
+    let monday = date - chrono::Duration::days(date.weekday().num_days_from_monday() as i64);
+    let days: Vec<chrono::NaiveDate> = (0..7).map(|i| monday + chrono::Duration::days(i)).collect();
+    let today = chrono::Local::now().date_naive();
+    let mut proposals = std::collections::HashMap::new();
+    for d in days.iter().filter(|d| **d <= today) {
+        let (s, e) = local_day(*d);
+        let r = day_report(app, &d.to_string(), s, e).await?;
+        proposals.insert(d.to_string(), timesheet::propose(&r));
+    }
+    let day_keys: Vec<String> = days.iter().map(|d| d.to_string()).collect();
+    let (first, last) = (day_keys[0].clone(), day_keys[6].clone());
+
+    // What's in Harvest already (logged some other way), by ticket and day.
+    let client = harvest_client(&app.state::<AppState>());
+    let user_id: Option<i64> = app.state::<AppState>().setting("harvest_user_id").and_then(|u| u.parse().ok());
+    let mut logged = std::collections::HashMap::new();
+    let mut projects = Vec::new();
+    let mut harvest_error = None;
+    if let (Some(client), Some(user)) = (&client, user_id) {
+        let ours = timesheet::harvest_ids(&app.state::<AppState>().db.relock()).map_err(err)?;
+        match client.entries(user, &first, &last).await {
+            Ok(entries) => {
+                for e in entries.iter().filter(|e| !ours.contains(&e.id)) {
+                    if let Some(key) = harvest::ticket_of(e) {
+                        *logged.entry((e.spent_date.clone(), key)).or_insert(0) += (e.hours * 60.0).round() as i64;
+                    }
+                }
+            }
+            Err(e) => harvest_error = Some(format!("{e:#}")),
+        }
+        projects = client.projects().await.unwrap_or_default();
+    }
+    let demo = app.state::<AppState>().demo;
+    if demo {
+        projects = demo::harvest_projects();
+    }
+
+    let state = app.state::<AppState>();
+    let conn = state.db.relock();
+    let stored = timesheet::stored(&conn, &first, &last).map_err(err)?;
+    let remembered = timesheet::buckets(&conn).map_err(err)?;
+    let titles: std::collections::HashMap<String, String> = jira::titles(&conn)
+        .map_err(err)?
+        .into_iter()
+        .map(|(k, v)| (k, v.0))
+        .collect();
+    let bucket = |row: &str, day: &str| {
+        let month = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map(|d| d.month()).unwrap_or(1);
+        timesheet::bucket_for(row, month, &remembered, &projects)
+    };
+    let rows = timesheet::week(&day_keys, &proposals, &stored, &logged, &bucket, &titles);
+    drop(conn);
+    Ok((TimesheetWeek { days: day_keys, rows, harvest: client.is_some() || demo, harvest_error }, projects))
+}
+
+#[tauri::command]
+async fn timesheet_week(app: AppHandle, day: String) -> CmdResult<TimesheetWeek> {
+    Ok(compute_week(&app, &day).await?.0)
+}
+
+/// Your hours for a ticket (or "__other") on a day; None goes back to the proposal.
+#[tauri::command(async)]
+fn timesheet_set(state: State<AppState>, day: String, row: String, minutes: Option<i64>) -> CmdResult<()> {
+    timesheet::set_minutes(&state.db.relock(), &day, &row, minutes).map_err(err)
+}
+
+/// Choose the Harvest bucket for a ticket — remembered for its Jira project too (or the default for "__other").
+#[tauri::command(async)]
+fn timesheet_bucket(
+    state: State<AppState>,
+    row: String,
+    project_id: i64,
+    project_name: String,
+    task_id: i64,
+    task_name: String,
+) -> CmdResult<()> {
+    let b = timesheet::Bucket { project_id, project_name, task_id, task_name, from: String::new() };
+    timesheet::remember(&state.db.relock(), &row, &b, &now()).map_err(err)
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SubmitResult {
+    created: usize,
+    updated: usize,
+    removed: usize,
+    /// Rows that couldn't go, and why ("HAIR-12: choose a Harvest bucket").
+    skipped: Vec<String>,
+}
+
+/// Send the days' timesheet to Harvest: new entries are created (linked to their Jira ticket), ones
+/// this app created are updated or removed. Anything already exactly in Harvest is left alone.
+#[tauri::command]
+async fn timesheet_submit(app: AppHandle, days: Vec<String>) -> CmdResult<SubmitResult> {
+    use chrono::Datelike;
+    // The demo pretends: entries get made-up ids and nothing leaves the Mac.
+    let demo = app.state::<AppState>().demo;
+    let client = harvest_client(&app.state::<AppState>());
+    if client.is_none() && !demo {
+        return Err("Connect Harvest in Settings first".into());
+    }
+    let Some(first) = days.first() else { return Ok(SubmitResult::default()) };
+    let (week, projects) = compute_week(&app, first).await?;
+    let rule: harvest::LinkRule = json_setting(&app.state::<AppState>(), "harvest_link_rule").unwrap_or_default();
+    let jira = jira_client(&app.state::<AppState>());
+    let mut project_ids: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    let mut result = SubmitResult::default();
+    for row in &week.rows {
+        for cell in row.cells.iter().filter(|c| days.contains(&c.day) && !c.submitted) {
+            let stored = {
+                let state = app.state::<AppState>();
+                let conn = state.db.relock();
+                timesheet::stored_row(&conn, &cell.day, &row.key).map_err(err)?.unwrap_or_default()
+            };
+            // Back to nothing: remove what this app put in Harvest.
+            if cell.minutes == 0 {
+                if let Some(id) = stored.harvest_id {
+                    if let Some(client) = &client {
+                        client.delete(id).await.map_err(|e| format!("{}: {e:#}", row.key))?;
+                    }
+                    result.removed += 1;
+                }
+                let _ = timesheet::submitted(&app.state::<AppState>().db.relock(), &cell.day, &row.key, None, 0, &now());
+                continue;
+            }
+            let month = chrono::NaiveDate::parse_from_str(&cell.day, "%Y-%m-%d").map(|d| d.month()).unwrap_or(1);
+            let bucket = {
+                let state = app.state::<AppState>();
+                let remembered = timesheet::buckets(&state.db.relock()).map_err(err)?;
+                timesheet::bucket_for(&row.key, month, &remembered, &projects)
+            };
+            let Some(bucket) = bucket else {
+                let name = if row.key == timesheet::OTHER { "Other work" } else { row.key.as_str() };
+                result.skipped.push(format!("{name}: choose a Harvest bucket"));
+                continue;
+            };
+            let (notes, reference) = if row.key == timesheet::OTHER {
+                (row.label.clone(), None)
+            } else {
+                let project_key = row.key.split('-').next().unwrap_or_default().to_string();
+                if !project_ids.contains_key(&project_key) {
+                    let id = match &jira {
+                        Some(j) => j.project_id(&project_key).await.ok(),
+                        None => None,
+                    };
+                    project_ids.insert(project_key.clone(), id);
+                }
+                let known: Option<(String, String)> = app
+                    .state::<AppState>()
+                    .db
+                    .relock()
+                    .query_row("SELECT id, url FROM jira_issues WHERE key = ?1", [&row.key], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .ok();
+                let reference = known.map(|(issue_id, url)| {
+                    harvest::link(
+                        &rule,
+                        &harvest::Ticket {
+                            key: &row.key,
+                            issue_id: &issue_id,
+                            project_key: &project_key,
+                            project_id: project_ids.get(&project_key).and_then(|p| p.as_deref()),
+                            url: &url,
+                        },
+                    )
+                });
+                (format!("{} {}", row.key, row.label).trim().to_string(), reference)
+            };
+            let entry = harvest::NewEntry {
+                project_id: bucket.project_id,
+                task_id: bucket.task_id,
+                spent_date: cell.day.clone(),
+                hours: cell.minutes as f64 / 60.0,
+                notes,
+                reference,
+            };
+            let id = match (stored.harvest_id, &client) {
+                (Some(id), Some(client)) => {
+                    client.update(id, &entry).await.map_err(|e| format!("{}: {e:#}", row.key))?;
+                    result.updated += 1;
+                    id
+                }
+                (None, Some(client)) => {
+                    let id = client.create(&entry).await.map_err(|e| format!("{}: {e:#}", row.key))?;
+                    result.created += 1;
+                    id
+                }
+                (Some(id), None) => {
+                    result.updated += 1;
+                    id
+                }
+                (None, None) => {
+                    result.created += 1;
+                    chrono::Utc::now().timestamp_micros()
+                }
+            };
+            timesheet::submitted(&app.state::<AppState>().db.relock(), &cell.day, &row.key, Some(id), cell.minutes, &now())
+                .map_err(err)?;
+        }
+    }
+    Ok(result)
+}
+
+/// End of the working day: if today's timesheet has hours not yet in Harvest, say so (once a day).
+async fn maybe_timesheet_nudge(app: &AppHandle) {
+    use chrono::{Datelike, Timelike};
+    let state = app.state::<AppState>();
+    if state.demo || harvest_client(&state).is_none() || state.setting("notifications").as_deref() == Some("0") {
+        return;
+    }
+    let at = state.setting("timesheet_nudge").unwrap_or_else(|| "17:30".into());
+    let Ok(time) = chrono::NaiveTime::parse_from_str(&at, "%H:%M") else { return };
+    let now = chrono::Local::now();
+    let today = now.date_naive().to_string();
+    let weekend = matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+    if weekend || (now.hour(), now.minute()) < (time.hour(), time.minute()) || state.setting("last_timesheet_nudge").as_deref() == Some(today.as_str()) {
+        return;
+    }
+    let _ = db::set_setting(&state.db.relock(), "last_timesheet_nudge", &today);
+    let Ok((week, _)) = compute_week(app, &today).await else { return };
+    let waiting: i64 = week.rows.iter().flat_map(|r| &r.cells).filter(|c| c.day == today && !c.submitted).map(|c| c.minutes).sum();
+    if waiting > 0 {
+        notify(
+            app,
+            sync::Notice {
+                title: "🕒 Today's timesheet".into(),
+                body: format!("{} to send to Harvest\nReview and submit", hours(waiting)),
+                url: None,
+                item_id: Some("view:timesheet".into()),
+            },
+        );
+    }
+}
+
 /// Save corrected blocks for a day (freezes it).
 #[tauri::command(async)]
 fn save_day(state: State<AppState>, day: String, blocks: Vec<day::Block>) -> CmdResult<()> {
@@ -2509,6 +2888,14 @@ pub fn run() {
                     }
                 });
             }
+            // Test aid: DEV_INBOX_VIEW=timesheet opens on that view a few seconds after launch.
+            if let Ok(view) = std::env::var("DEV_INBOX_VIEW") {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                    let _ = handle.emit_to("main", "navigate", view);
+                });
+            }
             refresh_tray(app.handle());
 
             if let Err(e) = app.global_shortcut().register(palette_shortcut()) {
@@ -2562,6 +2949,15 @@ pub fn run() {
             dismiss_suggestion,
             open_in_main,
             jira_transitions,
+            harvest_status,
+            harvest_connect,
+            harvest_disconnect,
+            harvest_projects,
+            set_timesheet_nudge,
+            timesheet_week,
+            timesheet_set,
+            timesheet_bucket,
+            timesheet_submit,
             jira_move,
             jira_assignable,
             jira_assign,

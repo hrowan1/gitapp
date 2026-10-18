@@ -319,6 +319,12 @@ impl Client {
         Ok((issues, changes))
     }
 
+    /// A Jira project's numeric id (for linking Harvest entries the way Harvest's Jira integration does).
+    pub async fn project_id(&self, key: &str) -> Result<String> {
+        let v = self.send(self.http.get(format!("{}/rest/api/3/project/{key}", self.base))).await?;
+        v["id"].as_str().map(String::from).ok_or_else(|| anyhow!("Jira didn't return the project"))
+    }
+
     pub async fn myself(&self) -> Result<Me> {
         let v = self.send(self.http.get(format!("{}/rest/api/3/myself", self.base))).await?;
         Ok(Me {
