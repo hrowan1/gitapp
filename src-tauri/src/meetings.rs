@@ -284,13 +284,17 @@ fn words(s: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Merge both tracks by time. When you're on speakers, your mic also hears the call, so a "you"
-/// line that overlaps a near-identical "others" line is an echo and is dropped.
+/// How far apart (seconds) a line and its echo can be: sound leaking from headphones into the mic
+/// is transcribed a little late, and its line boundaries fall differently.
+const ECHO_WINDOW: f64 = 2.0;
+
+/// Merge both tracks by time. Your mic can also hear the call (speakers, or headphones loud enough
+/// to leak), so a "you" line that overlaps a near-identical "others" line is an echo and is dropped.
 pub fn merge(mut you: Vec<Segment>, others: Vec<Segment>) -> Vec<Segment> {
     you.retain(|y| {
         let yw = words(&y.text);
         !others.iter().any(|o| {
-            let overlap = y.start < o.end + 1.0 && o.start < y.end + 1.0;
+            let overlap = y.start < o.end + ECHO_WINDOW && o.start < y.end + ECHO_WINDOW;
             if !overlap || yw.is_empty() {
                 return false;
             }
@@ -645,6 +649,19 @@ mod tests {
         assert!(m.error.unwrap().contains("Try again"));
         assert!(m.ended_at.is_some() && m.seconds.is_some());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn drops_late_partial_echo_from_headphones() {
+        // Headphone leak: quieter, so only some words are caught, and the line lands just after.
+        let you = vec![
+            seg(15.6, 17.0, "you", "deploy staging tomorrow"),
+            seg(30.0, 31.0, "you", "Sounds good to me."),
+        ];
+        let others = vec![seg(11.0, 14.0, "others", "We can deploy it to staging tomorrow morning.")];
+        let merged = merge(you, others);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|s| s.text == "Sounds good to me."), "your own line stays");
     }
 
     #[test]

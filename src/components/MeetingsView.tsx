@@ -403,6 +403,8 @@ interface Caption {
   /** false while the recogniser may still change it */
   final: boolean;
   start: number;
+  /** When it first arrived (ms). The two tracks' own clocks drift apart, so echoes are matched on this. */
+  at?: number;
 }
 interface Captions {
   /** Settled lines, oldest first (only the last few are kept). */
@@ -412,8 +414,9 @@ interface Captions {
 }
 const NO_CAPTIONS: Captions = { done: [], live: {} };
 
-function addCaption(c: Captions, cap: Caption): Captions {
+function addCaption(c: Captions, incoming: Caption): Captions {
   const live = { ...c.live };
+  const cap = { ...incoming, at: live[incoming.speaker]?.at ?? Date.now() };
   if (cap.final) {
     delete live[cap.speaker];
     return { done: [...c.done, cap].slice(-6), live };
@@ -422,9 +425,36 @@ function addCaption(c: Captions, cap: Caption): Captions {
   return { done: c.done, live };
 }
 
+function words(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((w) => w.length > 2),
+  );
+}
+
+/** Your mic can hear the call (speakers, or headphones loud enough to leak), so a "You" line that
+ * repeats what "Others" said moments ago is the call, not you. Same rule as the saved transcript. */
+function isEcho(line: Caption, all: Caption[]): boolean {
+  if (line.speaker !== "you") return false;
+  const mine = words(line.text);
+  if (mine.size === 0) return false;
+  return all.some((o) => {
+    if (o.speaker !== "others" || Math.abs((o.at ?? 0) - (line.at ?? 0)) > 10_000) return false;
+    const theirs = words(o.text);
+    const shared = [...mine].filter((w) => theirs.has(w)).length;
+    return shared >= Math.min(2, mine.size) && shared / Math.max(1, Math.min(mine.size, theirs.size)) >= 0.6;
+  });
+}
+
 /** What's being said right now; the proper transcript is made from the recording afterwards. */
 function LiveCaptions({ captions }: { captions: Captions }) {
-  const lines = [...captions.done, ...Object.values(captions.live)].sort((a, b) => a.start - b.start).slice(-4);
+  const all = [...captions.done, ...Object.values(captions.live)];
+  const lines = all
+    .filter((l) => !isEcho(l, all))
+    .sort((a, b) => a.start - b.start)
+    .slice(-4);
   if (lines.length === 0) return null;
   return (
     <div className="captions" aria-live="polite">
