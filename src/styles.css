@@ -2008,6 +2008,97 @@ a {
   color: var(--muted);
   flex-shrink: 0;
 }
+
+/* Project tabs (Tickets) */
+.tabs {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  margin-top: 10px;
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+.tab {
+  border: none;
+  background: none;
+  box-shadow: none;
+  border-radius: 0;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--muted);
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab:hover:not(.on) {
+  color: var(--text);
+  background: none;
+}
+.tab.on {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.tab .count {
+  color: var(--faint);
+  font-weight: 500;
+  margin-left: 4px;
+}
+.tab.on .count {
+  color: var(--muted);
+}
+
+/* Status groups (Tickets) */
+.status-group {
+  margin-top: 12px;
+}
+.status-group:first-child {
+  margin-top: 6px;
+}
+.status-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  background: none;
+  box-shadow: none;
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+.status-head:hover {
+  background: var(--hover);
+}
+.status-head .chevron {
+  color: var(--faint);
+}
+.status-head .status-name {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-head .count {
+  color: var(--faint);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.group-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--tone, var(--muted));
+  flex-shrink: 0;
+}
 .tl-row.mine .tl-text {
   font-weight: 550;
 }

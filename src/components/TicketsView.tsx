@@ -20,6 +20,32 @@ type Filter = "active" | "all" | "done";
 
 const CATEGORY_TONE: Record<string, string> = { new: "gray", indeterminate: "blue", done: "green" };
 
+/** Remembered preference for the "only assigned to you" filter. */
+const MINE_ONLY_KEY = "tickets-mine-only";
+
+/** A colour tone for a Jira status, so "In QA", "In Review", "In Progress" each read at a glance. */
+function statusTone(t: { status: string; category: string }): string {
+  if (t.category === "done") return "green";
+  const s = t.status.toLowerCase();
+  if (/block|impediment|hold/.test(s)) return "red";
+  if (/\bqa\b|test|verif/.test(s)) return "orange";
+  if (/review|\bpr\b|pull request|approv/.test(s)) return "violet";
+  if (/progress|doing|develop|\bwip\b|build|implement/.test(s)) return "blue";
+  if (/to ?do|backlog|open|triage|selected|\bnew\b|ready|groom|refine/.test(s)) return "gray";
+  return CATEGORY_TONE[t.category] ?? "gray";
+}
+
+/** Roughly where a status sits in a dev workflow, so groups read To Do → In Progress → Review → QA → Done. */
+function statusRank(t: { status: string; category: string }): number {
+  if (t.category === "done") return 9;
+  const s = t.status.toLowerCase();
+  if (t.category === "new" || /to ?do|backlog|open|triage|selected|\bnew\b|groom|refine/.test(s)) return 0;
+  if (/progress|doing|develop|\bwip\b|build|implement/.test(s)) return 1;
+  if (/review|\bpr\b|pull request|approv/.test(s)) return 2;
+  if (/\bqa\b|test|verif/.test(s)) return 3;
+  return 4;
+}
+
 
 const EVENT_ICON: Record<string, IconName> = {
   status: "chevronRight",
@@ -106,7 +132,7 @@ function StatusPicker({ ticket }: { ticket: Ticket }) {
   return (
     <div className="picker" ref={ref}>
       <button
-        className={`chip-state chip-button tone-${CATEGORY_TONE[ticket.category] ?? "gray"}`}
+        className={`chip-state chip-button tone-${statusTone(ticket)}`}
         onClick={toggle}
         disabled={busy}
         title="Move to another status (in Jira)"
@@ -338,7 +364,15 @@ export function TicketsView({
   const [tickets, setTickets] = useState<Ticket[] | null>(null);
   const [filter, setFilter] = useState<Filter>("active");
   const [text, setText] = useState("");
-  const [mineOnly, setMineOnly] = useState(false);
+  const [mineOnly, setMineOnly] = useState(() => {
+    try {
+      return localStorage.getItem(MINE_ONLY_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const [project, setProject] = useState<string>("all");
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<TicketDetail | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -347,6 +381,8 @@ export function TicketsView({
       setSelected(target.key);
       setFilter("all");
       setText("");
+      setProject("all");
+      setMineOnly(false);
     }
   }, [target]);
 
@@ -365,7 +401,8 @@ export function TicketsView({
     api.getTicket(selected).then(setDetail).catch((e) => toast(String(e), true));
   }, [selected, version]);
 
-  const shown = useMemo(() => {
+  // Everything matching the text / open-done / assigned-to-you filters, before narrowing to a project tab.
+  const base = useMemo(() => {
     const q = text.trim().toLowerCase();
     return (tickets ?? []).filter(
       (t) =>
@@ -374,6 +411,79 @@ export function TicketsView({
         (!q || `${t.key} ${t.summary} ${t.status} ${t.project}`.toLowerCase().includes(q)),
     );
   }, [tickets, filter, mineOnly, text]);
+
+  // The projects present, with a count each, for the tabs.
+  const projects = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of base) counts.set(t.project, (counts.get(t.project) ?? 0) + 1);
+    return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [base]);
+
+  // A selected project tab that no longer has anything falls back to All.
+  useEffect(() => {
+    if (project !== "all" && !projects.some(([p]) => p === project)) setProject("all");
+  }, [projects, project]);
+
+  const shown = useMemo(
+    () => (project === "all" ? base : base.filter((t) => t.project === project)),
+    [base, project],
+  );
+
+  // Grouped by status, newest within each group, ordered To Do → In Progress → Review → QA → Done.
+  const groups = useMemo(() => {
+    const by = new Map<string, Ticket[]>();
+    for (const t of shown) {
+      const arr = by.get(t.status);
+      if (arr) arr.push(t);
+      else by.set(t.status, [t]);
+    }
+    const list = [...by.entries()].map(([statusName, items]) => {
+      items.sort((a, b) => (b.updated ?? b.lastMoveAt ?? "").localeCompare(a.updated ?? a.lastMoveAt ?? ""));
+      return { status: statusName, items, rank: statusRank(items[0]), tone: statusTone(items[0]) };
+    });
+    list.sort((a, b) => a.rank - b.rank || a.status.localeCompare(b.status));
+    return list;
+  }, [shown]);
+
+  const toggleGroup = useCallback((statusName: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(statusName)) next.delete(statusName);
+      else next.add(statusName);
+      return next;
+    });
+  }, []);
+
+  const renderRow = (t: Ticket) => (
+    <div
+      key={t.key}
+      className={`row${selected === t.key ? " selected" : ""}`}
+      role="button"
+      onClick={() => setSelected(t.key)}
+      onDoubleClick={() => openUrl(t.url)}
+    >
+      <span className={`state-icon tone-${statusTone(t)}`}>
+        <Icon name={t.category === "done" ? "checkCircle" : "ticket"} size={14} />
+      </span>
+      <div className="row-main">
+        <div className="row-title">
+          <span className="ticket-key">{t.key}</span>
+          <span className="title">{t.summary}</span>
+        </div>
+        <div className="row-sub">
+          <span className="reason">{t.lastMove ?? t.issueType}</span>
+          {INVOLVEMENT[t.involvement] && <span className="pill">{INVOLVEMENT[t.involvement]}</span>}
+        </div>
+      </div>
+      <div className="row-right">
+        {/* The list is sorted by last update, so show that rather than the last status move. */}
+        <span className="age" title={t.updated ? `Updated ${friendlyDate(t.updated)} ${clock(t.updated)}` : undefined}>
+          {t.updated ? age(t.updated, now) : t.lastMoveAt ? age(t.lastMoveAt, now) : ""}
+        </span>
+      </div>
+    </div>
+  );
+
   const ticket = tickets?.find((t) => t.key === selected) ?? null;
 
   if (status && !status.connected) {
@@ -423,6 +533,18 @@ export function TicketsView({
         </p>
         {status?.error && <p className="error small">Last Jira sync failed: {status.error}</p>}
       </div>
+      {projects.length > 1 && (
+        <div className="tabs" role="tablist">
+          <button className={`tab${project === "all" ? " on" : ""}`} onClick={() => setProject("all")}>
+            All <span className="count">{base.length}</span>
+          </button>
+          {projects.map(([p, n]) => (
+            <button key={p} className={`tab${project === p ? " on" : ""}`} onClick={() => setProject(p)}>
+              {p} <span className="count">{n}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="filters">
         <div className="search-box">
           <Icon name="search" size={14} />
@@ -436,8 +558,19 @@ export function TicketsView({
           ))}
         </div>
         <label className="check">
-          <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} /> Only assigned to
-          you
+          <input
+            type="checkbox"
+            checked={mineOnly}
+            onChange={(e) => {
+              setMineOnly(e.target.checked);
+              try {
+                localStorage.setItem(MINE_ONLY_KEY, e.target.checked ? "1" : "0");
+              } catch {
+                // Preference not remembered; fine.
+              }
+            }}
+          />{" "}
+          Only assigned to you
         </label>
       </div>
     </>
@@ -454,37 +587,25 @@ export function TicketsView({
               {tickets.length === 0 ? "No tickets yet — the first Jira sync may still be running." : "Nothing matches."}
             </div>
           )}
-          {shown.map((t) => (
-            <div
-              key={t.key}
-              className={`row${selected === t.key ? " selected" : ""}`}
-              role="button"
-              onClick={() => setSelected(t.key)}
-              onDoubleClick={() => openUrl(t.url)}
-            >
-              <span className={`state-icon tone-${CATEGORY_TONE[t.category] ?? "gray"}`}>
-                <Icon name={t.category === "done" ? "checkCircle" : "ticket"} size={14} />
-              </span>
-              <div className="row-main">
-                <div className="row-title">
-                  <span className="ticket-key">{t.key}</span>
-                  <span className="title">{t.summary}</span>
-                </div>
-                <div className="row-sub">
-                  <span>{t.status}</span>
-                  <span className="sep">·</span>
-                  <span className="reason">{t.lastMove ?? t.issueType}</span>
-                  {INVOLVEMENT[t.involvement] && <span className="pill">{INVOLVEMENT[t.involvement]}</span>}
-                </div>
+          {groups.map((g) => {
+            const isCollapsed = collapsed.has(g.status);
+            return (
+              <div className="status-group" key={g.status}>
+                <button
+                  className="status-head"
+                  onClick={() => toggleGroup(g.status)}
+                  aria-expanded={!isCollapsed}
+                  title={isCollapsed ? "Show these" : "Hide these"}
+                >
+                  <Icon name="chevronDown" size={13} className={`chevron${isCollapsed ? " closed" : ""}`} />
+                  <span className={`group-dot tone-${g.tone}`} />
+                  <span className="status-name">{g.status}</span>
+                  <span className="count">{g.items.length}</span>
+                </button>
+                {!isCollapsed && g.items.map(renderRow)}
               </div>
-              <div className="row-right">
-                {/* The list is sorted by last update, so show that rather than the last status move. */}
-                <span className="age" title={t.updated ? `Updated ${friendlyDate(t.updated)} ${clock(t.updated)}` : undefined}>
-                  {t.updated ? age(t.updated, now) : t.lastMoveAt ? age(t.lastMoveAt, now) : ""}
-                </span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </section>
 
