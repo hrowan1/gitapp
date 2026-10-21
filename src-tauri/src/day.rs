@@ -9,7 +9,7 @@ use chrono::Duration;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use crate::derive::{fmt_ts, parse_ts, Ts};
@@ -65,9 +65,15 @@ fn valid(t: &str) -> bool {
     !NOT_TICKETS.contains(&project)
 }
 
-/// A Jira-style ticket key from a branch name ("io-2641-dealflow" → "IO-2641").
+/// A Jira-style ticket key from a branch name ("io-2641-dealflow" → "IO-2641"). A version number
+/// isn't one: "update-gin-3.1.0" and "drupal-10.6.19" have no ticket.
 pub fn ticket_in_branch(branch: &str) -> Option<String> {
-    BRANCH_TICKET.captures(branch).map(|c| c[1].to_ascii_uppercase()).filter(|t| valid(t))
+    BRANCH_TICKET.captures_iter(branch).find_map(|c| {
+        let m = c.get(1)?;
+        let mut rest = branch[m.end()..].chars();
+        let version = rest.next() == Some('.') && rest.next().is_some_and(|d| d.is_ascii_digit());
+        Some(m.as_str().to_ascii_uppercase()).filter(|t| !version && valid(t))
+    })
 }
 
 /// A ticket key written in a title or message (must be upper-case there: "IO-2641").
@@ -75,6 +81,12 @@ pub fn ticket_in_text(text: &str) -> Option<String> {
     TEXT_TICKET.captures(text).map(|c| c[1].to_string()).filter(|t| valid(t))
 }
 
+
+/// A merge commit ("Merge pull request #12 from …", "Merge branch 'main' into …") is a click, not
+/// an hour of coding: it counts like merging a PR.
+fn is_merge(message: &str) -> bool {
+    ["Merge pull request #", "Merge branch ", "Merge remote-tracking branch "].iter().any(|p| message.starts_with(p))
+}
 
 fn is_trunk(branch: &str) -> bool {
     matches!(branch, "main" | "master" | "develop" | "dev" | "trunk")
@@ -84,8 +96,10 @@ fn short_repo(repo: &str) -> &str {
     repo.split('/').nth(1).unwrap_or(repo)
 }
 
-/// What an event counts towards: (key, label, url). Ticket > PR > branch > repo.
-pub fn work_key(e: &WorkEvent) -> (String, String, Option<String>) {
+/// What an event counts towards: (key, label, url). Ticket > PR > branch > repo. When the user's
+/// Jira projects are known (`projects` isn't empty) only their keys are tickets, so a branch named
+/// "core-10" doesn't hide the "ES-636" in its PR's title.
+pub fn work_key(e: &WorkEvent, projects: &HashSet<String>) -> (String, String, Option<String>) {
     if let Some((key, label)) = &e.group {
         return (key.clone(), label.clone(), e.url.clone());
     }
@@ -93,12 +107,11 @@ pub fn work_key(e: &WorkEvent) -> (String, String, Option<String>) {
         return (format!("T:{t}"), t.clone(), e.url.clone());
     }
     let title = e.pr.as_ref().map(|p| p.1.as_str());
-    let ticket = e
-        .branch
-        .as_deref()
-        .and_then(ticket_in_branch)
-        .or_else(|| title.and_then(ticket_in_text))
-        .or_else(|| ticket_in_text(&e.text));
+    let known = |t: &String| projects.is_empty() || t.split('-').next().is_some_and(|p| projects.contains(p));
+    let ticket = [e.branch.as_deref().and_then(ticket_in_branch), title.and_then(ticket_in_text), ticket_in_text(&e.text)]
+        .into_iter()
+        .flatten()
+        .find(known);
     if let Some(t) = ticket {
         let what = title.map(String::from).or_else(|| e.branch.clone()).unwrap_or_else(|| e.text.clone());
         // "IO-2641 - Dealflow…" / "io-2641-dealflow" → don't repeat the key.
@@ -258,9 +271,10 @@ pub fn build(
     events.retain(|e| e.dedupe.as_ref().map_or(true, |d| seen.insert(d.clone())));
     events.sort_by_key(|e| e.at);
 
+    let projects: HashSet<String> = titles.keys().filter_map(|k| k.split('-').next()).map(String::from).collect();
     let mut by_key: BTreeMap<String, (String, Option<String>, Vec<&WorkEvent>)> = BTreeMap::new();
     for e in &events {
-        let (key, label, url) = work_key(e);
+        let (key, label, url) = work_key(e, &projects);
         let entry = by_key.entry(key).or_insert_with(|| (label.clone(), url.clone(), Vec::new()));
         // Prefer a label that comes from a PR title.
         if e.pr.is_some() && entry.1.is_none() {
@@ -438,7 +452,7 @@ pub fn gather(conn: &Connection, start: &str, end: &str) -> Result<Vec<WorkEvent
         };
         out.push(WorkEvent {
             at,
-            kind: kind.clone(),
+            kind: if kind == "committed" && is_merge(&detail) { "merged".into() } else { kind.clone() },
             repo,
             branch,
             pr: pr.map(|p| (p.0.clone(), p.1.clone(), p.2.clone())),
@@ -487,7 +501,7 @@ pub fn local_events(conn: &Connection, commits: Vec<(String, crate::editor::Loca
         };
         out.push(WorkEvent {
             at,
-            kind: "local_commit".into(),
+            kind: if is_merge(&c.message) { "merged" } else { "local_commit" }.into(),
             repo: repo.clone(),
             branch: c.branch.clone(),
             pr: pr.map(|p| (format!("{}#{}", p.repo, p.number), p.title, p.url)),
@@ -599,6 +613,31 @@ mod tests {
         assert_eq!(ticket_in_text("feat(p4-02): register deep links"), None, "lower-case or one-letter isn't a ticket");
         assert_eq!(ticket_in_text("Fix UTF-8 handling"), None);
         assert_eq!(ticket_in_text("IO-2641 country search"), Some("IO-2641".into()));
+        // Version numbers in branch names aren't tickets.
+        assert_eq!(ticket_in_branch("update-gin-3.1.0"), None);
+        assert_eq!(ticket_in_branch("drupal-10.6.19"), None);
+        assert_eq!(ticket_in_branch("es-636-upgrade-core-10.6.18").as_deref(), Some("ES-636"));
+        assert_eq!(ticket_in_branch("release-2").as_deref(), Some("RELEASE-2"), "no version after it");
+    }
+
+    #[test]
+    fn merge_commits_are_merges() {
+        assert!(is_merge("Merge pull request #1312 from fullfatthings/KEY-1072"));
+        assert!(is_merge("Merge branch 'main' into RF-305"));
+        assert!(is_merge("Merge remote-tracking branch 'origin/main' into io-2635"));
+        assert!(!is_merge("Merge the two settings pages"), "a commit about merging things");
+        assert_eq!(lead_minutes("merged"), 3, "a click, not 25 minutes of coding");
+    }
+
+    #[test]
+    fn known_jira_projects_win() {
+        let mut e = ev("09:00", "committed", Some("core-10-upgrade"), "Upgrade core");
+        e.pr = Some(("acme/site#9".into(), "ES-636 - Upgrade Drupal core".into(), "https://github.com/acme/site/pull/9".into()));
+        let projects: HashSet<String> = ["ES".to_string(), "IO".to_string()].into();
+        assert_eq!(work_key(&e, &projects).0, "T:ES-636", "the branch's CORE-10 isn't a Jira project");
+        assert_eq!(work_key(&e, &HashSet::new()).0, "T:CORE-10", "without Jira, the branch still wins");
+        e.pr = None;
+        assert_eq!(work_key(&e, &projects).0, "B:acme/web:core-10-upgrade", "no ticket at all: the branch");
     }
 
     #[test]

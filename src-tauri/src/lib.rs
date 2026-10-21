@@ -2969,7 +2969,8 @@ fn timesheet_set(state: State<AppState>, day: String, row: String, minutes: Opti
     timesheet::set_minutes(&state.db.relock(), &day, &row, minutes).map_err(err)
 }
 
-/// Choose the Harvest bucket for a ticket — remembered for its Jira project too (or the default for "__other").
+/// Choose the Harvest bucket for a row — remembered for a ticket's Jira project or a repository's
+/// organisation too (or the default, for "__other").
 #[tauri::command(async)]
 fn timesheet_bucket(
     state: State<AppState>,
@@ -3035,12 +3036,17 @@ async fn timesheet_submit(app: AppHandle, days: Vec<String>) -> CmdResult<Submit
                 timesheet::bucket_for(&row.key, month, &remembered, &projects)
             };
             let Some(bucket) = bucket else {
-                let name = if row.key == timesheet::OTHER { "Other work" } else { row.key.as_str() };
+                let name = match row.key.strip_prefix(timesheet::REPO) {
+                    Some(repo) => repo,
+                    None if row.key == timesheet::OTHER => "Meetings and other work",
+                    None => row.key.as_str(),
+                };
                 result.skipped.push(format!("{name}: choose a Harvest bucket"));
                 continue;
             };
-            let (notes, reference) = if row.key == timesheet::OTHER {
-                (row.label.clone(), None)
+            let notes = timesheet::notes(row, cell);
+            let reference = if row.key == timesheet::OTHER || row.key.starts_with(timesheet::REPO) {
+                None
             } else {
                 let project_key = row.key.split('-').next().unwrap_or_default().to_string();
                 if !project_ids.contains_key(&project_key) {
@@ -3056,7 +3062,7 @@ async fn timesheet_submit(app: AppHandle, days: Vec<String>) -> CmdResult<Submit
                     .relock()
                     .query_row("SELECT id, url FROM jira_issues WHERE key = ?1", [&row.key], |r| Ok((r.get(0)?, r.get(1)?)))
                     .ok();
-                let reference = known.map(|(issue_id, url)| {
+                known.map(|(issue_id, url)| {
                     harvest::link(
                         &rule,
                         &harvest::Ticket {
@@ -3067,8 +3073,7 @@ async fn timesheet_submit(app: AppHandle, days: Vec<String>) -> CmdResult<Submit
                             url: &url,
                         },
                     )
-                });
-                (format!("{} {}", row.key, row.label).trim().to_string(), reference)
+                })
             };
             let entry = harvest::NewEntry {
                 project_id: bucket.project_id,

@@ -516,7 +516,7 @@ export interface HarvestBucket {
   projectName: string;
   taskId: number;
   taskName: string;
-  /** "ticket" | "project" | "default" | "rollover" */
+  /** "ticket" | "project" | "repo" | "org" | "default" | "rollover" */
   from: string;
 }
 
@@ -528,10 +528,12 @@ export interface TimesheetCell {
   minutes: number;
   edited: boolean;
   submitted: boolean;
+  /** What was done that day: commit messages, PR titles, reviews. */
+  notes: string[];
 }
 
 export interface TimesheetRow {
-  /** A Jira key, or "__other". */
+  /** A Jira key, "repo:owner/name" for work not on a ticket, or "__other". */
   key: string;
   label: string;
   bucket: HarvestBucket | null;

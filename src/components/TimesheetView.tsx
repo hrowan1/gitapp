@@ -13,6 +13,33 @@ import { toast } from "../lib/toast";
 import { Icon } from "./Icon";
 
 const OTHER = "__other";
+const REPO = "repo:";
+/** Rows with less than this in the week fold away under "small bits". */
+const SMALL = 30;
+
+const rowTotal = (row: TimesheetRow) => row.cells.reduce((n, c) => n + c.minutes, 0);
+
+/** "repo:acme/web" → ["acme", "web"]; null for tickets and other work. */
+function repoOf(key: string): [string, string] | null {
+  if (!key.startsWith(REPO)) return null;
+  const [owner, name] = key.slice(REPO.length).split("/");
+  return [owner, name ?? owner];
+}
+
+/** Everything the week says was done on a row, first mention first. */
+function weekNotes(row: TimesheetRow): string[] {
+  const out: string[] = [];
+  for (const c of row.cells) for (const n of c.notes) if (!out.includes(n)) out.push(n);
+  return out;
+}
+
+/** "Mon: Fix nav; Reviewed 2 PRs" per line, for a tooltip. */
+function notesByDay(row: TimesheetRow): string {
+  return row.cells
+    .filter((c) => c.notes.length > 0)
+    .map((c) => `${parseDay(c.day).toLocaleDateString(undefined, { weekday: "short" })}: ${c.notes.join("; ")}`)
+    .join("\n");
+}
 
 /** Minutes as hours for a cell: "", "0.25", "1.5", "2". */
 function hoursText(minutes: number): string {
@@ -79,6 +106,7 @@ export function TimesheetView({
   const [projects, setProjects] = useState<HarvestProject[] | null>(harvestCache?.projects ?? null);
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [picking, setPicking] = useState<string | null>(null);
+  const [showSmall, setShowSmall] = useState(false);
 
   // The day on screen now, for answers that arrive after you've moved to another week.
   const shown = useRef(day);
@@ -120,6 +148,13 @@ export function TimesheetView({
   const weekTotal = dayTotals.reduce((a, b) => a + b, 0);
   const waiting = (d: string) => rows.some((r) => r.cells.some((c) => c.day === d && !c.submitted));
   const weekWaiting = days.filter((d) => d <= today && waiting(d));
+
+  // Rows come most time first; small bits fold away, but anything you've changed stays in view.
+  const isSmall = (r: TimesheetRow) => r.key !== OTHER && rowTotal(r) < SMALL && !r.cells.some((c) => c.edited);
+  const main = rows.filter((r) => !isSmall(r));
+  const small = rows.filter(isSmall);
+  const smallTotals = days.map((_, i) => small.reduce((n, r) => n + (r.cells[i]?.minutes ?? 0), 0));
+  const unbucketed = small.filter((r) => !r.bucket).length;
 
   const submit = async (which: string[], label: string) => {
     setSubmitting(label);
@@ -165,6 +200,62 @@ export function TimesheetView({
   };
 
   const connected = status?.connected ?? false;
+
+  const renderRow = (row: TimesheetRow) => {
+    const notes = weekNotes(row);
+    const repo = repoOf(row.key);
+    return (
+      <tr key={row.key} className={row.key === OTHER ? "ts-other" : undefined}>
+        <td className="ts-what">
+          <div className="ts-title">
+            {row.key === OTHER ? (
+              <>
+                <Icon name="calendar" size={12} />
+                <span className="strong">Meetings and other work</span>
+              </>
+            ) : repo ? (
+              <>
+                <Icon name="code" size={12} />
+                <span className="strong">{repo[1]}</span>
+                <span className="ts-label">{repo[0]}</span>
+              </>
+            ) : (
+              <>
+                <button className="ticket-key link" onClick={() => onOpenTicket(row.key)}>
+                  {row.key}
+                </button>
+                <span className="ts-label" title={row.label}>
+                  {row.label}
+                </span>
+              </>
+            )}
+          </div>
+          {notes.length > 0 && (
+            <div className="ts-notes" title={notesByDay(row)}>
+              {notes.slice(0, 3).join(" · ")}
+              {notes.length > 3 && <span className="faint"> · +{notes.length - 3} more</span>}
+            </div>
+          )}
+          {connected && (
+            <BucketButton
+              row={row}
+              open={picking === row.key}
+              projects={projects}
+              onOpen={() => setPicking(picking === row.key ? null : row.key)}
+              onClose={() => setPicking(null)}
+              onChoose={(p, t) => void chooseBucket(row.key, p, t)}
+            />
+          )}
+        </td>
+        {row.cells.map((c) => (
+          <td key={c.day} className="ts-cell-td">
+            <HoursCell cell={c} future={c.day > today} connected={connected} onSet={(m) => void setCell(row, c, m)} />
+          </td>
+        ))}
+        <td className="ts-sum">{total(rowTotal(row))}</td>
+      </tr>
+    );
+  };
 
   return (
     <div className="page timesheet-page">
@@ -253,40 +344,29 @@ export function TimesheetView({
               </tr>
             </thead>
             <tbody>
-              {rows.map((row) => (
-                <tr key={row.key} className={row.key === OTHER ? "ts-other" : undefined}>
+              {main.map(renderRow)}
+              {small.length > 0 && (
+                <tr className="ts-small-head">
                   <td className="ts-what">
-                    <div className="ts-title">
-                      {row.key === OTHER ? (
-                        <span className="strong">Other work</span>
-                      ) : (
-                        <button className="ticket-key link" onClick={() => onOpenTicket(row.key)}>
-                          {row.key}
-                        </button>
-                      )}
-                      <span className="ts-label" title={row.label}>
-                        {row.key === OTHER ? "Meetings, reviews, and anything not on a ticket" : row.label}
+                    <button className="ts-fold" onClick={() => setShowSmall(!showSmall)} aria-expanded={showSmall}>
+                      <Icon name="chevronDown" size={12} className={`chevron${showSmall ? "" : " closed"}`} />
+                      {small.length} small {small.length === 1 ? "bit" : "bits"}, under half an hour each
+                    </button>
+                    {connected && unbucketed > 0 && (
+                      <span className="ts-fold-warn">
+                        <Icon name="alert" size={11} /> {unbucketed} need{unbucketed === 1 ? "s" : ""} a Harvest project
                       </span>
-                    </div>
-                    {connected && (
-                      <BucketButton
-                        row={row}
-                        open={picking === row.key}
-                        projects={projects}
-                        onOpen={() => setPicking(picking === row.key ? null : row.key)}
-                        onClose={() => setPicking(null)}
-                        onChoose={(p, t) => void chooseBucket(row.key, p, t)}
-                      />
                     )}
                   </td>
-                  {row.cells.map((c) => (
-                    <td key={c.day} className="ts-cell-td">
-                      <HoursCell cell={c} future={c.day > today} connected={connected} onSet={(m) => void setCell(row, c, m)} />
+                  {days.map((d, i) => (
+                    <td key={d} className="ts-fold-sum">
+                      {hoursText(smallTotals[i])}
                     </td>
                   ))}
-                  <td className="ts-sum">{total(row.cells.reduce((n, c) => n + c.minutes, 0))}</td>
+                  <td className="ts-sum">{total(smallTotals.reduce((a, b) => a + b, 0))}</td>
                 </tr>
-              ))}
+              )}
+              {showSmall && small.map(renderRow)}
             </tbody>
             <tfoot>
               <tr>
@@ -359,11 +439,13 @@ function HoursCell({
   if (cell.logged) hints.push(`Already in Harvest: ${total(cell.logged)}`);
   if (cell.edited) hints.push("You changed this");
   if (connected && cell.minutes > 0) hints.push(cell.submitted ? "Sent to Harvest" : "Not sent yet");
+  // What was done first: it's what goes in Harvest's notes.
+  const tip = [cell.notes.map((n) => `• ${n}`).join("\n"), hints.join("\n")].filter(Boolean).join("\n\n");
 
   return (
     <div
       className={`ts-cell${cell.edited ? " edited" : ""}${connected && cell.submitted && cell.minutes > 0 ? " sent" : ""}`}
-      title={hints.join("\n")}
+      title={tip}
     >
       <input
         inputMode="decimal"
@@ -393,6 +475,8 @@ function HoursCell({
 const FROM: Record<string, string> = {
   ticket: "",
   project: "Remembered for this Jira project",
+  repo: "",
+  org: "Remembered for this organisation's repositories",
   default: "Your default for other work",
   rollover: "Same as last month, this month's project",
 };
@@ -459,7 +543,8 @@ function BucketPicker({
     return () => document.removeEventListener("mousedown", away);
   }, [onClose]);
 
-  const project = rowKey === OTHER ? null : rowKey.split("-")[0];
+  const repo = useMemo(() => repoOf(rowKey), [rowKey]);
+  const project = rowKey === OTHER || repo ? null : rowKey.split("-")[0];
   const options = useMemo(() => {
     const words = q.toLowerCase().split(/\s+/).filter(Boolean);
     const out: { p: HarvestProject; t: { id: number; name: string } }[] = [];
@@ -469,13 +554,18 @@ function BucketPicker({
         if (words.every((w) => hay.includes(w))) out.push({ p, t });
       }
     }
-    // Projects that look like this ticket's Jira project first ("HAIR-12" → "Project Hair …").
-    if (project) {
-      const like = (p: HarvestProject) => `${p.name} ${p.code ?? ""}`.toLowerCase().includes(project.toLowerCase());
+    // Projects that look like this ticket's Jira project ("HAIR-12" → "Project Hair …") or this
+    // repository or its owner ("indexventures/io-app" → "Index Ventures") first.
+    const hints = (repo ?? (project ? [project] : [])).map((h) => h.toLowerCase().replace(/[^a-z0-9]/g, ""));
+    if (hints.length > 0) {
+      const like = (p: HarvestProject) => {
+        const hay = `${p.client ?? ""} ${p.name} ${p.code ?? ""}`.toLowerCase().replace(/[^a-z0-9]/g, "");
+        return hints.some((h) => h.length > 1 && hay.includes(h));
+      };
       out.sort((a, b) => Number(like(b.p)) - Number(like(a.p)));
     }
     return out.slice(0, 80);
-  }, [projects, q, project]);
+  }, [projects, q, project, repo]);
 
   return (
     <div className="ts-picker" ref={box}>
@@ -503,8 +593,10 @@ function BucketPicker({
       </div>
       <div className="muted small pad">
         {rowKey === OTHER
-          ? "Used for all time that isn't on a ticket."
-          : `Remembered for ${rowKey} and other ${project} tickets. Monthly projects roll over automatically.`}
+          ? "Used for meetings and other time, and repositories you haven't chosen one for."
+          : repo
+            ? `Remembered for ${repo[1]} and other ${repo[0]} repositories. Monthly projects roll over automatically.`
+            : `Remembered for ${rowKey} and other ${project} tickets. Monthly projects roll over automatically.`}
       </div>
     </div>
   );

@@ -1,17 +1,30 @@
-//! The weekly timesheet: one row per Jira ticket (plus "Other work") per day, proposed from the Day
-//! view's estimates, rounded to 15 minutes, less anything already logged in Harvest for that ticket
-//! and day; you adjust it and submit to Harvest. Buckets (Harvest project + task) are remembered per
-//! ticket and per Jira project, and follow monthly buckets ("Project Hair September" → "… October").
+//! The weekly timesheet: one row per Jira ticket, per repository for work that isn't on a ticket,
+//! and "Meetings and other work", per day — proposed from the Day view's estimates, rounded to 15
+//! minutes, less anything already logged in Harvest for that ticket and day, with what was done
+//! (commit messages, PR titles, reviews); you adjust it and submit to Harvest. Buckets (Harvest
+//! project + task) are remembered per ticket and Jira project, or per repository and organisation,
+//! and follow monthly buckets ("Project Hair September" → "… October").
 
 use anyhow::Result;
+use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use crate::day::Group;
 use crate::harvest::Project;
 
-/// The row for time not on a ticket (meetings, reviews of others' PRs, unlinked work).
+/// The row for time that's neither on a ticket nor in a repository (meetings, time added by hand).
 pub const OTHER: &str = "__other";
+
+/// Rows for work that isn't on a ticket are per repository: "repo:acme/web".
+pub const REPO: &str = "repo:";
+
+/// "acme/web" → "acme".
+fn org(repo: &str) -> &str {
+    repo.split('/').next().unwrap_or(repo)
+}
 
 pub const MONTHS: [&str; 12] = [
     "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
@@ -50,11 +63,11 @@ pub struct Bucket {
     pub project_name: String,
     pub task_id: i64,
     pub task_name: String,
-    /// ticket | project | default | rollover — where it came from, for the UI.
+    /// ticket | project | repo | org | default | rollover — where it came from, for the UI.
     pub from: String,
 }
 
-/// Remembered buckets: "ticket:BILL-142", "project:BILL" and "default".
+/// Remembered buckets: "ticket:BILL-142", "project:BILL", "repo:acme/web", "org:acme" and "default".
 pub fn buckets(conn: &Connection) -> Result<HashMap<String, Bucket>> {
     let mut stmt = conn.prepare("SELECT scope, project_id, project_name, task_id, task_name FROM harvest_buckets")?;
     let rows = stmt
@@ -67,10 +80,13 @@ pub fn buckets(conn: &Connection) -> Result<HashMap<String, Bucket>> {
     Ok(rows)
 }
 
-/// Remember a bucket for a ticket and its Jira project (or the default, for `OTHER`).
+/// Remember a bucket for a ticket and its Jira project, a repository and its organisation, or the
+/// default (for `OTHER`).
 pub fn remember(conn: &Connection, row: &str, b: &Bucket, now: &str) -> Result<()> {
     let scopes: Vec<String> = if row == OTHER {
         vec!["default".into()]
+    } else if let Some(repo) = row.strip_prefix(REPO) {
+        vec![format!("repo:{repo}"), format!("org:{}", org(repo))]
     } else {
         let project = row.split('-').next().unwrap_or(row);
         vec![format!("ticket:{row}"), format!("project:{project}")]
@@ -86,15 +102,22 @@ pub fn remember(conn: &Connection, row: &str, b: &Bucket, now: &str) -> Result<(
     Ok(())
 }
 
-/// The bucket for a row on a day: the ticket's, else its Jira project's, else the default for
-/// `OTHER` — moved on to this month's bucket if it's a monthly one and that exists.
+/// The bucket for a row on a day: the ticket's, else its Jira project's; the repository's, else its
+/// organisation's, else the default; the default for `OTHER` — moved on to this month's bucket if
+/// it's a monthly one and that exists.
 pub fn bucket_for(row: &str, month: u32, remembered: &HashMap<String, Bucket>, projects: &[Project]) -> Option<Bucket> {
     let b = if row == OTHER {
-        remembered.get("default")?.clone()
+        remembered.get("default")
+    } else if let Some(repo) = row.strip_prefix(REPO) {
+        remembered
+            .get(&format!("repo:{repo}"))
+            .or_else(|| remembered.get(&format!("org:{}", org(repo))))
+            .or_else(|| remembered.get("default"))
     } else {
         let project = row.split('-').next().unwrap_or(row);
-        remembered.get(&format!("ticket:{row}")).or_else(|| remembered.get(&format!("project:{project}")))?.clone()
-    };
+        remembered.get(&format!("ticket:{row}")).or_else(|| remembered.get(&format!("project:{project}")))
+    }?
+    .clone();
     let Some(name) = for_month(&b.project_name, month) else { return Some(b) };
     let Some(p) = projects.iter().find(|p| p.name.eq_ignore_ascii_case(&name)) else { return Some(b) };
     let task = p.tasks.iter().find(|t| t.name.eq_ignore_ascii_case(&b.task_name)).or(p.tasks.first())?;
@@ -166,48 +189,168 @@ pub struct Cell {
     pub edited: bool,
     /// Harvest has exactly this.
     pub submitted: bool,
+    /// What was done that day (commit messages, PR titles, reviews), most time first.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Row {
-    /// The Jira key, or `OTHER`.
+    /// The Jira key, `REPO` + "owner/name", or `OTHER`.
     pub key: String,
     pub label: String,
     pub bucket: Option<Bucket>,
     pub cells: Vec<Cell>,
 }
 
-/// The Day view's estimate for one day: row → (label, minutes).
-pub type DayProposal = HashMap<String, (String, i64)>;
+/// One row's estimate for one day.
+#[derive(Debug, Clone, Default)]
+pub struct Proposal {
+    pub label: String,
+    pub minutes: i64,
+    /// What was done, most time first.
+    pub notes: Vec<String>,
+}
 
-/// A day report as proposals: ticket groups by key, everything else together as `OTHER`.
+/// The Day view's estimate for one day, by row.
+pub type DayProposal = HashMap<String, Proposal>;
+
+/// The repository a Day view group is in: "PR:acme/web#12", "B:acme/web:fix-nav", "R:acme/web".
+fn repo_of(key: &str) -> Option<&str> {
+    if let Some(r) = key.strip_prefix("PR:") {
+        return r.split('#').next();
+    }
+    key.strip_prefix("B:").and_then(|r| r.split(':').next()).or_else(|| key.strip_prefix("R:"))
+}
+
+/// Only reviewing or commenting on a PR, no work of your own on it.
+fn just_reviewing(g: &Group) -> bool {
+    !g.events.is_empty() && g.events.iter().all(|e| matches!(e.kind.as_str(), "reviewed" | "commented"))
+}
+
+/// "IO-2647 - Add a tool" → "Add a tool": the row already says IO-2647.
+fn strip_key<'a>(line: &'a str, key: &str) -> &'a str {
+    match line.get(..key.len()) {
+        Some(head) if head.eq_ignore_ascii_case(key) => line[key.len()..].trim_start_matches([' ', ':', '-', '–', '_', '/', '·']),
+        _ => line,
+    }
+}
+
+/// "Sync files from tools-template@b8173e230664" → "Sync files from tools-template", so a run of
+/// automated commits reads as one thing.
+static SHA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@[0-9a-f]{7,40}\b").unwrap());
+
+fn push_new(out: &mut Vec<String>, note: String) {
+    if !note.is_empty() && !out.contains(&note) {
+        out.push(note);
+    }
+}
+
+/// What a group says was done: its commit messages (first lines) and merged PRs, else what you did
+/// (opened, merged), its PR title, branch or meeting. A ticket's or repository's own name isn't
+/// news, so those add nothing.
+fn did(g: &Group, ticket: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in &g.events {
+        let line = e.text.lines().next().unwrap_or_default().trim();
+        match e.kind.as_str() {
+            "committed" | "local_commit" => push_new(&mut out, SHA.replace_all(ticket.map_or(line, |t| strip_key(line, t)), "").trim().to_string()),
+            "merged" => {
+                if let Some(n) = line.strip_prefix("Merge pull request #").and_then(|r| r.split_whitespace().next()) {
+                    push_new(&mut out, format!("Merged PR #{n}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    if let Some(rest) = g.key.strip_prefix("B:") {
+        out.extend(rest.split_once(':').map(|(_, branch)| branch.to_string()));
+    } else if g.key.starts_with("T:") || g.key.starts_with("R:") {
+        for e in &g.events {
+            match e.kind.as_str() {
+                "opened" => push_new(&mut out, "Opened a PR".into()),
+                "merged" => push_new(&mut out, "Merged a PR".into()),
+                _ => {}
+            }
+        }
+    } else {
+        out.push(g.label.clone());
+    }
+    out
+}
+
+/// A day report as proposals: a row per ticket, per repository for work that isn't on a ticket, and
+/// `OTHER` for the rest (meetings, time added by hand) — each with what was done.
 pub fn propose(report: &crate::day::DayReport) -> DayProposal {
     let mut out: DayProposal = HashMap::new();
+    // Reviews are counted: "Reviewed 12 PRs" reads better than twelve titles.
+    let mut reviews: HashMap<String, Vec<String>> = HashMap::new();
     for g in &report.groups {
         if g.minutes <= 0 {
             continue;
         }
-        match g.key.strip_prefix("T:") {
-            Some(key) => {
-                let label = g.label.trim_start_matches(key).trim_start_matches(" · ").trim().to_string();
-                out.insert(key.to_string(), (label, g.minutes));
-            }
-            None => {
-                let e = out.entry(OTHER.to_string()).or_insert_with(|| ("Meetings, reviews and other work".into(), 0));
-                e.1 += g.minutes;
+        let ticket = g.key.strip_prefix("T:");
+        let (row, label) = match (ticket, repo_of(&g.key)) {
+            (Some(key), _) => (key.to_string(), g.label.trim_start_matches(key).trim_start_matches(" · ").trim().to_string()),
+            (None, Some(repo)) => (format!("{REPO}{repo}"), repo.to_string()),
+            (None, None) => (OTHER.to_string(), "Meetings and other work".to_string()),
+        };
+        let p = out.entry(row.clone()).or_insert_with(|| Proposal { label, ..Default::default() });
+        p.minutes += g.minutes;
+        if just_reviewing(g) {
+            reviews.entry(row).or_default().push(if ticket.is_some() { String::new() } else { g.label.clone() });
+            continue;
+        }
+        for n in did(g, ticket) {
+            if !p.notes.contains(&n) {
+                p.notes.push(n);
             }
         }
     }
+    for (row, titles) in reviews {
+        let note = match titles.as_slice() {
+            [one] if !one.is_empty() => format!("Reviewed “{one}”"),
+            [_] => "Reviewed a PR".to_string(),
+            many => format!("Reviewed {} PRs", many.len()),
+        };
+        out.entry(row).or_default().notes.push(note);
+    }
+    // Likewise a run of merges: "Merged 12 PRs", where the first one was.
+    for p in out.values_mut() {
+        let merged = p.notes.iter().filter(|n| n.starts_with("Merged PR #")).count();
+        if merged > 2 {
+            let at = p.notes.iter().position(|n| n.starts_with("Merged PR #")).unwrap_or(0);
+            p.notes.retain(|n| !n.starts_with("Merged PR #"));
+            p.notes.insert(at.min(p.notes.len()), format!("Merged {merged} PRs"));
+        }
+    }
     out
+}
+
+/// Harvest's notes for a row's day: what the row is, then what was done.
+pub fn notes(row: &Row, cell: &Cell) -> String {
+    let what = match row.key.strip_prefix(REPO) {
+        Some(repo) => repo.rsplit('/').next().unwrap_or(repo).to_string(),
+        None if row.key == OTHER => String::new(),
+        None => format!("{} {}", row.key, row.label).trim().to_string(),
+    };
+    match (what.as_str(), cell.notes.join("; ").as_str()) {
+        ("", "") => row.label.clone(),
+        ("", done) => done.to_string(),
+        (what, "") => what.to_string(),
+        (what, done) => format!("{what} — {done}"),
+    }
 }
 
 /// A day's proposals in quarter hours that add up to the day's own total (rounded to 15 minutes):
 /// each row gets its whole quarters, and the spare quarters go to the rows closest to the next one.
 /// Rounding every row on its own made a day of many small things far longer than it was.
 pub fn quarters(day: &DayProposal) -> HashMap<String, i64> {
-    let target = round15(day.values().map(|(_, m)| *m).sum());
-    let mut rows: Vec<(&String, i64, i64)> = day.iter().map(|(k, (_, m))| (k, (m / 15) * 15, m % 15)).collect();
+    let target = round15(day.values().map(|p| p.minutes).sum());
+    let mut rows: Vec<(&String, i64, i64)> = day.iter().map(|(k, p)| (k, (p.minutes / 15) * 15, p.minutes % 15)).collect();
     let mut spare = (target - rows.iter().map(|r| r.1).sum::<i64>()) / 15;
     // Largest remainder first; ties to the bigger row, then by key so it's stable.
     rows.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(b.0)));
@@ -221,7 +364,8 @@ pub fn quarters(day: &DayProposal) -> HashMap<String, i64> {
     rows.into_iter().map(|(k, m, _)| (k.clone(), m)).collect()
 }
 
-/// The week: rows for every ticket with time (proposed, entered or logged), each with a cell per day.
+/// The week: rows for every ticket or repository with time (proposed, entered or logged), each with
+/// a cell per day — most time first, "Meetings and other work" last.
 pub fn week(
     days: &[String],
     proposals: &HashMap<String, DayProposal>,
@@ -233,8 +377,8 @@ pub fn week(
     let mut keys: Vec<String> = Vec::new();
     let mut labels: HashMap<String, String> = HashMap::new();
     for d in days {
-        for (k, (label, _)) in proposals.get(d).into_iter().flatten() {
-            labels.entry(k.clone()).or_insert_with(|| label.clone());
+        for (k, p) in proposals.get(d).into_iter().flatten() {
+            labels.entry(k.clone()).or_insert_with(|| p.label.clone());
             if !keys.contains(k) {
                 keys.push(k.clone());
             }
@@ -245,10 +389,9 @@ pub fn week(
             keys.push(k.clone());
         }
     }
-    // Tickets alphabetically, "Other work" last.
-    keys.sort_by(|a, b| (a == OTHER).cmp(&(b == OTHER)).then(a.cmp(b)));
     let rounded: HashMap<&String, HashMap<String, i64>> = proposals.iter().map(|(d, p)| (d, quarters(p))).collect();
-    keys.into_iter()
+    let mut rows: Vec<Row> = keys
+        .into_iter()
         .map(|key| {
             let cells: Vec<Cell> = days
                 .iter()
@@ -259,7 +402,8 @@ pub fn week(
                     let minutes = s.minutes.unwrap_or_else(|| (proposed - logged).max(0));
                     let submitted = s.harvest_id.is_some() && s.submitted_minutes == Some(minutes)
                         || s.harvest_id.is_none() && minutes == 0;
-                    Cell { day: d.clone(), proposed, logged, minutes, edited: s.minutes.is_some(), submitted }
+                    let notes = proposals.get(d).and_then(|p| p.get(&key)).map(|p| p.notes.clone()).unwrap_or_default();
+                    Cell { day: d.clone(), proposed, logged, minutes, edited: s.minutes.is_some(), submitted, notes }
                 })
                 .collect();
             let label = titles.get(&key).cloned().or_else(|| labels.get(&key).cloned()).unwrap_or_default();
@@ -268,7 +412,10 @@ pub fn week(
         })
         // A few minutes that rounded to nothing all week isn't worth a row.
         .filter(|r| r.cells.iter().any(|c| c.minutes > 0 || c.proposed > 0 || c.logged > 0 || c.edited))
-        .collect()
+        .collect();
+    let total = |r: &Row| r.cells.iter().map(|c| c.minutes).sum::<i64>();
+    rows.sort_by(|a, b| (a.key == OTHER).cmp(&(b.key == OTHER)).then(total(b).cmp(&total(a))).then(a.key.cmp(&b.key)));
+    rows
 }
 
 pub fn stored_row(conn: &Connection, day: &str, row: &str) -> Result<Option<Stored>> {
@@ -284,11 +431,128 @@ pub fn stored_row(conn: &Connection, day: &str, row: &str) -> Result<Option<Stor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::day::{DayReport, EventOut};
     use crate::harvest::Task;
+
+    fn prop(label: &str, minutes: i64) -> Proposal {
+        Proposal { label: label.into(), minutes, notes: Vec::new() }
+    }
+
+    fn group(key: &str, label: &str, minutes: i64, events: &[(&str, &str)]) -> Group {
+        Group {
+            key: key.into(),
+            label: label.into(),
+            url: None,
+            status: None,
+            minutes,
+            events: events
+                .iter()
+                .map(|(kind, text)| EventOut {
+                    at: String::new(),
+                    kind: kind.to_string(),
+                    text: text.to_string(),
+                    url: None,
+                    repo: String::new(),
+                    branch: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Work that isn't on a ticket is split by repository and says what was done.
+    #[test]
+    fn proposals_say_what_was_done() {
+        let report = DayReport {
+            day: "2026-10-16".into(),
+            frozen: false,
+            total_minutes: 0,
+            blocks: Vec::new(),
+            groups: vec![
+                group("T:IO-2647", "IO-2647 · Add an MCP tool", 89, &[("committed", "IO-2647 - Resolve contacts by domain\n\nBody"), ("pushed", "Pushed")]),
+                group(
+                    "R:acme/app",
+                    "acme/app",
+                    128,
+                    &[
+                        ("local_commit", "Fix the launch screen"),
+                        ("merged", "Merge pull request #12 from acme/fix-nav"),
+                        ("committed", "Sync files from acme/template@b8173e230664"),
+                        ("committed", "Sync files from acme/template@ea96e54b9a37"),
+                    ],
+                ),
+                group("T:ES-636", "ES-636 · Upgrade core", 14, &[("opened", "Opened"), ("pushed", "Pushed to core-10-6"), ("merged", "Merged")]),
+                group("B:acme/app:drop-dev", "app · drop-dev", 20, &[("local_commit", "")]),
+                group("PR:acme/app#605", "Test-user back door", 10, &[("reviewed", "Approved the PR")]),
+                group("PR:acme/app#560", "Deep-link corpus", 7, &[("reviewed", "Approved the PR"), ("commented", "Commented")]),
+                group(
+                    "PR:acme/tools#87",
+                    "Label each deploy",
+                    11,
+                    &[
+                        ("opened", "Opened"),
+                        ("merged", "Merge pull request #3 from acme/a"),
+                        ("merged", "Merge pull request #4 from acme/b"),
+                        ("merged", "Merge pull request #5 from acme/c"),
+                    ],
+                ),
+                group("MTG:m1", "Planning", 14, &[("meeting", "Recorded meeting (14m)")]),
+            ],
+            ticket_moves: Vec::new(),
+            meetings: Vec::new(),
+        };
+        let p = propose(&report);
+        let keys: std::collections::BTreeSet<&str> = p.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["ES-636", "IO-2647", OTHER, "repo:acme/app", "repo:acme/tools"].into(), "a row per repo, meetings in other");
+        assert_eq!(p["IO-2647"].notes, ["Resolve contacts by domain"], "first line, without the key");
+        assert_eq!(p["ES-636"].notes, ["Opened a PR", "Merged a PR"], "no commits: what you did");
+        let app = &p["repo:acme/app"];
+        assert_eq!(app.minutes, 128 + 20 + 10 + 7);
+        assert_eq!(
+            app.notes,
+            ["Fix the launch screen", "Merged PR #12", "Sync files from acme/template", "drop-dev", "Reviewed 2 PRs"],
+            "commit SHAs dropped so repeats read once; reviews counted"
+        );
+        assert_eq!(p["repo:acme/tools"].notes, ["Merged 3 PRs"], "a run of merges is counted");
+        assert_eq!((p[OTHER].label.as_str(), p[OTHER].notes.as_slice()), ("Meetings and other work", ["Planning".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn harvest_notes() {
+        let cell = |notes: &[&str]| Cell {
+            day: "2026-10-16".into(),
+            proposed: 0,
+            logged: 0,
+            minutes: 60,
+            edited: false,
+            submitted: false,
+            notes: notes.iter().map(|n| n.to_string()).collect(),
+        };
+        let row = |key: &str, label: &str| Row { key: key.into(), label: label.into(), bucket: None, cells: Vec::new() };
+        assert_eq!(notes(&row("repo:acme/app", "acme/app"), &cell(&["Fix nav", "Reviewed 2 PRs"])), "app — Fix nav; Reviewed 2 PRs");
+        assert_eq!(notes(&row("IO-1", "Search"), &cell(&["Add index"])), "IO-1 Search — Add index", "the key stays first for Jira links");
+        assert_eq!(notes(&row("IO-1", "Search"), &cell(&[])), "IO-1 Search");
+        assert_eq!(notes(&row(OTHER, "Meetings and other work"), &cell(&[])), "Meetings and other work");
+        assert_eq!(notes(&row(OTHER, "Meetings and other work"), &cell(&["Planning"])), "Planning");
+    }
+
+    #[test]
+    fn repo_buckets_fall_back_to_their_org_then_the_default() {
+        let b = |id: i64, from: &str| Bucket { project_id: id, project_name: format!("P{id}"), task_id: 1, task_name: "Dev".into(), from: from.into() };
+        let mut remembered = HashMap::from([("default".to_string(), b(1, "default"))]);
+        assert_eq!(bucket_for("repo:acme/app", 10, &remembered, &[]).unwrap().from, "default");
+        remembered.insert("org:acme".into(), b(2, "org"));
+        assert_eq!(bucket_for("repo:acme/app", 10, &remembered, &[]).unwrap().project_id, 2, "any acme repo");
+        remembered.insert("repo:acme/app".into(), b(3, "repo"));
+        assert_eq!(bucket_for("repo:acme/app", 10, &remembered, &[]).unwrap().project_id, 3);
+        assert_eq!(bucket_for("repo:other/x", 10, &remembered, &[]).unwrap().project_id, 1);
+        assert!(bucket_for("IO-1", 10, &remembered, &[]).is_none(), "tickets don't take the default");
+    }
 
     #[test]
     fn a_day_rounds_as_a_whole() {
-        let p = |rows: &[(&str, i64)]| -> DayProposal { rows.iter().map(|(k, m)| (k.to_string(), (String::new(), *m))).collect() };
+        let p = |rows: &[(&str, i64)]| -> DayProposal {
+            rows.iter().map(|(k, m)| (k.to_string(), Proposal { minutes: *m, ..Default::default() })).collect()
+        };
         // Six 10-minute things are an hour, not an hour and a half.
         let q = quarters(&p(&[("A-1", 10), ("A-2", 10), ("A-3", 10), ("A-4", 10), ("A-5", 10), ("A-6", 10)]));
         assert_eq!(q.values().sum::<i64>(), 60);
@@ -310,7 +574,7 @@ mod tests {
         let conn = crate::db::open(&dir.join("t.sqlite3")).unwrap();
         let days = vec!["2026-10-12".to_string()];
         let mut proposals = HashMap::new();
-        proposals.insert(days[0].clone(), HashMap::from([("HAIR-1".to_string(), ("Fix".to_string(), 50))]));
+        proposals.insert(days[0].clone(), HashMap::from([("HAIR-1".to_string(), prop("Fix", 50))]));
         let none = |_: &str, _: &str| None;
         let cell = |conn: &Connection| {
             let stored = stored(conn, "2026-10-12", "2026-10-12").unwrap();
@@ -377,7 +641,7 @@ mod tests {
         let mut proposals = HashMap::new();
         proposals.insert(
             "2026-10-12".to_string(),
-            HashMap::from([("HAIR-12".to_string(), ("Fix the header".to_string(), 128)), (OTHER.to_string(), ("Other".to_string(), 20))]),
+            HashMap::from([("HAIR-12".to_string(), prop("Fix the header", 128)), (OTHER.to_string(), prop("Other", 20))]),
         );
         let logged = HashMap::from([(("2026-10-12".to_string(), "HAIR-12".to_string()), 60)]);
         let mut stored = HashMap::new();
