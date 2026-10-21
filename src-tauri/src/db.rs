@@ -386,6 +386,37 @@ fn migrate(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 16 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            -- Events from the Mac's calendars (read-only copy, refreshed in a rolling window).
+            CREATE TABLE IF NOT EXISTS calendar_events (
+                uid TEXT PRIMARY KEY,          -- event id @ start (one row per occurrence)
+                calendar_id TEXT NOT NULL,
+                calendar TEXT NOT NULL,
+                title TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                all_day INTEGER NOT NULL,
+                location TEXT,
+                notes TEXT,
+                video_url TEXT,
+                attendees INTEGER NOT NULL,
+                attendee_names TEXT,           -- JSON list
+                organiser TEXT,
+                my_status TEXT NOT NULL,       -- accepted | declined | tentative | pending | organiser | none
+                free INTEGER NOT NULL,
+                reminded_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS calendar_events_start ON calendar_events (start_at);
+            -- Anyone already signed in has been using the app: no first-run setup for them.
+            INSERT OR IGNORE INTO settings (key, value) SELECT 'setup_done', '1' FROM settings WHERE key = 'login';
+            PRAGMA user_version = 16;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -997,7 +1028,7 @@ pub fn is_repo_hidden(conn: &Connection, repo: &str) -> Result<bool> {
 /// Wipes all mirrored and personal data (used on sign-out).
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries; DELETE FROM intent_queue; DELETE FROM harvest_buckets; DELETE FROM timesheet_rows;",
+        "DELETE FROM prs; DELETE FROM personal; DELETE FROM activity; DELETE FROM settings; DELETE FROM hidden_repos; DELETE FROM seen; DELETE FROM unfollowed; DELETE FROM work_samples; DELETE FROM time_blocks; DELETE FROM frozen_days; DELETE FROM jira_issues; DELETE FROM jira_events; DELETE FROM meetings; DELETE FROM meeting_segments; DELETE FROM meeting_actions; DELETE FROM meeting_speakers; DELETE FROM meeting_search; DELETE FROM meeting_voices; DELETE FROM known_voices; DELETE FROM ai_summaries; DELETE FROM intent_queue; DELETE FROM harvest_buckets; DELETE FROM timesheet_rows; DELETE FROM calendar_events;",
     )?;
     Ok(())
 }

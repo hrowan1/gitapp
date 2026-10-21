@@ -387,6 +387,41 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
     };
     crate::summary::save(conn, "demo-proration", &notes, crate::summary::DEFAULT_CLAUDE_MODEL)?;
 
+    // A pretend calendar: this morning's standup, a ticket meeting this afternoon (with a call link),
+    // and planning tomorrow.
+    let local = |days: i64, h: u32, m: u32| {
+        use chrono::TimeZone;
+        let d = chrono::Local::now().date_naive() + Duration::days(days);
+        fmt_ts(chrono::Local.from_local_datetime(&d.and_hms_opt(h, m, 0).unwrap()).earliest().unwrap().to_utc())
+    };
+    let event = |uid: &str, title: &str, start: String, end: String, video: bool, names: &[&str]| crate::calendar::Event {
+        uid: uid.into(),
+        calendar_id: "demo-work".into(),
+        calendar: "Work".into(),
+        title: title.into(),
+        start,
+        end,
+        all_day: false,
+        location: String::new(),
+        notes: String::new(),
+        video_url: video.then(|| "https://meet.google.com/abc-defg-hij".to_string()),
+        attendees: names.len() as i64,
+        attendee_names: names.iter().map(|n| n.to_string()).collect(),
+        organiser: Some("Sam".into()),
+        my_status: "accepted".into(),
+        free: false,
+    };
+    let events = vec![
+        event("demo-standup", "Standup", local(0, 9, 30), local(0, 9, 45), true, &["Sam", "Priya", "James", "Mike"]),
+        event("demo-bill", "BILL-142 proration sync", local(0, 15, 0), local(0, 15, 30), true, &["Priya", "Sam"]),
+        event("demo-lunch", "Lunch", local(0, 12, 30), local(0, 13, 15), false, &[]),
+        event("demo-planning", "Sprint planning", local(1, 10, 0), local(1, 11, 0), true, &["Sam", "Priya", "James", "Mike", "Lena"]),
+    ];
+    crate::calendar::store(conn, &local(-1, 0, 0), &local(3, 0, 0), &events)?;
+    db::set_setting(conn, "calendar_enabled", "1")?;
+    db::set_setting(conn, "calendar_last_sync", &fmt_ts(Utc::now()))?;
+    db::set_setting(conn, "setup_done", "1")?;
+
     // A pretend Harvest account: Esprit's monthly bucket was chosen last month, so it rolls over.
     db::set_setting(conn, "harvest_account_id", "000000")?;
     db::set_setting(conn, "harvest_user_id", "1")?;
@@ -406,6 +441,14 @@ fn seed_work_day(conn: &Connection) -> Result<()> {
     db::set_setting(conn, "jira_name", "You")?;
     db::set_setting(conn, "jira_last_sync", &fmt_ts(Utc::now()))?;
     Ok(())
+}
+
+/// The demo's calendars.
+pub fn calendars() -> Vec<crate::calendar::Calendar> {
+    vec![
+        crate::calendar::Calendar { id: "demo-work".into(), title: "Work".into(), source: "Google".into(), color: "#3b82f6".into() },
+        crate::calendar::Calendar { id: "demo-home".into(), title: "Home".into(), source: "iCloud".into(), color: "#22c55e".into() },
+    ]
 }
 
 /// The demo's Harvest projects (this month's and last month's monthly ones, plus fixed ones).

@@ -12,9 +12,10 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
 use objc2::{define_class, msg_send, AllocAnyThread};
-use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSArray, NSBundle, NSError, NSObject, NSObjectProtocol, NSSet, NSString};
 use objc2_user_notifications::{
-    UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent, UNNotification,
+    UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent, UNNotification, UNNotificationAction,
+    UNNotificationActionOptions, UNNotificationCategory, UNNotificationCategoryOptions, UNNotificationDefaultActionIdentifier,
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse, UNNotificationSettings,
     UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
@@ -23,7 +24,14 @@ use std::sync::OnceLock;
 /// Separates the parts of a notification's identifier: id, link, item id.
 const SEP: &str = "\u{1f}";
 
-type OnClick = Box<dyn Fn(Option<String>, Option<String>) + Send + Sync>;
+/// (link, item id, button): the button is None for a click on the notification itself.
+type OnClick = Box<dyn Fn(Option<String>, Option<String>, Option<String>) + Send + Sync>;
+
+/// A meeting about to start: buttons to record it, and to join the call when it has a link.
+pub const MEETING: &str = "meeting";
+pub const MEETING_WITH_CALL: &str = "meeting-call";
+pub const RECORD: &str = "record";
+pub const JOIN: &str = "join";
 static ON_CLICK: OnceLock<OnClick> = OnceLock::new();
 
 define_class!(
@@ -58,8 +66,10 @@ define_class!(
             let id = response.notification().request().identifier().to_string();
             let mut parts = id.split(SEP).skip(1).map(|s| (!s.is_empty()).then(|| s.to_string()));
             let (url, item) = (parts.next().flatten(), parts.next().flatten());
+            let action = response.actionIdentifier();
+            let action = (!action.isEqualToString(unsafe { UNNotificationDefaultActionIdentifier })).then(|| action.to_string());
             if let Some(on_click) = ON_CLICK.get() {
-                on_click(url, item);
+                on_click(url, item, action);
             }
             handler.call(());
         }
@@ -79,7 +89,7 @@ pub fn bundled() -> bool {
 }
 
 /// Set up: the click handler and, in the built app, the delegate and the permission prompt (once).
-pub fn init(on_click: impl Fn(Option<String>, Option<String>) + Send + Sync + 'static) {
+pub fn init(on_click: impl Fn(Option<String>, Option<String>, Option<String>) + Send + Sync + 'static) {
     let _ = ON_CLICK.set(Box::new(on_click));
     if !bundled() {
         return;
@@ -89,6 +99,26 @@ pub fn init(on_click: impl Fn(Option<String>, Option<String>) + Send + Sync + 's
     center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     // The centre only holds the delegate weakly: keep it for the life of the app.
     std::mem::forget(delegate);
+    let action = |id: &str, title: &str| {
+        UNNotificationAction::actionWithIdentifier_title_options(
+            &NSString::from_str(id),
+            &NSString::from_str(title),
+            UNNotificationActionOptions::Foreground,
+        )
+    };
+    let category = |id: &str, actions: &[Retained<UNNotificationAction>]| {
+        UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+            &NSString::from_str(id),
+            &NSArray::from_retained_slice(actions),
+            &NSArray::new(),
+            UNNotificationCategoryOptions::empty(),
+        )
+    };
+    let categories = NSSet::from_retained_slice(&[
+        category(MEETING, &[action(RECORD, "Record")]),
+        category(MEETING_WITH_CALL, &[action(JOIN, "Join call"), action(RECORD, "Record")]),
+    ]);
+    center.setNotificationCategories(&categories);
     let done = RcBlock::new(|granted: Bool, _error: *mut NSError| {
         if !granted.as_bool() {
             eprintln!("notifications: not allowed (System Settings → Notifications → Dev Inbox)");
@@ -130,6 +160,12 @@ pub fn route() -> Route {
 
 /// Show a notification. `url` opens on click; `item` is the app's id for it (marked seen on click).
 pub fn send(title: &str, subtitle: &str, body: &str, url: Option<&str>, item: Option<&str>) {
+    send_in(title, subtitle, body, url, item, None);
+}
+
+/// Like `send`, with a category's buttons (MEETING, MEETING_WITH_CALL). In `tauri dev` there are no
+/// buttons: the notification is sent plain.
+pub fn send_in(title: &str, subtitle: &str, body: &str, url: Option<&str>, item: Option<&str>, category: Option<&str>) {
     if !bundled() {
         dev_notify(title, subtitle, body);
         return;
@@ -141,6 +177,9 @@ pub fn send(title: &str, subtitle: &str, body: &str, url: Option<&str>, item: Op
     }
     content.setBody(&NSString::from_str(body));
     content.setSound(Some(&UNNotificationSound::defaultSound()));
+    if let Some(category) = category {
+        content.setCategoryIdentifier(&NSString::from_str(category));
+    }
     let unique = format!("{:?}", std::time::SystemTime::now());
     let id = [unique.as_str(), url.unwrap_or(""), item.unwrap_or("")].join(SEP);
     let request = UNNotificationRequest::requestWithIdentifier_content_trigger(&NSString::from_str(&id), &content, None);

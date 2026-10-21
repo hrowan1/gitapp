@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
 import {
   api,
   type Meeting,
   type MeetingAction,
+  type MeetingBrief,
   type MeetingSearchResult,
   type MeetingSummary,
   type RecordingStatus,
@@ -44,8 +46,9 @@ export function MeetingsView({
 }: {
   version: number;
   recording: RecordingStatus;
-  /** Open this meeting (e.g. clicked in the Day view), or search for something (from ⌘K). */
-  target?: { id?: string; query?: string; at?: number | null } | null;
+  /** Open this meeting (e.g. clicked in the Day view), search for something (from ⌘K), or show a
+   *  calendar meeting's brief (from its reminder). */
+  target?: { id?: string; query?: string; at?: number | null; brief?: string } | null;
   onOpenDay: (day: string) => void;
 }) {
   const [meetings, setMeetings] = useState<Meeting[] | null>(null);
@@ -55,6 +58,24 @@ export function MeetingsView({
   const [levels, setLevels] = useState({ mic: 0, system: 0, seconds: 0 });
   const [warnings, setWarnings] = useState<string[]>([]);
   const [captions, setCaptions] = useState<Captions>(NO_CAPTIONS);
+  // Calendar meetings coming up, and the one whose brief is open.
+  const [upcoming, setUpcoming] = useState<MeetingBrief[]>([]);
+  const [brief, setBrief] = useState<MeetingBrief | null>(null);
+  useEffect(() => {
+    const load = () => api.calendarUpcoming().then(setUpcoming).catch(() => {});
+    load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, [version]);
+  const openBrief = (b: MeetingBrief) => {
+    setSelected(null);
+    setBrief(b);
+  };
+  useEffect(() => {
+    if (!target?.brief) return;
+    api.calendarBrief(target.brief).then((b) => b && openBrief(b), (e) => toast(String(e), true));
+  }, [target]);
+
   useEffect(() => {
     if (target?.id) setSelected(target.id);
     if (target?.at != null) setJump({ at: target.at, n: Date.now() });
@@ -135,9 +156,10 @@ export function MeetingsView({
   };
 
   const meeting = meetings?.find((m) => m.id === selected) ?? null;
+  const shownBrief = meeting ? null : brief;
 
   return (
-    <div className={`workspace${meeting ? " has-selection" : ""}`}>
+    <div className={`workspace${meeting || shownBrief ? " has-selection" : ""}`}>
       <section className="pane-list">
         <div className="pane-header">
           <div className="headline compact">
@@ -209,6 +231,58 @@ export function MeetingsView({
 
         <div className="pane-scroll">
           {results && <SearchResults results={results} selected={selected} onOpen={openHit} />}
+          {!results && upcoming.length > 0 && (
+            <>
+              <div className="section-head static">
+                <span className="section-title">Up next</span>
+                <span className="count">{upcoming.length}</span>
+              </div>
+              {upcoming.map((b) => (
+                <div
+                  key={b.event.uid}
+                  className={`row${shownBrief?.event.uid === b.event.uid ? " selected" : ""}`}
+                  role="button"
+                  onClick={() => openBrief(b)}
+                >
+                  <span className="state-icon tone-blue">
+                    <Icon name="calendar" size={14} />
+                  </span>
+                  <div className="row-main">
+                    <div className="row-title">
+                      {b.ticket && !b.event.title.toUpperCase().includes(b.ticket.key) && (
+                        <span className="ticket-key">{b.ticket.key}</span>
+                      )}
+                      <span className="title">{b.event.title || "Untitled meeting"}</span>
+                    </div>
+                    <div className="row-sub">
+                      <span>
+                        {friendlyDate(b.event.start)} {clock(b.event.start)}
+                      </span>
+                      {fromNow(b.event.start, b.event.end) && (
+                        <>
+                          <span className="sep">·</span>
+                          <span>{fromNow(b.event.start, b.event.end)}</span>
+                        </>
+                      )}
+                      {b.openActions.length > 0 && (
+                        <>
+                          <span className="sep">·</span>
+                          <span className="reason">
+                            {b.openActions.length} open from last time
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {meetings && meetings.length > 0 && (
+                <div className="section-head static">
+                  <span className="section-title">Recorded</span>
+                </div>
+              )}
+            </>
+          )}
           {!results && meetings?.length === 0 && (
             <div className="empty">No meetings yet. Press Record when one starts — your mic and the call's audio are saved.</div>
           )}
@@ -217,7 +291,10 @@ export function MeetingsView({
               key={m.id}
               className={`row${selected === m.id ? " selected" : ""}`}
               role="button"
-              onClick={() => setSelected(m.id)}
+              onClick={() => {
+                setBrief(null);
+                setSelected(m.id);
+              }}
             >
               <span className={`state-icon tone-${m.status === "failed" ? "red" : m.status === "done" ? "violet" : "yellow"}`}>
                 <Icon name={m.status === "recording" ? "mic" : m.status === "transcribing" ? "loader" : m.status === "failed" ? "alert" : "message"} size={14} />
@@ -263,6 +340,17 @@ export function MeetingsView({
           onClose={() => setSelected(null)}
           onOpenDay={onOpenDay}
         />
+      ) : shownBrief ? (
+        <BriefPane
+          key={shownBrief.event.uid}
+          brief={shownBrief}
+          recording={recording.recording}
+          onClose={() => setBrief(null)}
+          onOpenMeeting={(id) => {
+            setBrief(null);
+            setSelected(id);
+          }}
+        />
       ) : (
         <aside className="detail empty-detail">
           <div className="empty-art">
@@ -275,6 +363,146 @@ export function MeetingsView({
         </aside>
       )}
     </div>
+  );
+}
+
+/** "in 2h 5m", "now", "started 5m ago"; nothing more than 12 hours ahead (the date says enough). */
+function fromNow(start: string, end: string): string | null {
+  const now = Date.now();
+  const s = new Date(start).getTime();
+  const e = new Date(end).getTime();
+  const span = (ms: number) => {
+    const m = Math.round(ms / 60_000);
+    return m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ""}` : `${m}m`;
+  };
+  if (s - now > 12 * 3_600_000) return null;
+  if (s - now > 60_000) return `in ${span(s - now)}`;
+  if (now < e) return now - s < 60_000 ? "now" : `started ${span(now - s)} ago`;
+  return "ended";
+}
+
+/** Before a calendar meeting: its ticket and that ticket's open PRs, how the last one went, and Record. */
+function BriefPane({
+  brief,
+  recording,
+  onClose,
+  onOpenMeeting,
+}: {
+  brief: MeetingBrief;
+  recording: boolean;
+  onClose: () => void;
+  onOpenMeeting: (id: string) => void;
+}) {
+  const e = brief.event;
+  const [busy, setBusy] = useState(false);
+  const names = e.attendeeNames;
+  const with_ =
+    names.length === 0
+      ? null
+      : names.length <= 3
+        ? names.join(", ")
+        : `${names.slice(0, 3).join(", ")} and ${names.length - 3} more`;
+  const record = async () => {
+    setBusy(true);
+    try {
+      await api.calendarRecord(e.uid);
+      toast(`Recording “${e.title}”`);
+    } catch (err) {
+      toast(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <aside className="detail">
+      <button className="detail-close ghost" onClick={onClose} title="Close">
+        <Icon name="x" />
+      </button>
+      <div className="detail-body">
+        <div className="detail-meta">
+          <Icon name="calendar" size={14} />
+          <span>
+            {friendlyDate(e.start)} {clock(e.start)}–{clock(e.end)}
+          </span>
+          {fromNow(e.start, e.end) && (
+            <>
+              <span className="sep">·</span>
+              <span>{fromNow(e.start, e.end)}</span>
+            </>
+          )}
+          <span className="sep">·</span>
+          <span>{e.calendar}</span>
+        </div>
+        <h2 className="brief-title">{e.title || "Untitled meeting"}</h2>
+        {with_ && <p className="muted small">With {with_}</p>}
+        <div className="actions brief-buttons">
+          <button className="primary" disabled={busy || recording} onClick={record} title={recording ? "Already recording" : ""}>
+            <Icon name="mic" size={14} /> Record
+          </button>
+          {e.videoUrl && <button onClick={() => openUrl(e.videoUrl!)}>Join call</button>}
+        </div>
+
+        {brief.ticket && (
+          <section className="brief-section">
+            <h3>Ticket</h3>
+            <div
+              className="brief-ticket"
+              role="button"
+              onClick={() => brief.ticket?.url && openUrl(brief.ticket.url)}
+              title="Open in Jira"
+            >
+              <span className="ticket-key">{brief.ticket.key}</span>
+              <span className="grow">{brief.ticket.summary ?? "Not one of your Jira tickets"}</span>
+              {brief.ticket.status && <span className="pill">{brief.ticket.status}</span>}
+            </div>
+            {brief.ticket.prs.map((p) => (
+              <div key={p.id} className="brief-pr" role="button" onClick={() => openUrl(p.url)}>
+                <Icon name="pr" size={13} />
+                <span className="grow">{p.title}</span>
+                <span className="muted small">
+                  {p.repo.split("/").pop()}#{p.number}
+                </span>
+              </div>
+            ))}
+          </section>
+        )}
+
+        {brief.last && (
+          <section className="brief-section">
+            <h3>
+              Last time · {friendlyDate(brief.last.startedAt)}{" "}
+              <button className="link small" onClick={() => onOpenMeeting(brief.last!.id)}>
+                open notes
+              </button>
+            </h3>
+            {brief.last.summary?.overview && <p className="small">{brief.last.summary.overview}</p>}
+            {brief.openActions.length > 0 && (
+              <ul className="brief-actions">
+                {brief.openActions.map((a) => (
+                  <li key={a.id}>
+                    <span className="muted small">{OWNER[a.owner] ?? a.owner}:</span> {a.text}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )}
+
+        {!brief.ticket && !brief.last && (
+          <p className="muted small">
+            Nothing to brief yet. Put a ticket key in the event's title (“BILL-142 sync”) to bring in the ticket and its
+            PRs; once you record one, next time shows its notes and open action items.
+          </p>
+        )}
+
+        {e.notes.trim() && (
+          <details className="brief-notes">
+            <summary className="small">Invite notes</summary>
+            <p className="small">{e.notes}</p>
+          </details>
+        )}
+      </div>
+    </aside>
   );
 }
 

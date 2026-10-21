@@ -32,6 +32,7 @@ const EVENT_ICON: Record<string, IconName> = {
   edit: "pencil",
   jira: "ticket",
   meeting: "mic",
+  calendar: "calendar",
 };
 
 const MOVE_ICON: Record<string, IconName> = {

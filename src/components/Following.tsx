@@ -5,7 +5,7 @@ import { StateIcon } from "./StateIcon";
 import { toast } from "../lib/toast";
 
 /** Choose exactly which PRs, issues and branches you listen to. Everything is followed by default. */
-export function Following({ version }: { version: number }) {
+export function Following({ version, embedded }: { version: number; embedded?: boolean }) {
   const [rows, setRows] = useState<FollowItem[] | null>(null);
   const [text, setText] = useState("");
   const [kind, setKind] = useState<"" | Kind>("");
@@ -57,7 +57,7 @@ export function Following({ version }: { version: number }) {
   const following = rows?.filter((r) => r.followed).length ?? 0;
 
   return (
-    <div className="page following">
+    <div className={embedded ? "following embedded" : "page following"}>
       <div className="headline compact">
         <h1>
           Following {following} of {total}

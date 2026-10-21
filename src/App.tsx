@@ -3,11 +3,12 @@ import { listen } from "@tauri-apps/api/event";
 import { api, type Inbox, type Session } from "./lib/api";
 import { groupItems } from "./lib/states";
 import { CommandPalette, type View } from "./components/CommandPalette";
-import { NAV, Sidebar } from "./components/Sidebar";
+import { NAV, NAV_GROUP, Sidebar } from "./components/Sidebar";
 import { Shortcuts } from "./components/Shortcuts";
 import { Icon } from "./components/Icon";
-import { AllPrs, History, SettingsView, SignIn, Today } from "./components/Views";
-import { Following } from "./components/Following";
+import { AllPrs, History, SignIn, Today } from "./components/Views";
+import { SettingsView, type SettingsSection } from "./components/Settings";
+import { Setup } from "./components/Setup";
 import { setAllItems } from "./lib/store";
 import { onToast, type Toast } from "./lib/toast";
 import { onDialog, type DialogRequest } from "./lib/dialog";
@@ -22,8 +23,13 @@ import "./styles.css";
 
 export default function App() {
   const [session, setSession] = useState<Session | null | undefined>(undefined);
+  /** First-run setup, shown after signing in (and from Settings → General). */
+  const [setup, setSetup] = useState(false);
   const [inbox, setInbox] = useState<Inbox | null>(null);
   const [view, setView] = useState<View>("today");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  /** The Time tab you were last on, so the sidebar's Time goes back to it. */
+  const [timeTab, setTimeTab] = useState<View>("day");
   const [palette, setPalette] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -34,7 +40,13 @@ export default function App() {
   /** A date to show in the Day view (e.g. from a ticket's history). */
   const [dayTarget, setDayTarget] = useState<{ day: string } | null>(null);
   const [ticketTarget, setTicketTarget] = useState<{ key: string } | null>(null);
-  const [meetingTarget, setMeetingTarget] = useState<{ id?: string; query?: string; at?: number | null } | null>(null);
+  const [meetingTarget, setMeetingTarget] = useState<{
+    id?: string;
+    query?: string;
+    at?: number | null;
+    /** A calendar meeting's brief. */
+    brief?: string;
+  } | null>(null);
   /** A PR or issue to open in Today (from a notification or the menu bar panel). */
   const [itemTarget, setItemTarget] = useState<{ id: string; n: number } | null>(null);
   /** A question being asked about your history (⌘K → Ask). */
@@ -52,11 +64,20 @@ export default function App() {
     setView("tickets");
   }, []);
   // Navigating yourself (sidebar, keys, ⌘K) starts each view fresh rather than at the last jump target.
-  const go = useCallback((v: View) => {
+  // Also takes "settings:<section>"; "following" is a section of Settings now.
+  const go = useCallback((to: View | string) => {
     setDayTarget(null);
     setTicketTarget(null);
     setMeetingTarget(null);
     setItemTarget(null);
+    const [v, section] = to.split(":") as [View, SettingsSection | undefined];
+    if (v === "following") {
+      setSettingsSection("following");
+      setView("settings");
+      return;
+    }
+    if (v === "settings" && section) setSettingsSection(section);
+    if (v === "day" || v === "timesheet" || v === "history") setTimeTab(v);
     setView(v);
   }, []);
   const [recording, setRecording] = useState<RecordingStatus>({ recording: false });
@@ -92,6 +113,9 @@ export default function App() {
   useEffect(() => {
     api.getSession().then(setSession);
   }, []);
+  useEffect(() => {
+    if (session) api.setupNeeded().then(setSetup).catch(() => {});
+  }, [session]);
 
   useEffect(() => {
     if (!session) return;
@@ -102,9 +126,14 @@ export default function App() {
       listen("open-palette", () => setPalette(true)),
       listen("jira-updated", () => setVersion((v) => v + 1)),
       // The menu bar's list: open what was picked.
-      listen<string>("navigate", (e) => go(e.payload as View)),
+      listen<string>("navigate", (e) => go(e.payload)),
       listen<string>("open-ticket", (e) => openTicket(e.payload)),
       listen<string>("open-meeting", (e) => openMeeting(e.payload)),
+      listen<string>("open-brief", (e) => {
+        setMeetingTarget({ brief: e.payload });
+        setView("meetings");
+      }),
+      listen("calendar-updated", () => setVersion((v) => v + 1)),
       listen<string>("open-item", (e) => {
         setItemTarget({ id: e.payload, n: Date.now() });
         setView("today");
@@ -147,6 +176,7 @@ export default function App() {
       if (nav) go(nav.id);
       else if (e.key === "r") sync();
       else if (e.key === "s") go("day");
+      else if (e.key === "t") go("timesheet");
       else if (e.key === "/") setPalette(true);
       else if (e.key === "?") setShortcuts(true);
       else return;
@@ -158,6 +188,7 @@ export default function App() {
 
   if (session === undefined) return null;
   if (session === null) return <SignIn onSignedIn={setSession} />;
+  if (setup) return <Setup session={session} onDone={() => setSetup(false)} />;
 
   const items = inbox?.items ?? [];
   const needs = groupItems(items).needs.length;
@@ -167,7 +198,7 @@ export default function App() {
     <div className="app shell">
       <Sidebar
         view={view}
-        onView={go}
+        onView={(v) => go(v === "day" && NAV_GROUP[view] !== "day" && view !== "day" ? timeTab : v)}
         counts={{ today: needs + attention.length + actions.length, all: items.length }}
         session={session}
         syncing={syncing}
@@ -189,7 +220,7 @@ export default function App() {
             </button>
           </div>
         )}
-        {firstLoad && !["settings", "following", "day", "timesheet", "tickets", "meetings"].includes(view) ? (
+        {firstLoad && !["settings", "day", "timesheet", "history", "tickets", "meetings"].includes(view) ? (
           <div className="empty big">
             <Icon name="refresh" size={22} className="spin" />
             <p>Fetching your pull requests and issues from GitHub…</p>
@@ -210,16 +241,45 @@ export default function App() {
               />
             )}
             {view === "all" && <AllPrs items={items} now={now} active={!overlay} />}
-            {view === "day" && (
-              <DayView
-                version={version}
-                target={dayTarget}
-                onOpenTicket={openTicket}
-                onOpenMeeting={openMeeting}
-              />
-            )}
-            {view === "timesheet" && (
-              <TimesheetView version={version} onSettings={() => setView("settings")} onOpenTicket={openTicket} />
+            {(view === "day" || view === "timesheet" || view === "history") && (
+              <div className="tabbed-view">
+                <div className="view-tabs" role="tablist">
+                  {(
+                    [
+                      ["day", "Day", "s"],
+                      ["timesheet", "Timesheet", "t"],
+                      ["history", "History", ""],
+                    ] as const
+                  ).map(([id, label, key]) => (
+                    <button
+                      key={id}
+                      role="tab"
+                      aria-selected={view === id}
+                      className={`view-tab${view === id ? " active" : ""}`}
+                      onClick={() => go(id)}
+                      title={key ? `${label} (${key})` : label}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {view === "day" && (
+                  <DayView
+                    version={version}
+                    target={dayTarget}
+                    onOpenTicket={openTicket}
+                    onOpenMeeting={openMeeting}
+                  />
+                )}
+                {view === "timesheet" && (
+                  <TimesheetView
+                    version={version}
+                    onSettings={() => go("settings:connections")}
+                    onOpenTicket={openTicket}
+                  />
+                )}
+                {view === "history" && <History version={version} onOpenDay={() => go("day")} />}
+              </div>
             )}
             {view === "meetings" && (
               <MeetingsView
@@ -242,16 +302,18 @@ export default function App() {
                   setDayTarget({ day });
                   setView("day");
                 }}
-                onSettings={() => setView("settings")}
+                onSettings={() => go("settings:connections")}
               />
             )}
-            {view === "history" && <History version={version} onOpenDay={() => setView("day")} />}
-            {view === "following" && <Following version={version} />}
           </>
         )}
         {view === "settings" && (
           <SettingsView
             session={session}
+            section={settingsSection}
+            onSection={setSettingsSection}
+            onSetup={() => setSetup(true)}
+            version={version}
             onSignedOut={() => {
               setInbox(null);
               setSession(null);

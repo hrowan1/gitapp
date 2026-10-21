@@ -424,6 +424,60 @@ export interface TicketDetail {
   prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
 }
 
+export interface CalendarInfo {
+  id: string;
+  title: string;
+  source: string;
+  color: string;
+}
+
+export interface CalendarStatus {
+  /** full | notDetermined | denied | restricted | writeOnly */
+  access: string;
+  enabled: boolean;
+  calendars: CalendarInfo[];
+  /** Calendar ids to read; empty means all. */
+  selected: string[];
+  /** Minutes before a meeting to remind you; 0 is off. */
+  remind: number;
+  countTime: boolean;
+  lastSync: string | null;
+  error: string | null;
+}
+
+export interface CalendarEvent {
+  uid: string;
+  calendarId: string;
+  calendar: string;
+  title: string;
+  start: string;
+  end: string;
+  allDay: boolean;
+  location: string;
+  notes: string;
+  videoUrl: string | null;
+  attendees: number;
+  attendeeNames: string[];
+  organiser: string | null;
+  myStatus: string;
+  free: boolean;
+}
+
+export interface MeetingBrief {
+  event: CalendarEvent;
+  ticket: {
+    key: string;
+    summary: string | null;
+    status: string | null;
+    category: string | null;
+    url: string | null;
+    prs: { id: string; repo: string; number: number; title: string; url: string; open: boolean }[];
+  } | null;
+  /** The last meeting in the series you recorded, with its notes. */
+  last: Meeting | null;
+  openActions: MeetingAction[];
+}
+
 export interface UpdateStatus {
   current: string;
   /** A newer version on GitHub. */
@@ -586,6 +640,17 @@ export const api = {
   getItemActivity: (itemId: string) => invoke<Activity[]>("get_item_activity", { itemId }),
   getRepos: () => invoke<RepoInfo[]>("get_repos"),
   setRepoHidden: (repo: string, hidden: boolean) => invoke<void>("set_repo_hidden", { repo, hidden }),
+  calendarStatus: () => invoke<CalendarStatus>("calendar_status"),
+  calendarConnect: () => invoke<CalendarStatus>("calendar_connect"),
+  calendarDisconnect: () => invoke<void>("calendar_disconnect"),
+  calendarSave: (selected: string[], remind: number, countTime: boolean) =>
+    invoke<CalendarStatus>("calendar_save", { selected, remind, countTime }),
+  calendarUpcoming: () => invoke<MeetingBrief[]>("calendar_upcoming"),
+  calendarBrief: (uid: string) => invoke<MeetingBrief | null>("calendar_brief", { uid }),
+  calendarSyncNow: () => invoke<CalendarStatus>("calendar_sync_now"),
+  calendarRecord: (uid: string) => invoke<RecordingStatus>("calendar_record", { uid }),
+  setupNeeded: () => invoke<boolean>("setup_needed"),
+  finishSetup: () => invoke<void>("finish_setup"),
   updateStatus: () => invoke<UpdateStatus>("update_status"),
   /** install: download and install even when automatic updates are off. */
   checkForUpdates: (install: boolean) => invoke<UpdateStatus>("check_for_updates", { install }),

@@ -428,6 +428,18 @@ pub fn for_ticket(conn: &Connection, key: &str) -> Result<Vec<Meeting>> {
     Ok(rows)
 }
 
+/// The last meeting before `before` in the same series: linked to `ticket`, or with the same title.
+pub fn previous(conn: &Connection, ticket: Option<&str>, title: &str, before: &str) -> Result<Option<Meeting>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEETING_COLUMNS} FROM meetings m
+         WHERE m.started_at < ?3 AND m.status != 'recording'
+           AND ((?1 IS NOT NULL AND upper(m.ticket) = upper(?1)) OR lower(trim(m.title)) = lower(trim(?2)))
+         ORDER BY m.started_at DESC LIMIT 1"
+    ))?;
+    let last = stmt.query_map(params![ticket, title, before], row_to_meeting)?.next().transpose()?;
+    Ok(last)
+}
+
 /// Recent meetings not linked to any ticket, newest first: candidates to link one to.
 pub fn recent_unlinked(conn: &Connection, since: &str) -> Result<Vec<Meeting>> {
     let mut stmt = conn.prepare(&format!(

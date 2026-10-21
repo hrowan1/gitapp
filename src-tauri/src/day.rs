@@ -233,13 +233,19 @@ pub fn build(
     for (key, label, start, end) in meetings {
         let (Some(s), Some(e)) = (parse_ts(start), parse_ts(end)) else { continue };
         let ticket = key.strip_prefix("T:").map(String::from);
+        let from_calendar = key.starts_with("CAL:") || label.starts_with(crate::calendar::CALENDAR_LABEL);
         events.push(WorkEvent {
             at: s,
-            kind: "meeting".into(),
+            kind: if from_calendar { "calendar" } else { "meeting" }.into(),
             repo: String::new(),
             branch: None,
             pr: None,
-            text: format!("Recorded meeting ({}m)", (e - s).num_minutes().max(1)),
+            text: if from_calendar {
+                let title = label.trim_start_matches(crate::calendar::CALENDAR_LABEL).trim_start_matches("Meeting · ");
+                format!("In your calendar: {title} ({}m)", (e - s).num_minutes().max(1))
+            } else {
+                format!("Recorded meeting ({}m)", (e - s).num_minutes().max(1))
+            },
             url: None,
             dedupe: None,
             group: if ticket.is_some() { None } else { Some((key.clone(), label.clone())) },

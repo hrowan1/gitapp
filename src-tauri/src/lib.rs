@@ -20,6 +20,7 @@ mod sync;
 mod harvest;
 mod timesheet;
 mod updates;
+mod calendar;
 mod voices;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -538,7 +539,30 @@ fn test_notification(app: AppHandle) -> String {
 /// A notification was clicked: bring Dev Inbox forward and open the item in it (a PR or issue in
 /// Today with its details, a ticket in Tickets), marking it seen. "Open on GitHub" is one click away
 /// from there. Notifications without an item (a burst summary, the morning digest) open Today.
-fn notification_clicked(app: &AppHandle, _url: Option<String>, item: Option<String>) {
+fn notification_clicked(app: &AppHandle, url: Option<String>, item: Option<String>, action: Option<String>) {
+    // A meeting reminder's buttons.
+    if let Some(uid) = item.as_deref().and_then(|i| i.strip_prefix("cal:")) {
+        match action.as_deref() {
+            Some(notifications::JOIN) => {
+                if let Some(url) = url {
+                    use tauri_plugin_opener::OpenerExt;
+                    let _ = app.opener().open_url(url, None::<&str>);
+                }
+                return;
+            }
+            Some(notifications::RECORD) => {
+                show_main(app);
+                record_event(app, uid);
+                let _ = app.emit_to("main", "navigate", "meetings");
+                return;
+            }
+            _ => {
+                show_main(app);
+                let _ = app.emit_to("main", "open-brief", uid);
+                return;
+            }
+        }
+    }
     show_main(app);
     match item.as_deref() {
         Some(id) if id.starts_with("view:") => {
@@ -1355,6 +1379,19 @@ fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
     let conn = state.db.relock();
     let events = jira::ticket_events(&conn, &key, &me).map_err(err)?;
     let description = jira::description(&conn, &key).map_err(err)?;
+    let prs = ticket_prs(&conn, &key)?;
+    let linked = meetings::for_ticket(&conn, &key).map_err(err)?;
+    let mut actions = Vec::new();
+    for m in &linked {
+        actions.extend(summary::meeting_actions(&conn, &m.id).map_err(err)?);
+    }
+    let fortnight = derive::fmt_ts(chrono::Utc::now() - chrono::Duration::days(14));
+    let linkable = meetings::recent_unlinked(&conn, &fortnight).map_err(err)?;
+    Ok(TicketDetail { description, events, prs, meetings: linked, actions, linkable })
+}
+
+/// PRs that mention a ticket key in their branch or title, newest first.
+fn ticket_prs(conn: &rusqlite::Connection, key: &str) -> CmdResult<Vec<PrLink>> {
     let like = format!("%{}%", key.to_lowercase());
     let mut stmt = conn
         .prepare(
@@ -1374,19 +1411,12 @@ fn get_ticket(state: State<AppState>, key: String) -> CmdResult<TicketDetail> {
         .filter_map(Result::ok)
         // "IO-26" must not match "IO-2641": require the exact key.
         .filter(|(p, branch)| {
-            branch.as_deref().and_then(day::ticket_in_branch).as_deref() == Some(key.as_str())
-                || day::ticket_in_text(&p.title).as_deref() == Some(key.as_str())
+            branch.as_deref().and_then(day::ticket_in_branch).as_deref() == Some(key)
+                || day::ticket_in_text(&p.title).as_deref() == Some(key)
         })
         .map(|(p, _)| p)
         .collect();
-    let linked = meetings::for_ticket(&conn, &key).map_err(err)?;
-    let mut actions = Vec::new();
-    for m in &linked {
-        actions.extend(summary::meeting_actions(&conn, &m.id).map_err(err)?);
-    }
-    let fortnight = derive::fmt_ts(chrono::Utc::now() - chrono::Duration::days(14));
-    let linkable = meetings::recent_unlinked(&conn, &fortnight).map_err(err)?;
-    Ok(TicketDetail { description, events, prs, meetings: linked, actions, linkable })
+    Ok(prs)
 }
 
 /// Link a meeting to a ticket in this app (nothing is written to Jira); None unlinks it.
@@ -1975,11 +2005,22 @@ fn start_recording(app: AppHandle, title: Option<String>) -> CmdResult<Recording
     let started = chrono::Utc::now();
     let id = format!("m{}", started.timestamp_millis());
     let dir = app.path().app_data_dir().map_err(err)?.join("meetings").join(&id);
+    let title = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    // No title given: named after the calendar meeting happening now (and linked to its ticket).
+    let current = match (&title, calendar_enabled(&state)) {
+        (None, true) => calendar::now_on(&state.db.relock(), &derive::fmt_ts(started)).ok().flatten(),
+        _ => None,
+    };
     let title = title
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+        .or_else(|| current.as_ref().map(|e| e.title.trim().to_string()).filter(|t| !t.is_empty()))
         .unwrap_or_else(|| format!("Meeting {}", started.with_timezone(&chrono::Local).format("%H:%M")));
-    meetings::create(&state.db.relock(), &id, &title, &derive::fmt_ts(started), &dir).map_err(err)?;
+    {
+        let conn = state.db.relock();
+        meetings::create(&conn, &id, &title, &derive::fmt_ts(started), &dir).map_err(err)?;
+        if let Some(ticket) = current.as_ref().and_then(calendar::ticket_of) {
+            meetings::set_ticket(&conn, &id, Some(&ticket)).map_err(err)?;
+        }
+    }
 
     let handle = app.clone();
     let meeting_id = id.clone();
@@ -2222,6 +2263,8 @@ async fn get_day(app: AppHandle, day: String, start: String, end: String) -> Cmd
 async fn day_report(app: &AppHandle, day: &str, s: derive::Ts, e: derive::Ts) -> CmdResult<day::DayReport> {
     let state = app.state::<AppState>();
     let me = state.setting("jira_account").unwrap_or_default();
+    // Settings take the database lock: read them before holding it.
+    let with_calendar = calendar_enabled(&state) && calendar_counts_time(&state);
     let (start, end) = (derive::fmt_ts(s), derive::fmt_ts(e));
     let clones = clones(&state);
     let (since, until) = (start.clone(), end.clone());
@@ -2239,7 +2282,11 @@ async fn day_report(app: &AppHandle, day: &str, s: derive::Ts, e: derive::Ts) ->
     let mut events = day::gather(&conn, &start, &end).map_err(err)?;
     events.extend(day::local_events(&conn, local).map_err(err)?);
     events.extend(day::jira_events(&conn, &start, &end, &titles).map_err(err)?);
-    let meeting_spans = meetings::day_spans(&conn, &start, &end).map_err(err)?;
+    let mut meeting_spans = meetings::day_spans(&conn, &start, &end).map_err(err)?;
+    if with_calendar {
+        let from_calendar = calendar::day_spans(&conn, &start, &end, &meeting_spans, chrono::Utc::now()).map_err(err)?;
+        meeting_spans.extend(from_calendar);
+    }
     let manual = day::manual_blocks(&conn, day).map_err(err)?;
     let mut report = day::build(day, events, manual, s, e, &titles, &meeting_spans);
     report.ticket_moves = jira::moves_between(&conn, &start, &end, &me).map_err(err)?;
@@ -2365,6 +2412,338 @@ async fn write_ai_summary(app: AppHandle, kind: String, day: String) -> CmdResul
         )
         .map_err(err)?;
     Ok(AiSummary { text, by, created_at })
+}
+
+// ---------- Calendar ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarStatus {
+    /// full | notDetermined | denied | restricted | writeOnly
+    access: String,
+    enabled: bool,
+    calendars: Vec<calendar::Calendar>,
+    /// Calendar ids to read; empty means all.
+    selected: Vec<String>,
+    /// Minutes before a meeting to remind you; 0 is off.
+    remind: i64,
+    /// Calendar meetings count as time in the Day view and timesheet.
+    count_time: bool,
+    last_sync: Option<String>,
+    error: Option<String>,
+}
+
+fn calendar_enabled(state: &AppState) -> bool {
+    state.setting("calendar_enabled").as_deref() == Some("1")
+}
+
+fn calendar_remind(state: &AppState) -> i64 {
+    state.setting("calendar_remind").and_then(|v| v.parse().ok()).unwrap_or(5)
+}
+
+fn calendar_counts_time(state: &AppState) -> bool {
+    state.setting("calendar_time").as_deref() != Some("0")
+}
+
+async fn calendar_status_of(app: &AppHandle) -> CalendarStatus {
+    let state = app.state::<AppState>();
+    let (access, calendars) = if state.demo {
+        ("full".to_string(), demo::calendars())
+    } else {
+        let looked = tauri::async_runtime::spawn_blocking(|| {
+            let access = calendar::status()?;
+            let calendars = if access == "full" { calendar::calendars()? } else { Vec::new() };
+            anyhow::Ok((access, calendars))
+        })
+        .await;
+        match looked {
+            Ok(Ok(v)) => v,
+            _ => ("denied".to_string(), Vec::new()),
+        }
+    };
+    CalendarStatus {
+        access,
+        enabled: calendar_enabled(&state),
+        calendars,
+        selected: json_setting(&state, "calendar_ids").unwrap_or_default(),
+        remind: calendar_remind(&state),
+        count_time: calendar_counts_time(&state),
+        last_sync: state.setting("calendar_last_sync"),
+        error: state.setting("calendar_error"),
+    }
+}
+
+/// Copy the chosen calendars' events into the database: the last `days_back` days to 3 days ahead.
+async fn sync_calendar(app: &AppHandle, days_back: i64) -> CmdResult<usize> {
+    let state = app.state::<AppState>();
+    if state.demo || !calendar_enabled(&state) {
+        return Ok(0);
+    }
+    let ids: Vec<String> = json_setting(&state, "calendar_ids").unwrap_or_default();
+    let today = chrono::Local::now().date_naive();
+    let (from, _) = local_day(today - chrono::Duration::days(days_back));
+    let (_, to) = local_day(today + chrono::Duration::days(3));
+    let (from, to) = (derive::fmt_ts(from), derive::fmt_ts(to));
+    let (f, t) = (from.clone(), to.clone());
+    let fetched = tauri::async_runtime::spawn_blocking(move || calendar::fetch(&f, &t, &ids)).await.map_err(err)?;
+    let events = match fetched {
+        Ok(events) => events,
+        Err(e) => {
+            let _ = db::set_setting(&state.db.relock(), "calendar_error", &format!("{e:#}"));
+            return Err(format!("{e:#}"));
+        }
+    };
+    {
+        let conn = state.db.relock();
+        calendar::store(&conn, &from, &to, &events).map_err(err)?;
+        db::set_setting(&conn, "calendar_last_sync", &now()).map_err(err)?;
+        db::delete_setting(&conn, "calendar_error").map_err(err)?;
+    }
+    let _ = app.emit("calendar-updated", ());
+    Ok(events.len())
+}
+
+#[tauri::command]
+async fn calendar_status(app: AppHandle) -> CalendarStatus {
+    calendar_status_of(&app).await
+}
+
+/// Ask for calendar access (macOS shows its prompt the first time), turn the calendar on and read
+/// the last two months.
+#[tauri::command]
+async fn calendar_connect(app: AppHandle) -> CmdResult<CalendarStatus> {
+    if !app.state::<AppState>().demo {
+        let access = tauri::async_runtime::spawn_blocking(calendar::request_access).await.map_err(err)?.map_err(err)?;
+        if access != "full" {
+            return Err(match access.as_str() {
+                "denied" => "Calendar access is off for Dev Inbox. Turn it on in System Settings → Privacy & Security → Calendars, then try again.".into(),
+                "writeOnly" => "Dev Inbox can only add events, not read them. Allow full access in System Settings → Privacy & Security → Calendars.".into(),
+                _ => "This Mac doesn't allow calendar access (it may be managed by your organisation).".to_string(),
+            });
+        }
+    }
+    db::set_setting(&app.state::<AppState>().db.relock(), "calendar_enabled", "1").map_err(err)?;
+    sync_calendar(&app, 60).await?;
+    Ok(calendar_status_of(&app).await)
+}
+
+#[tauri::command(async)]
+fn calendar_disconnect(app: AppHandle) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    let conn = state.db.relock();
+    db::set_setting(&conn, "calendar_enabled", "0").map_err(err)?;
+    conn.execute("DELETE FROM calendar_events", []).map_err(err)?;
+    let _ = app.emit("calendar-updated", ());
+    Ok(())
+}
+
+/// Which calendars to read, when to remind, and whether meetings count as time.
+#[tauri::command]
+async fn calendar_save(app: AppHandle, selected: Vec<String>, remind: i64, count_time: bool) -> CmdResult<CalendarStatus> {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.relock();
+        db::set_setting(&conn, "calendar_ids", &serde_json::to_string(&selected).map_err(err)?).map_err(err)?;
+        db::set_setting(&conn, "calendar_remind", &remind.clamp(0, 60).to_string()).map_err(err)?;
+        db::set_setting(&conn, "calendar_time", if count_time { "1" } else { "0" }).map_err(err)?;
+    }
+    sync_calendar(&app, 60).await?;
+    Ok(calendar_status_of(&app).await)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BriefTicket {
+    key: String,
+    summary: Option<String>,
+    status: Option<String>,
+    category: Option<String>,
+    url: Option<String>,
+    prs: Vec<PrLink>,
+}
+
+/// What to know before a meeting: its ticket and that ticket's PRs, and how the last one went.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingBrief {
+    event: calendar::Event,
+    ticket: Option<BriefTicket>,
+    /// The last meeting in the series you recorded (same ticket or title), with its notes.
+    last: Option<meetings::Meeting>,
+    /// Its action items still open.
+    open_actions: Vec<summary::Action>,
+}
+
+fn brief_for(conn: &rusqlite::Connection, event: calendar::Event) -> CmdResult<MeetingBrief> {
+    let from_title = calendar::ticket_of(&event);
+    let last = meetings::previous(conn, from_title.as_deref(), &event.title, &event.start).map_err(err)?;
+    let key = from_title.or_else(|| last.as_ref().and_then(|m| m.ticket.clone()));
+    let ticket = match key {
+        Some(key) => {
+            let issue: Option<(String, String, String, String)> = conn
+                .query_row("SELECT summary, status, category, url FROM jira_issues WHERE key = ?1", [&key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()
+                .map_err(err)?;
+            let prs = ticket_prs(conn, &key)?.into_iter().filter(|p| p.open).collect();
+            Some(BriefTicket {
+                summary: issue.as_ref().map(|i| i.0.clone()),
+                status: issue.as_ref().map(|i| i.1.clone()),
+                category: issue.as_ref().map(|i| i.2.clone()),
+                url: issue.map(|i| i.3),
+                key,
+                prs,
+            })
+        }
+        None => None,
+    };
+    let open_actions = match &last {
+        Some(m) => summary::meeting_actions(conn, &m.id).map_err(err)?.into_iter().filter(|a| !a.done).collect(),
+        None => Vec::new(),
+    };
+    Ok(MeetingBrief { event, ticket, last, open_actions })
+}
+
+/// Meetings from now until the end of tomorrow (including one that started up to 15 minutes ago),
+/// each with its brief.
+#[tauri::command(async)]
+fn calendar_upcoming(state: State<AppState>) -> CmdResult<Vec<MeetingBrief>> {
+    if !calendar_enabled(&state) {
+        return Ok(Vec::new());
+    }
+    let from = derive::fmt_ts(chrono::Utc::now() - chrono::Duration::minutes(15));
+    let (_, to) = local_day(chrono::Local::now().date_naive() + chrono::Duration::days(1));
+    let conn = state.db.relock();
+    let mut seen = std::collections::HashSet::new();
+    calendar::between(&conn, &from, &derive::fmt_ts(to))
+        .map_err(err)?
+        .into_iter()
+        .filter(|e| e.start >= from && calendar::is_meeting(e))
+        .filter(|e| seen.insert((e.title.to_lowercase(), e.start.clone())))
+        .take(12)
+        .map(|e| brief_for(&conn, e))
+        .collect()
+}
+
+#[tauri::command(async)]
+fn calendar_brief(state: State<AppState>, uid: String) -> CmdResult<Option<MeetingBrief>> {
+    let conn = state.db.relock();
+    match calendar::get(&conn, &uid).map_err(err)? {
+        Some(e) => Ok(Some(brief_for(&conn, e)?)),
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+async fn calendar_sync_now(app: AppHandle) -> CmdResult<CalendarStatus> {
+    sync_calendar(&app, 2).await?;
+    Ok(calendar_status_of(&app).await)
+}
+
+/// One line for a meeting reminder: its ticket, what's open from last time, or who's coming.
+fn reminder_line(b: &MeetingBrief) -> String {
+    if let Some(t) = &b.ticket {
+        let mut parts = vec![t.key.clone()];
+        parts.extend(t.status.clone());
+        if !t.prs.is_empty() {
+            parts.push(format!("{} open PR{}", t.prs.len(), if t.prs.len() == 1 { "" } else { "s" }));
+        }
+        return parts.join(" · ");
+    }
+    if !b.open_actions.is_empty() {
+        let n = b.open_actions.len();
+        return format!("{n} action item{} still open from last time", if n == 1 { "" } else { "s" });
+    }
+    let names = &b.event.attendee_names;
+    match names.len() {
+        0 => b.event.calendar.clone(),
+        1 => format!("With {}", names[0]),
+        2 => format!("With {} and {}", names[0], names[1]),
+        n => format!("With {}, {} and {} more", names[0], names[1], n - 2),
+    }
+}
+
+/// Reminders for meetings about to start, with Record (and Join call) buttons.
+fn calendar_reminders(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let minutes = calendar_remind(&state);
+    if !calendar_enabled(&state) || minutes <= 0 || state.setting("notifications").as_deref() == Some("0") {
+        return;
+    }
+    let briefs: Vec<MeetingBrief> = {
+        let conn = state.db.relock();
+        let Ok(due) = calendar::due_reminders(&conn, &now(), minutes) else { return };
+        due.into_iter().filter_map(|e| brief_for(&conn, e).ok()).collect()
+    };
+    for b in briefs {
+        let starts_in = derive::parse_ts(&b.event.start)
+            .map(|s| ((s - chrono::Utc::now()).num_seconds() as f64 / 60.0).round() as i64)
+            .unwrap_or(minutes)
+            .max(1);
+        let title = format!("{} in {starts_in} min", if b.event.title.trim().is_empty() { "A meeting" } else { b.event.title.trim() });
+        #[cfg(target_os = "macos")]
+        notifications::send_in(
+            &format!("📅 {title}"),
+            &reminder_line(&b),
+            "Record it, or open the brief",
+            b.event.video_url.as_deref(),
+            Some(&format!("cal:{}", b.event.uid)),
+            Some(if b.event.video_url.is_some() { notifications::MEETING_WITH_CALL } else { notifications::MEETING }),
+        );
+    }
+}
+
+/// Keep the calendar copy fresh (every 5 minutes) and send reminders (checked every 30 seconds).
+fn start_calendar(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_sync: Option<std::time::Instant> = None;
+        loop {
+            let state = app.state::<AppState>();
+            if calendar_enabled(&state) && !state.demo {
+                if last_sync.is_none_or(|t| t.elapsed() >= Duration::from_secs(5 * 60)) {
+                    // Two months back the first time, so past Day views and timesheets have meetings too.
+                    let backfilled = state.setting("calendar_backfilled").is_some();
+                    if sync_calendar(&app, if backfilled { 2 } else { 60 }).await.is_ok() && !backfilled {
+                        let _ = db::set_setting(&state.db.relock(), "calendar_backfilled", "1");
+                    }
+                    last_sync = Some(std::time::Instant::now());
+                }
+                calendar_reminders(&app);
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
+/// Start recording a calendar meeting: named after it, and linked to its ticket.
+#[tauri::command(async)]
+fn calendar_record(app: AppHandle, uid: String) -> CmdResult<RecordingStatus> {
+    let event = calendar::get(&app.state::<AppState>().db.relock(), &uid).map_err(err)?.ok_or("That meeting is no longer in your calendar")?;
+    let status = start_recording(app.clone(), Some(event.title.clone()))?;
+    if let (Some(id), Some(ticket)) = (status.meeting_id.as_deref(), calendar::ticket_of(&event)) {
+        meetings::set_ticket(&app.state::<AppState>().db.relock(), id, Some(&ticket)).map_err(err)?;
+    }
+    let _ = app.emit("meetings-updated", ());
+    Ok(status)
+}
+
+fn record_event(app: &AppHandle, uid: &str) {
+    if let Err(e) = calendar_record(app.clone(), uid.to_string()) {
+        notify(app, sync::Notice { title: "Couldn't start recording".into(), body: e, url: None, item_id: None });
+    }
+}
+
+// ---------- First-run setup ----------
+
+#[tauri::command(async)]
+fn setup_needed(state: State<AppState>) -> bool {
+    std::env::var("DEV_INBOX_SETUP").is_ok_and(|v| v == "1") || state.setting("setup_done").as_deref() != Some("1")
+}
+
+#[tauri::command(async)]
+fn finish_setup(state: State<AppState>) -> CmdResult<()> {
+    db::set_setting(&state.db.relock(), "setup_done", "1").map_err(err)
 }
 
 // ---------- Harvest & the timesheet ----------
@@ -2864,7 +3243,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 let handle = app.handle().clone();
-                notifications::init(move |url, item| notification_clicked(&handle, url, item));
+                notifications::init(move |url, item, action| notification_clicked(&handle, url, item, action));
                 // Test aid: DEV_INBOX_NOTIFY_TEST=1 sends one notification at launch.
                 if std::env::var("DEV_INBOX_NOTIFY_TEST").is_ok_and(|v| v == "1") {
                     let handle = app.handle().clone();
@@ -2918,11 +3297,16 @@ pub fn run() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(4));
-                    let _ = handle.emit_to("main", "navigate", view);
+                    match view.strip_prefix("brief:") {
+                        Some(uid) => handle.emit_to("main", "open-brief", uid),
+                        None => handle.emit_to("main", "navigate", view),
+                    }
+                    .ok();
                 });
             }
             refresh_tray(app.handle());
             updates::start(app.handle().clone());
+            start_calendar(app.handle().clone());
 
             if let Err(e) = app.global_shortcut().register(palette_shortcut()) {
                 eprintln!("couldn't register global shortcut: {e}");
@@ -2975,6 +3359,16 @@ pub fn run() {
             dismiss_suggestion,
             open_in_main,
             jira_transitions,
+            calendar_status,
+            calendar_connect,
+            calendar_disconnect,
+            calendar_save,
+            calendar_upcoming,
+            calendar_brief,
+            calendar_sync_now,
+            calendar_record,
+            setup_needed,
+            finish_setup,
             updates::update_status,
             updates::check_for_updates,
             updates::set_auto_update,

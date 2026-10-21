@@ -6,5 +6,9 @@
   <string>Dev Inbox records your side of meetings you choose to record, and transcribes them on this Mac.</string>
   <key>NSAudioCaptureUsageDescription</key>
   <string>Dev Inbox records the call audio of meetings you choose to record, and transcribes them on this Mac.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Dev Inbox shows your meetings in the Day view and timesheet, and reminds you before they start. Nothing is changed in your calendar.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>Dev Inbox shows your meetings in the Day view and timesheet, and reminds you before they start. Nothing is changed in your calendar.</string>
 </dict>
 </plist>

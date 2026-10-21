@@ -8,14 +8,18 @@ import { Icon, type IconName } from "./Icon";
 export const NAV: { id: View; label: string; icon: IconName; key: string }[] = [
   { id: "today", label: "Today", icon: "today", key: "1" },
   { id: "all", label: "Inbox", icon: "inbox", key: "2" },
-  { id: "day", label: "Day", icon: "calendar", key: "3" },
-  { id: "timesheet", label: "Timesheet", icon: "clock", key: "4" },
-  { id: "tickets", label: "Tickets", icon: "ticket", key: "5" },
-  { id: "meetings", label: "Meetings", icon: "mic", key: "6" },
-  { id: "history", label: "History", icon: "history", key: "7" },
-  { id: "following", label: "Following", icon: "eye", key: "8" },
-  { id: "settings", label: "Settings", icon: "settings", key: "9" },
+  { id: "day", label: "Time", icon: "clock", key: "3" },
+  { id: "tickets", label: "Tickets", icon: "ticket", key: "4" },
+  { id: "meetings", label: "Meetings", icon: "mic", key: "5" },
+  { id: "settings", label: "Settings", icon: "settings", key: "6" },
 ];
+
+/** Views shown under one sidebar item (Time: Day, Timesheet and History as tabs). */
+export const NAV_GROUP: Partial<Record<View, View>> = {
+  timesheet: "day",
+  history: "day",
+  following: "settings",
+};
 
 export function Sidebar({
   view,
@@ -63,7 +67,7 @@ export function Sidebar({
         {NAV.map((n) => (
           <button
             key={n.id}
-            className={`nav-item${view === n.id ? " active" : ""}`}
+            className={`nav-item${view === n.id || NAV_GROUP[view] === n.id ? " active" : ""}`}
             onClick={() => onView(n.id)}
             title={`${n.label} (${n.key})`}
           >

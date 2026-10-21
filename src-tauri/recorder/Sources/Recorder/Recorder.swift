@@ -9,6 +9,7 @@
 //   dev-inbox-recorder summarise <transcript.txt> -> {"event":"summary","overview","decisions","actionItems"}
 //   dev-inbox-recorder generate <request.json>       -> Apple Intelligence text (see Generate.swift)
 //   dev-inbox-recorder diarize <file> <models dir>     -> who spoke when (see Diarize.swift)
+//   dev-inbox-recorder calendar-status | calendar-access | calendars | events <from> <to> [ids] (Calendar.swift)
 //   dev-inbox-recorder check [locale]             -> {"speech":bool,"locale":...,"summary":bool,"summaryReason":...}
 
 import AVFAudio
@@ -599,6 +600,14 @@ struct Main {
                 captioner.stop()
                 emit(["event": "done"])
             }
+        case "calendar-status":
+            emit(["status": calendarStatus()])
+        case "calendar-access":
+            await calendarAccess()
+        case "calendars":
+            listCalendars()
+        case "events" where args.count >= 4:
+            listEvents(from: args[2], to: args[3], ids: args.count >= 5 ? args[4] : nil)
         case "check":
             if #available(macOS 26, *) {
                 await checkSpeech(localeID: args.count >= 3 ? args[2] : locale)
