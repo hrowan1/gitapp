@@ -3297,11 +3297,13 @@ pub fn run() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(4));
-                    match view.strip_prefix("brief:") {
-                        Some(uid) => handle.emit_to("main", "open-brief", uid),
-                        None => handle.emit_to("main", "navigate", view),
+                    if let Some(uid) = view.strip_prefix("brief:") {
+                        let _ = handle.emit_to("main", "open-brief", uid);
+                    } else if let Some(id) = view.strip_prefix("item:") {
+                        let _ = handle.emit_to("main", "open-item", id);
+                    } else {
+                        let _ = handle.emit_to("main", "navigate", view);
                     }
-                    .ok();
                 });
             }
             refresh_tray(app.handle());

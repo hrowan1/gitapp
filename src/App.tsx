@@ -237,6 +237,7 @@ export default function App() {
                 active={!overlay}
                 onOpenTicket={openTicket}
                 onOpenMeeting={openMeeting}
+                onOpenInbox={() => go("all")}
                 focus={itemTarget}
               />
             )}

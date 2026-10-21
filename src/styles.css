@@ -3656,3 +3656,105 @@ html.panel-window #root {
   align-items: center;
   gap: 6px;
 }
+
+/* ---------- Today & Inbox: one column, details inline ---------- */
+
+.list-page > * {
+  max-width: 860px;
+}
+.list-page-head {
+  margin-bottom: 6px;
+}
+.list-page .list {
+  margin: 0 -12px;
+}
+.entry.open {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  box-shadow: var(--shadow-sm);
+  margin: 6px 0 10px;
+}
+.entry.open > .row,
+.entry.open > .row.selected {
+  background: transparent;
+}
+.inline-detail {
+  padding: 0 14px 12px 44px;
+  cursor: default;
+}
+.inline-detail .quote,
+.inline-detail .callout {
+  margin: 2px 0 10px;
+}
+.inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.inline-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  padding: 5px 10px;
+}
+.inline-detail .snooze {
+  margin: 0 0 8px;
+}
+.inline-detail .ci-explain,
+.inline-detail .action {
+  margin-bottom: 8px;
+}
+.inline-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.inline-foot .mono {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.inline-mark select {
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.inline-detail .timeline {
+  margin-top: 10px;
+}
+.show-more {
+  display: block;
+  margin: 2px 0 6px 44px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  padding: 4px 0;
+  color: var(--accent);
+  font-size: 12.5px;
+}
+.show-more:hover {
+  text-decoration: underline;
+}
+.empty.big .link {
+  margin-top: 4px;
+}
+.inline-detail .action {
+  width: auto;
+  padding: 4px 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  color: var(--accent);
+  font-size: 12.5px;
+  gap: 6px;
+}
+.inline-detail .action kbd {
+  display: none;
+}

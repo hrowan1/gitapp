@@ -106,3 +106,64 @@ export function shortRef(item: { kind: string; repo: string; number: number }): 
 }
 
 export const KIND_LABEL: Record<string, string> = { pr: "Pull request", issue: "Issue", run: "Branch" };
+
+/** Lists are organised by what you'd do next, most urgent first (no repo folders). */
+export type TodoId =
+  | "reminders"
+  | "replies"
+  | "review"
+  | "fix"
+  | "merge"
+  | "assigned"
+  | "waiting"
+  | "parked"
+  | "quiet"
+  | "done";
+
+export const TODO_SECTIONS: { id: TodoId; title: string; actionable: boolean }[] = [
+  { id: "reminders", title: "Reminders", actionable: true },
+  { id: "replies", title: "Replies to you", actionable: true },
+  { id: "review", title: "Review requested", actionable: true },
+  { id: "fix", title: "Fix: changes requested or failing", actionable: true },
+  { id: "merge", title: "Ready to merge", actionable: true },
+  { id: "assigned", title: "Assigned to you", actionable: true },
+  { id: "waiting", title: "Waiting on others", actionable: false },
+  { id: "parked", title: "Parked", actionable: false },
+  { id: "quiet", title: "Gone quiet · 30+ days", actionable: false },
+  { id: "done", title: "Done & FYI", actionable: false },
+];
+
+export function todoOf(item: Item): TodoId {
+  if (item.reminderDue) return "reminders";
+  switch (item.state) {
+    case "replied":
+      return "replies";
+    case "needs_review":
+    case "needs_rereview":
+      return "review";
+    case "needs_changes":
+    case "broken":
+      return "fix";
+    case "ready_to_merge":
+      return "merge";
+    case "assigned":
+      return "assigned";
+    case "later":
+      return "parked";
+    case "stale":
+      return "quiet";
+    case "done":
+    case "fyi":
+    case "muted":
+      return "done";
+    default:
+      return "waiting";
+  }
+}
+
+export function groupTodo(items: Item[]): Record<TodoId, Item[]> {
+  const out = Object.fromEntries(TODO_SECTIONS.map((s) => [s.id, [] as Item[]])) as Record<TodoId, Item[]>;
+  for (const item of items) out[todoOf(item)].push(item);
+  for (const k of Object.keys(out) as TodoId[]) out[k].sort(compareItems);
+  return out;
+}

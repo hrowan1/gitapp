@@ -5,17 +5,28 @@ import {
   type Activity,
   type Item,
   type Session,
-  type StateId,
   type TicketAttention,
   type MeetingAction,
 } from "../lib/api";
-import { SECTIONS, STATES, compareItems, groupItems, shortRef } from "../lib/states";
+import { TODO_SECTIONS, groupTodo, shortRef } from "../lib/states";
 import { clock, friendlyDate } from "../lib/time";
 import { Icon, type IconName } from "./Icon";
 import { PrList } from "./PrList";
 import { TicketsNeedingYou } from "./TicketsNeedingYou";
 import { MeetingActions } from "./MeetingActions";
-import { useSelection, Workspace } from "./Workspace";
+import { useSelection } from "./Workspace";
+
+/** One column: a header, then the list. Details open inside the list, under the row. */
+function ListPage({ header, children }: { header: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="page list-page">
+      <div className="list-page-head">{header}</div>
+      {children}
+    </div>
+  );
+}
+
+const ACTIONABLE_TODO = TODO_SECTIONS.filter((s) => s.actionable);
 
 export function Today({
   items,
@@ -26,6 +37,7 @@ export function Today({
   now,
   active,
   onOpenTicket,
+  onOpenInbox,
 }: {
   items: Item[];
   /** Jira tickets that need you. */
@@ -36,102 +48,119 @@ export function Today({
   active: boolean;
   onOpenTicket: (key: string) => void;
   onOpenMeeting: (id: string) => void;
+  onOpenInbox: () => void;
   /** Open this item (from a notification or the menu bar panel). */
   focus?: { id: string; n: number } | null;
 }) {
-  const groups = useMemo(() => groupItems(items), [items]);
+  const groups = useMemo(() => groupTodo(items), [items]);
+  // Today is what needs you; what you're waiting on and what you've parked are tucked away below.
   const sections = useMemo(
-    () =>
-      SECTIONS.map((s) => ({
-        ...s,
-        items: groups[s.id],
-        collapsedByDefault: s.id === "done" || s.id === "stale",
-      })),
+    () => [
+      ...ACTIONABLE_TODO.map((s) => ({ id: s.id, title: s.title, items: groups[s.id] })),
+      { id: "waiting", title: "Waiting on others", items: groups.waiting, collapsedByDefault: true },
+      { id: "parked", title: "Parked", items: groups.parked, collapsedByDefault: true },
+    ],
     [groups],
   );
-  const { selectedId, selection, onSelect, clear } = useSelection(items, focus);
-  const needs = groups.needs.length + tickets.length + actions.length;
+  const { selectedId, onSelect } = useSelection(items, focus);
+  const prs = ACTIONABLE_TODO.reduce((n, s) => n + groups[s.id].length, 0);
+  const needs = prs + tickets.length + actions.length;
   const fresh = items.filter((i) => i.isNew);
+  const counts = [
+    groups.replies.length && `${groups.replies.length} ${groups.replies.length === 1 ? "reply" : "replies"}`,
+    groups.review.length && `${groups.review.length} to review`,
+    groups.fix.length && `${groups.fix.length} to fix`,
+    groups.merge.length && `${groups.merge.length} to merge`,
+    tickets.length && `${tickets.length} Jira`,
+    actions.length && `${actions.length} from meetings`,
+  ].filter(Boolean);
+
   const header = (
     <div className="headline">
       <h1>{needs === 0 ? "You're all caught up" : `${needs} ${needs === 1 ? "thing needs" : "things need"} you`}</h1>
       <p className="muted">
+        {counts.join(" · ")}
         {fresh.length > 0 && (
           <>
+            {counts.length > 0 && " · "}
             <span className="new-text">{fresh.length} new</span>{" "}
             <button className="link" onClick={() => api.markSeen(fresh.map((i) => i.id))}>
               mark seen
             </button>
-            {" · "}
           </>
         )}
-        {groups.later.length > 0 && `${groups.later.length} parked · `}
-        {groups.waiting.length + groups.mine.length} in progress or waiting
       </p>
     </div>
   );
   return (
-    <Workspace header={header} selection={selection} now={now} onClose={clear}>
+    <ListPage header={header}>
+      {needs === 0 && (
+        <div className="empty big">
+          <Icon name="checkCircle" size={22} />
+          <p>Nothing needs you right now.</p>
+          <button className="link" onClick={onOpenInbox}>
+            See everything in the Inbox
+          </button>
+        </div>
+      )}
       <TicketsNeedingYou tickets={tickets} now={now} onOpen={onOpenTicket} />
       <MeetingActions actions={actions} onOpenMeeting={onOpenMeeting} />
       <PrList sections={sections} now={now} active={active} selectedId={selectedId} onSelect={onSelect} />
-    </Workspace>
+    </ListPage>
   );
 }
 
+/** Everything you're involved in, in the same what-to-do sections, with search and a repo filter. */
 export function AllPrs({ items, now, active }: { items: Item[]; now: number; active: boolean }) {
   const [repo, setRepo] = useState("");
-  const [author, setAuthor] = useState("");
-  const [state, setStateFilter] = useState("");
-  const [owner, setOwner] = useState<"" | "mine" | "others">("");
-  const [ci, setCi] = useState("");
-  const [kind, setKind] = useState("");
   const [text, setText] = useState("");
-  const { selectedId, selection, onSelect, clear } = useSelection(items);
+  const { selectedId, onSelect } = useSelection(items);
 
   const repos = useMemo(() => [...new Set(items.map((i) => i.repo))].sort(), [items]);
-  const authors = useMemo(() => [...new Set(items.map((i) => i.author))].sort((a, b) => a.localeCompare(b)), [items]);
-  const filtered = useMemo(
-    () =>
-      items
-        .filter(
-          (i) =>
-            (!repo || i.repo === repo || i.repo.startsWith(repo + "/")) &&
-            (!author || i.author === author) &&
-            (!state || i.state === state) &&
-            (!ci || i.ci === ci) &&
-            (!kind || i.kind === kind) &&
-            (!owner || (owner === "mine") === i.isMine) &&
-            (!text || `${i.title} ${i.repo} #${i.number}`.toLowerCase().includes(text.toLowerCase())),
-        )
-        .sort(compareItems),
-    [items, repo, author, state, ci, kind, owner, text],
-  );
   const orgs = [...new Set(repos.map((r) => r.split("/")[0]))];
+  const filtered = useMemo(() => {
+    const q = text.toLowerCase().trim();
+    return items.filter(
+      (i) =>
+        (!repo || i.repo === repo || i.repo.startsWith(repo + "/")) &&
+        (!q || `${i.title} ${i.repo} #${i.number} ${i.author}`.toLowerCase().includes(q)),
+    );
+  }, [items, repo, text]);
+  const groups = useMemo(() => groupTodo(filtered), [filtered]);
+  const searching = !!text.trim() || !!repo;
   const sections = useMemo(
-    () => [{ id: "all", title: `${filtered.length} items`, items: filtered, empty: "No matches." }],
-    [filtered],
+    () =>
+      TODO_SECTIONS.map((s) => ({
+        id: s.id,
+        title: s.title,
+        items: groups[s.id],
+        // Old and finished things stay folded unless you're looking for something.
+        collapsedByDefault: !searching && (s.id === "quiet" || s.id === "done"),
+      })),
+    [groups, searching],
   );
 
   const header = (
     <>
       <div className="headline compact">
         <h1>Inbox</h1>
-        <p className="muted">Everything you're involved in, across every repository.</p>
+        <p className="muted">
+          {searching ? `${filtered.length} of ${items.length}` : items.length} things you're involved in, across every
+          repository.
+        </p>
       </div>
       <div className="filters">
-        <div className="search-box">
+        <div className="search-box grow">
           <Icon name="search" size={14} />
-          <input placeholder="Filter by title, repo or number" value={text} onChange={(e) => setText(e.target.value)} />
+          <input
+            placeholder="Search titles, repos, numbers or people"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && setText("")}
+          />
         </div>
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
-          <option value="">All types</option>
-          <option value="pr">Pull requests</option>
-          <option value="issue">Issues</option>
-          <option value="run">Branches</option>
-        </select>
         <select value={repo} onChange={(e) => setRepo(e.target.value)}>
-          <option value="">All repos</option>
+          <option value="">All repositories</option>
           {orgs.length > 1 && (
             <optgroup label="Organisations">
               {orgs.map((o) => (
@@ -149,39 +178,15 @@ export function AllPrs({ items, now, active }: { items: Item[]; now: number; act
             ))}
           </optgroup>
         </select>
-        <select value={state} onChange={(e) => setStateFilter(e.target.value)}>
-          <option value="">Any state</option>
-          {(Object.keys(STATES) as StateId[]).map((s) => (
-            <option key={s} value={s}>
-              {STATES[s].label}
-            </option>
-          ))}
-        </select>
-        <select value={author} onChange={(e) => setAuthor(e.target.value)}>
-          <option value="">Anyone</option>
-          {authors.map((a) => (
-            <option key={a}>{a}</option>
-          ))}
-        </select>
-        <select value={ci} onChange={(e) => setCi(e.target.value)}>
-          <option value="">Any CI</option>
-          <option value="failure">Failing</option>
-          <option value="pending">Running</option>
-          <option value="success">Passing</option>
-        </select>
-        <select value={owner} onChange={(e) => setOwner(e.target.value as typeof owner)}>
-          <option value="">Mine & others'</option>
-          <option value="mine">Mine</option>
-          <option value="others">Others'</option>
-        </select>
       </div>
     </>
   );
 
   return (
-    <Workspace header={header} selection={selection} now={now} onClose={clear}>
+    <ListPage header={header}>
+      {searching && filtered.length === 0 && <div className="empty">Nothing matches.</div>}
       <PrList sections={sections} now={now} active={active} selectedId={selectedId} onSelect={onSelect} />
-    </Workspace>
+    </ListPage>
   );
 }
 

@@ -3,13 +3,12 @@ import type { Item } from "../lib/api";
 import { openInEditor, openItem, setStates } from "../lib/actions";
 import { openDialog } from "../lib/dialog";
 import { emit } from "../lib/events";
-import { STATES } from "../lib/states";
-import type { Selection } from "./DetailPane";
+import { InlineDetail, type Selection } from "./DetailPane";
 import { Icon } from "./Icon";
-import { ActionMenu, PrRow } from "./PrRow";
+import { PrRow } from "./PrRow";
 
-/** A repo with at least this many PRs in one section is collapsed into a single group row. */
-const GROUP_MIN = 4;
+/** Rows shown per section before "Show all". */
+const PREVIEW = 8;
 
 export interface ListSection {
   id: string;
@@ -19,43 +18,9 @@ export interface ListSection {
   collapsedByDefault?: boolean;
 }
 
-type Block = { kind: "item"; item: Item } | { kind: "group"; key: string; repo: string; items: Item[] };
-
-/** Keep sort order, but fold repos with many PRs into one group at the position of their first PR. */
-function toBlocks(sectionId: string, items: Item[]): Block[] {
-  const counts = new Map<string, number>();
-  for (const i of items) counts.set(i.repo, (counts.get(i.repo) ?? 0) + 1);
-  const groups = new Map<string, Block & { kind: "group" }>();
-  const out: Block[] = [];
-  for (const item of items) {
-    if ((counts.get(item.repo) ?? 0) < GROUP_MIN) {
-      out.push({ kind: "item", item });
-      continue;
-    }
-    let g = groups.get(item.repo);
-    if (!g) {
-      g = { kind: "group", key: `group:${sectionId}:${item.repo}`, repo: item.repo, items: [] };
-      groups.set(item.repo, g);
-      out.push(g);
-    }
-    g.items.push(item);
-  }
-  return out;
-}
-
-function summarise(items: Item[]): string {
-  const by = new Map<string, number>();
-  for (const i of items) by.set(i.state, (by.get(i.state) ?? 0) + 1);
-  return [...by.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([s, n]) => `${n} ${STATES[s as Item["state"]]?.label.toLowerCase() ?? s}`)
-    .join(" · ");
-}
-
-type Entry = { id: string; item?: Item; group?: Block & { kind: "group" } };
-
-/** Sectioned list with keyboard navigation (j/k, ↵ open/expand, e done, l later, x reset).
- * Selection is owned by the parent so the detail pane can show it. */
+/** Sections of rows, one item per row (no repo folders). Click a row to open its details right
+ * under it; click again, or Esc, to close. Keys: j/k move, ↵ open on GitHub, e done, l later, x reset,
+ * R reply, a approve, m merge, c check out. */
 export function PrList({
   sections,
   now,
@@ -70,7 +35,7 @@ export function PrList({
   onSelect: (id: string | null, selection: Selection) => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [showAll, setShowAll] = useState<Record<string, boolean>>({});
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [focusNote, setFocusNote] = useState(false);
   const openMenu = (id: string | null, note = false) => {
@@ -78,48 +43,34 @@ export function PrList({
     setMenuFor(id);
   };
 
-  const isCollapsed = (s: ListSection) => collapsed[s.id] ?? !!s.collapsedByDefault;
-  const blocks = useMemo(
-    () => Object.fromEntries(sections.map((s) => [s.id, toBlocks(s.id, s.items)])),
-    [sections],
-  );
-
-  const selectEntry = (e: Entry | undefined) => {
-    if (!e) return onSelect(null, null);
-    onSelect(e.id, e.group ? { group: { repo: e.group.repo, items: e.group.items } } : { item: e.item! });
+  const holdsSelection = (s: ListSection) => s.items.some((i) => i.id === selectedId);
+  // A section with the selected item stays open and shows it, even past the preview.
+  const isCollapsed = (s: ListSection) => (collapsed[s.id] ?? !!s.collapsedByDefault) && !holdsSelection(s);
+  const visible = (s: ListSection) => {
+    if (showAll[s.id] || s.items.length <= PREVIEW) return s.items;
+    const at = s.items.findIndex((i) => i.id === selectedId);
+    return s.items.slice(0, Math.max(PREVIEW, at + 1));
   };
 
+  const select = (item: Item | null) => onSelect(item?.id ?? null, item ? { item } : null);
+
   // Everything keyboard navigation can land on, in display order.
-  const entries: Entry[] = useMemo(
-    () =>
-      sections.flatMap((s) =>
-        isCollapsed(s)
-          ? []
-          : blocks[s.id].flatMap((b): Entry[] =>
-              b.kind === "item"
-                ? [{ id: b.item.id, item: b.item }]
-                : [
-                    { id: b.key, group: b },
-                    ...(expanded[b.key] ? b.items.map((item) => ({ id: item.id, item })) : []),
-                  ],
-            ),
-      ),
+  const entries: Item[] = useMemo(
+    () => sections.flatMap((s) => (isCollapsed(s) ? [] : visible(s))),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sections, blocks, collapsed, expanded],
+    [sections, collapsed, showAll, selectedId],
   );
 
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
-      if (tag === "input" || tag === "textarea" || e.metaKey || e.ctrlKey || e.altKey || menuFor) return;
+      if (tag === "input" || tag === "textarea" || tag === "select" || e.metaKey || e.ctrlKey || e.altKey || menuFor) return;
       const idx = entries.findIndex((x) => x.id === selectedId);
       const cur = idx >= 0 ? entries[idx] : null;
-      const targets = cur?.group ? cur.group.items : cur?.item ? [cur.item] : [];
       const move = (d: number) => {
         if (!entries.length) return;
-        const next = idx < 0 ? 0 : Math.min(entries.length - 1, Math.max(0, idx + d));
-        selectEntry(entries[next]);
+        select(entries[idx < 0 ? 0 : Math.min(entries.length - 1, Math.max(0, idx + d))]);
       };
       switch (e.key) {
         case "j":
@@ -132,13 +83,12 @@ export function PrList({
           break;
         case "Enter":
         case "o":
-          if (cur?.group) setExpanded({ ...expanded, [cur.id]: !expanded[cur.id] });
-          else if (cur?.item) openItem(cur.item);
+          if (cur) openItem(cur);
           break;
         case "e":
-          if (targets.length) {
+          if (cur) {
             move(1);
-            setStates(targets, "done");
+            setStates([cur], "done");
           }
           break;
         case "l":
@@ -149,22 +99,22 @@ export function PrList({
           break;
         case "Escape":
           if (!cur) return;
-          selectEntry(undefined);
+          select(null);
           break;
         case "x":
-          if (targets.some((t) => t.personal)) setStates(targets, null);
+          if (cur?.personal) setStates([cur], null);
           break;
         case "R":
-          if (cur?.item && cur.item.kind !== "run") openDialog("reply", cur.item);
+          if (cur && cur.kind !== "run") openDialog("reply", cur);
           break;
         case "a":
-          if (cur?.item?.kind === "pr" && !cur.item.isMine) openDialog("approve", cur.item);
+          if (cur?.kind === "pr" && !cur.isMine) openDialog("approve", cur);
           break;
         case "m":
-          if (cur?.item?.kind === "pr") openDialog("merge", cur.item);
+          if (cur?.kind === "pr") openDialog("merge", cur);
           break;
         case "c":
-          if (cur?.item && cur.item.kind !== "run") openInEditor(cur.item, cur.item.kind === "pr");
+          if (cur && cur.kind !== "run") openInEditor(cur, cur.kind === "pr");
           break;
         default:
           return;
@@ -173,27 +123,16 @@ export function PrList({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, entries, selectedId, menuFor, expanded]);
-
-  const row = (item: Item, nested = false) => (
-    <PrRow
-      key={item.id}
-      item={item}
-      now={now}
-      nested={nested}
-      selected={item.id === selectedId}
-      onSelect={() => onSelect(item.id, { item })}
-      menuOpen={menuFor === item.id}
-      onMenu={(open) => openMenu(open ? item.id : null)}
-      focusNote={focusNote}
-    />
-  );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, entries, selectedId, menuFor]);
 
   return (
     <div className="list">
       {sections.map((s) => {
         if (!s.items.length && !s.empty) return null;
         const closed = isCollapsed(s);
+        const shown = visible(s);
+        const hidden = s.items.length - shown.length;
         return (
           <section key={s.id} className="section">
             <button className="section-head" onClick={() => setCollapsed({ ...collapsed, [s.id]: !closed })}>
@@ -203,44 +142,33 @@ export function PrList({
             </button>
             {!closed && !s.items.length && <div className="empty">{s.empty}</div>}
             {!closed &&
-              blocks[s.id].map((b) => {
-                if (b.kind === "item") return row(b.item);
-                const open = !!expanded[b.key];
-                const newCount = b.items.filter((i) => i.isNew).length;
+              shown.map((item) => {
+                const selected = item.id === selectedId;
                 return (
-                  <div key={b.key} className="group">
-                    <div
-                      className={`row group-row${selectedId === b.key ? " selected" : ""}`}
-                      role="button"
-                      onClick={() => {
-                        onSelect(b.key, { group: { repo: b.repo, items: b.items } });
-                        setExpanded({ ...expanded, [b.key]: !open });
-                      }}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        onSelect(b.key, { group: { repo: b.repo, items: b.items } });
-                        openMenu(b.key);
-                      }}
-                    >
-                      <span className="group-count">{b.items.length}</span>
-                      <div className="row-main">
-                        <div className="row-title">
-                          <span className="title">{b.repo}</span>
-                          <Icon name="chevronDown" size={13} className={`chevron${open ? "" : " closed"}`} />
-                        </div>
-                        <div className="row-sub">
-                          <span className="reason">{summarise(b.items)}</span>
-                        </div>
-                      </div>
-                      <div className="row-right">
-                        {newCount > 0 && <span className="new-dot" title={`${newCount} new`} />}
-                      </div>
-                      {menuFor === b.key && <ActionMenu items={b.items} onClose={() => setMenuFor(null)} />}
-                    </div>
-                    {open && b.items.map((item) => row(item, true))}
+                  <div key={item.id} className={`entry${selected ? " open" : ""}`}>
+                    <PrRow
+                      item={item}
+                      now={now}
+                      selected={selected}
+                      onSelect={() => select(selected ? null : item)}
+                      menuOpen={menuFor === item.id}
+                      onMenu={(open) => openMenu(open ? item.id : null)}
+                      focusNote={focusNote}
+                    />
+                    {selected && <InlineDetail item={item} />}
                   </div>
                 );
               })}
+            {!closed && hidden > 0 && (
+              <button className="show-more" onClick={() => setShowAll({ ...showAll, [s.id]: true })}>
+                Show {hidden} more
+              </button>
+            )}
+            {!closed && showAll[s.id] && s.items.length > PREVIEW && (
+              <button className="show-more" onClick={() => setShowAll({ ...showAll, [s.id]: false })}>
+                Show fewer
+              </button>
+            )}
           </section>
         );
       })}

@@ -55,7 +55,7 @@ Moving to an Apple Developer ID later (notarised, no "Open Anyway") only changes
 
 ## What it does
 
-- **Today**: Needs you · Come back to · Your work · Waiting on others · Gone quiet · Done & FYI
+- **Today** and **Inbox** are one list each, organised by what to do next — Reminders · Replies to you · Review requested · Fix (changes requested or failing) · Ready to merge · Assigned to you — then Waiting on others, Parked, Gone quiet and Done & FYI. Today shows what needs you (plus Jira and meeting action items) with the rest folded away; Inbox has everything, with search and a repository filter. No repo folders: long sections show 8 and "Show more". Click a row to open its details and actions right under it.
 - **PRs, issues and branches**: PRs and issues you're involved in, plus the default branch of repos you're active in when its CI goes red (🔴, or 🔧 if your commit broke it; it clears itself when green).
 - **Personal states**, derived automatically from GitHub, overridable by hand:
   - review requested → 👀 Need to review
@@ -72,7 +72,7 @@ Moving to an Apple Developer ID later (notarised, no "Open Anyway") only changes
 - **History** (Time → History): a timeline of your reviews, comments, opened/merged PRs and the states you set.
 - **New since you last looked**: a dot on things that need you and arrived after you last opened them; "mark seen" clears them all.
 - **Following** (Settings → Following): everything is followed by default; untick any PR, issue, branch or whole repo to stop hearing about it (gone from Today, counts and notifications). Filter, then follow/unfollow everything shown in one go.
-- **Noise control**: a repo with 4+ items in one section collapses into a single group row with bulk "✓ all" / snooze / stop following. **Ignore people & bots** (Settings): their comments don't count as replies and their PRs go to FYI.
+- **Noise control**: **Ignore people & bots** (Settings): their comments don't count as replies and their PRs go to FYI.
 - **⌘K command bar**:
   - Questions: "what do I need to review?", "what's new since I last looked?", "show me Sarah's PRs", "what have I forgotten about?", "what did I work on yesterday?"
   - Actions: "remind me about the checkout PR tomorrow", "come back to auth middleware after the API migration", "mark sarah's checkout pr as done", "approve sarah's checkout pr", "reply to priya", "merge export reports", "check out the checkout refactor", "open web in my editor", "stop following …", "rerun checks on billing"
@@ -154,7 +154,7 @@ src-tauri/recorder/                 the dev-inbox-recorder sidecar, a SwiftPM pa
   demo.rs     fictional seed data for DEV_INBOX_DEMO=1
   lib.rs      Tauri commands, tray, poller, global shortcut
 src/
-  App.tsx, components/   sidebar shell, Today / Inbox (list + detail pane), Time (Day, Timesheet, History), Tickets,
+  App.tsx, components/   sidebar shell, Today / Inbox (one list, details inline), Time (Day, Timesheet, History), Tickets,
                          Meetings, Settings (sections), first-run Setup, ⌘K
   lib/query.ts           command-bar intent parsing
   lib/day.ts             day boundaries, durations, colours, summary text

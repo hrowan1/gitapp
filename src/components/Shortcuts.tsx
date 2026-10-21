@@ -14,9 +14,9 @@ const GROUPS: { title: string; keys: [string, string][] }[] = [
     title: "In a list",
     keys: [
       ["j / k  or  ↓ / ↑", "Move"],
-      ["click", "Show details and actions"],
-      ["↵  or  o", "Open on GitHub (or expand a group)"],
-      ["Esc", "Clear selection"],
+      ["click", "Open its details and actions, right under it"],
+      ["↵  or  o", "Open on GitHub"],
+      ["Esc", "Close the details"],
       ["right-click  or  .", "Quick menu"],
     ],
   },
