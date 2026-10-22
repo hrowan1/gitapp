@@ -1,0 +1,3 @@
+# Paths `tauri dev` shouldn't restart the app for (same syntax as .gitignore).
+# SwiftPM writes lock files and build output here while build.rs builds the recorder.
+recorder/.build/
