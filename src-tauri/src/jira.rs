@@ -23,6 +23,40 @@ pub struct Client {
     token: String,
 }
 
+/// Jira answered with an error status.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: reqwest::StatusCode,
+    pub text: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if matches!(self.status, reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) {
+            write!(f, "Jira rejected the email or API token ({})", self.status)
+        } else {
+            write!(f, "Jira returned {} {}", self.status, self.text)
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+fn status_of(e: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    e.downcast_ref::<HttpError>().map(|h| h.status)
+}
+
+/// Jira refused the email and API token (an expired or revoked token, say).
+pub fn login_rejected(e: &anyhow::Error) -> bool {
+    matches!(status_of(e), Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN))
+}
+
+/// "Issue does not exist or you do not have permission to see it." Jira says the same to a login
+/// it no longer accepts — it answers that as nobody — so check `myself` before believing it.
+pub fn not_found(e: &anyhow::Error) -> bool {
+    status_of(e) == Some(reqwest::StatusCode::NOT_FOUND)
+}
+
 /// "fullfatthings.atlassian.net", "https://x.atlassian.net/jira/software/…" → "https://x.atlassian.net"
 pub fn normalise_site(site: &str) -> Result<String> {
     let s = site.trim().trim_start_matches("https://").trim_start_matches("http://");
@@ -245,12 +279,9 @@ impl Client {
             .await
             .context("Couldn't reach Jira")?;
         let status = res.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            bail!("Jira rejected the email or API token ({status})");
-        }
         let body: Value = res.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
-            bail!("Jira returned {status} {}", error_text(&body));
+            return Err(HttpError { status, text: error_text(&body) }.into());
         }
         Ok(body)
     }
@@ -960,6 +991,20 @@ mod tests {
         let body = json!({"type": "doc", "content": [{"type": "paragraph", "content": [
             {"type": "mention", "attrs": {"id": "me", "text": "@Harry"}}, {"type": "text", "text": " can you check?"}]}]});
         assert_eq!(adf_mentions(&body), ["me"]);
+    }
+
+    #[test]
+    fn jira_errors_tell_a_dead_login_from_a_missing_ticket() {
+        let err = |status: reqwest::StatusCode, text: &str| -> anyhow::Error { HttpError { status, text: text.into() }.into() };
+        let gone = err(reqwest::StatusCode::NOT_FOUND, "Issue does not exist or you do not have permission to see it.");
+        assert!(not_found(&gone) && !login_rejected(&gone));
+        assert_eq!(gone.to_string(), "Jira returned 404 Not Found Issue does not exist or you do not have permission to see it.");
+        let dead = err(reqwest::StatusCode::UNAUTHORIZED, "");
+        assert!(login_rejected(&dead) && !not_found(&dead));
+        assert_eq!(dead.to_string(), "Jira rejected the email or API token (401 Unauthorized)", "the message connecting shows");
+        assert!(login_rejected(&err(reqwest::StatusCode::FORBIDDEN, "")));
+        let offline = anyhow!("Couldn't reach Jira");
+        assert!(!not_found(&offline) && !login_rejected(&offline));
     }
 
     #[test]

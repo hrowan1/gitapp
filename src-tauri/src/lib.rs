@@ -1084,18 +1084,43 @@ async fn refresh_ticket(app: &AppHandle, client: &jira::Client, key: &str) {
     let _ = app.emit("jira-updated", ());
 }
 
+/// What to say when Jira no longer accepts the saved login.
+const JIRA_LOGIN_REJECTED: &str =
+    "Jira isn't accepting the saved API token any more (it may have expired). Reconnect Jira in Settings with a new one.";
+
+/// A ticket action failed. Jira doesn't refuse a login it no longer accepts: it answers as nobody,
+/// and to nobody every ticket "does not exist" (404). So on a 404, check who's signed in — if no one
+/// is, say so (and show it with the sync status) rather than blaming the ticket.
+async fn ticket_error(app: &AppHandle, client: &jira::Client, e: anyhow::Error) -> String {
+    if jira::not_found(&e) {
+        if let Err(who) = client.myself().await {
+            if jira::login_rejected(&who) {
+                let _ = db::set_setting(&app.state::<AppState>().db.relock(), "jira_error", JIRA_LOGIN_REJECTED);
+                let _ = app.emit("jira-updated", ());
+                return JIRA_LOGIN_REJECTED.to_string();
+            }
+        }
+    }
+    format!("{e:#}")
+}
+
 /// The statuses a ticket can move to from where it is.
 #[tauri::command]
 async fn jira_transitions(app: AppHandle, key: String) -> CmdResult<Vec<jira::Transition>> {
     let client = jira_for_edit(&app.state::<AppState>())?;
-    client.transitions(&key).await.map_err(|e| format!("{e:#}"))
+    match client.transitions(&key).await {
+        Ok(moves) => Ok(moves),
+        Err(e) => Err(ticket_error(&app, &client, e).await),
+    }
 }
 
 /// Move a ticket to another status (in Jira).
 #[tauri::command]
 async fn jira_move(app: AppHandle, key: String, transition_id: String) -> CmdResult<()> {
     let client = jira_for_edit(&app.state::<AppState>())?;
-    client.transition(&key, &transition_id).await.map_err(|e| format!("{e:#}"))?;
+    if let Err(e) = client.transition(&key, &transition_id).await {
+        return Err(ticket_error(&app, &client, e).await);
+    }
     refresh_ticket(&app, &client, &key).await;
     Ok(())
 }
@@ -1104,7 +1129,10 @@ async fn jira_move(app: AppHandle, key: String, transition_id: String) -> CmdRes
 #[tauri::command]
 async fn jira_assignable(app: AppHandle, key: String, query: String) -> CmdResult<Vec<jira::JiraUser>> {
     let client = jira_for_edit(&app.state::<AppState>())?;
-    client.assignable(&key, query.trim()).await.map_err(|e| format!("{e:#}"))
+    match client.assignable(&key, query.trim()).await {
+        Ok(people) => Ok(people),
+        Err(e) => Err(ticket_error(&app, &client, e).await),
+    }
 }
 
 /// Assign a ticket (in Jira); None unassigns it.
@@ -1116,7 +1144,9 @@ async fn jira_assign(app: AppHandle, key: String, account_id: Option<String>) ->
         Some("me") => Some(app.state::<AppState>().setting("jira_account").ok_or("Connect Jira in Settings first")?),
         _ => account_id,
     };
-    client.assign(&key, account_id.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+    if let Err(e) = client.assign(&key, account_id.as_deref()).await {
+        return Err(ticket_error(&app, &client, e).await);
+    }
     refresh_ticket(&app, &client, &key).await;
     Ok(())
 }
@@ -1159,6 +1189,11 @@ async fn run_jira_sync(app: &AppHandle) -> CmdResult<()> {
         .map(|t| t - chrono::Duration::days(1))
         .unwrap_or(now - chrono::Duration::days(jira::FIRST_SYNC_DAYS));
     let result = async {
+        // A login Jira no longer accepts isn't refused outright: Jira answers as nobody, so the
+        // search below would "succeed" with nothing, sync after sync. Check who's signed in first.
+        if let Err(e) = client.myself().await {
+            return Err(if jira::login_rejected(&e) { anyhow::anyhow!(JIRA_LOGIN_REJECTED) } else { e });
+        }
         let issues = client.involved_issues(since, &me).await?;
         let mut changes = client.changelogs(&issues).await?;
         for i in &issues {

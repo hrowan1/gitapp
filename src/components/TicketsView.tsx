@@ -531,7 +531,14 @@ export function TicketsView({
             {syncing ? "syncing…" : "sync now"}
           </button>
         </p>
-        {status?.error && <p className="error small">Last Jira sync failed: {status.error}</p>}
+        {status?.error && (
+          <p className="error small">
+            Last Jira sync failed: {status.error}{" "}
+            <button className="link" onClick={onSettings}>
+              Open Settings
+            </button>
+          </p>
+        )}
       </div>
       {projects.length > 1 && (
         <div className="tabs" role="tablist">
